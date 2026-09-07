@@ -2,7 +2,7 @@
 
 This tool reads a wheel and source distribution without extracting, importing,
 building, installing, or executing either artifact.  The allowlists are tied to
-the 0.1.0a0 package surface and must be reviewed when that surface changes.
+the 0.1.0a1 package surface and must be reviewed when that surface changes.
 """
 
 from __future__ import annotations
@@ -16,8 +16,10 @@ from email import policy
 from email.parser import BytesParser
 import gzip
 import hashlib
+from html.parser import HTMLParser
 import io
 from pathlib import Path, PurePosixPath
+import re
 import stat
 import sys
 import tarfile
@@ -28,7 +30,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 DIST_NAME = "alelyon-ai"
 ARCHIVE_NAME = "alelyon_ai"
-VERSION = "0.1.0a0"
+VERSION = "0.1.0a1"
 PYTHON_REQUIRES = ">=3.10"
 DIST_INFO = f"{ARCHIVE_NAME}-{VERSION}.dist-info"
 SDIST_ROOT = f"{ARCHIVE_NAME}-{VERSION}"
@@ -419,11 +421,64 @@ def _normalized_text_bytes(data: bytes, code: str) -> bytes:
     return normalized
 
 
+class _ReadmeHtmlLinks(HTMLParser):
+    """Collect explicitly declared HTML link and image destinations."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.destinations: list[str] = []
+
+    def handle_starttag(
+            self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del tag
+        for name, value in attrs:
+            if name.lower() in {"href", "src"} and value is not None:
+                self.destinations.append(value.strip())
+
+    def handle_startendtag(
+            self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+
+
+def _verify_readme_links(readme: str) -> None:
+    """Admit HTTPS destinations in the bounded syntax this verifier checks.
+
+    This is intentionally not a complete Markdown parser.  It checks ordinary
+    inline Markdown destinations, one-line or next-line reference definitions,
+    and HTML ``href``/``src`` attributes.  The reviewed README must use one of
+    those forms so every link destination remains visible to this gate.
+    """
+    destinations: list[str] = []
+    inline = re.compile(r"\]\(\s*(?:<([^>\r\n]+)>|([^\s)]+))")
+    destinations.extend(match.group(1) or match.group(2)
+                        for match in inline.finditer(readme))
+    reference = re.compile(
+        r"(?m)^[ \t]{0,3}\[[^\]\r\n]+\]:[ \t]*"
+        r"(?:\r?\n[ \t]+)?(?:<([^>\r\n]+)>|([^\s]+))"
+    )
+    destinations.extend(match.group(1) or match.group(2)
+                        for match in reference.finditer(readme))
+    html = _ReadmeHtmlLinks()
+    html.feed(readme)
+    html.close()
+    destinations.extend(html.destinations)
+    if any(not destination.startswith("https://") for destination in destinations):
+        _refuse("readme-relative-link")
+
+
 def _verify_sdist_metadata(files: Mapping[str, bytes], wheel_metadata: bytes) -> None:
     package_info = files["PKG-INFO"]
     if package_info != files[f"{EGG_INFO}/PKG-INFO"] or package_info != wheel_metadata:
         _refuse("distribution-metadata-byte-mismatch")
     _verify_metadata(package_info, "sdist")
+    try:
+        expected_description = files["README.md"].decode("utf-8").replace("\r\n", "\n")
+    except UnicodeError:
+        _refuse("readme-encoding")
+    description = BytesParser(policy=policy.default).parsebytes(package_info).get_payload(decode=True)
+    if not isinstance(description, bytes) or description.replace(b"\r\n", b"\n") != expected_description.encode("utf-8"):
+        _refuse("distribution-description-mismatch")
+    _verify_readme_links(expected_description)
     normalized_metadata = _normalized_text_bytes(
         package_info, "distribution-metadata-text-malformed"
     )

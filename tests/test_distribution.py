@@ -29,7 +29,7 @@ SPEC.loader.exec_module(distribution)
 METADATA = (
     "Metadata-Version: 2.4\n"
     "Name: alelyon-ai\n"
-    "Version: 0.1.0a0\n"
+    "Version: 0.1.0a1\n"
     "Summary: Synthetic verifier fixture\n"
     "License-Expression: MIT\n"
     "License-File: LICENSE\n"
@@ -168,12 +168,86 @@ def test_exact_reviewed_wheel_and_sdist_pass(artifacts: tuple[Path, Path]) -> No
     assert "tests/test_distribution.py" in distribution.SDIST_FILES
 
 
+def test_published_description_must_match_reviewed_readme(tmp_path: Path) -> None:
+    metadata = METADATA + b"Unexpected description text\n"
+    wheel = _write_wheel(
+        tmp_path / f"{distribution.ARCHIVE_NAME}-{distribution.VERSION}-py3-none-any.whl",
+        _wheel_files(metadata),
+    )
+    sdist = _write_sdist(
+        tmp_path / f"{distribution.ARCHIVE_NAME}-{distribution.VERSION}.tar.gz",
+        _sdist_files(metadata),
+    )
+    _refused(wheel, sdist, "distribution-description-mismatch")
+
+
+@pytest.mark.parametrize("addition", [
+    "[Inline](LICENSE)",
+    "[Reference][local]\n\n[local]: docs/ARCHITECTURE.md",
+    "[Reference][local]\n\n[local]:\n  docs/ARCHITECTURE.md",
+    '<a href="docs/ARCHITECTURE.md">Architecture</a>',
+    '<img src="assets/logo.png" alt="Logo">',
+])
+def test_source_consistent_readme_with_relative_links_refuses(
+        tmp_path: Path, addition: str) -> None:
+    source = tmp_path / "source"
+    for name in distribution.SDIST_SOURCE_FILES:
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes((ROOT / name).read_bytes())
+    readme = (source / "README.md").read_bytes() + f"\n{addition}\n".encode()
+    (source / "README.md").write_bytes(readme)
+    metadata = METADATA.split(b"\n\n", 1)[0] + b"\n\n" + readme.replace(b"\r\n", b"\n")
+    files = _sdist_files(metadata)
+    files["README.md"] = readme
+    wheel = _write_wheel(
+        tmp_path / f"{distribution.ARCHIVE_NAME}-{distribution.VERSION}-py3-none-any.whl",
+        _wheel_files(metadata),
+    )
+    sdist = _write_sdist(
+        tmp_path / f"{distribution.ARCHIVE_NAME}-{distribution.VERSION}.tar.gz", files,
+    )
+    with pytest.raises(distribution.DistributionError, match="^readme-relative-link$"):
+        distribution.verify_distribution(wheel, sdist, source_root=source)
+
+
+@pytest.mark.parametrize("addition", [
+    "[Inline](https://example.test/LICENSE)",
+    "[Reference][remote]\n\n[remote]: https://example.test/architecture",
+    "[Reference][remote]\n\n[remote]:\n  https://example.test/architecture",
+    '<a href="https://example.test/architecture">Architecture</a>',
+    '<img src="https://example.test/logo.png" alt="Logo">',
+])
+def test_source_consistent_readme_with_absolute_https_links_passes(
+        tmp_path: Path, addition: str) -> None:
+    source = tmp_path / "source"
+    for name in distribution.SDIST_SOURCE_FILES:
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes((ROOT / name).read_bytes())
+    readme = (source / "README.md").read_bytes() + f"\n{addition}\n".encode()
+    (source / "README.md").write_bytes(readme)
+    metadata = METADATA.split(b"\n\n", 1)[0] + b"\n\n" + readme.replace(b"\r\n", b"\n")
+    files = _sdist_files(metadata)
+    files["README.md"] = readme
+    wheel = _write_wheel(
+        tmp_path / f"{distribution.ARCHIVE_NAME}-{distribution.VERSION}-py3-none-any.whl",
+        _wheel_files(metadata),
+    )
+    sdist = _write_sdist(
+        tmp_path / f"{distribution.ARCHIVE_NAME}-{distribution.VERSION}.tar.gz", files,
+    )
+    assert distribution.verify_distribution(
+        wheel, sdist, source_root=source,
+    ).sdist_files == len(distribution.SDIST_FILES)
+
+
 def test_cli_reports_bounded_pass_and_refusal(
         artifacts: tuple[Path, Path], capsys: pytest.CaptureFixture[str]) -> None:
     wheel, sdist = artifacts
     assert distribution.main(["--wheel", str(wheel), "--sdist", str(sdist)]) == 0
     output = capsys.readouterr()
-    assert output.err == "" and output.out.startswith("PASS: alelyon-ai 0.1.0a0;")
+    assert output.err == "" and output.out.startswith("PASS: alelyon-ai 0.1.0a1;")
     bad = wheel.with_name("renamed.whl")
     shutil.copyfile(wheel, bad)
     assert distribution.main(["--wheel", str(bad), "--sdist", str(sdist)]) == 1
@@ -249,7 +323,7 @@ def test_wheel_missing_file_and_source_byte_drift_refuse(tmp_path: Path) -> None
 
 @pytest.mark.parametrize(("header", "replacement", "code"), [
     (b"Name: alelyon-ai", b"Name: other", "wheel-name-mismatch"),
-    (b"Version: 0.1.0a0", b"Version: 9", "wheel-version-mismatch"),
+    (b"Version: 0.1.0a1", b"Version: 9", "wheel-version-mismatch"),
     (b"Requires-Python: >=3.10", b"Requires-Python: >=3.12",
      "wheel-python-requirement-mismatch"),
 ])
@@ -468,7 +542,7 @@ def test_runtime_and_project_version_contracts_are_independently_bound() -> None
     distribution._verify_source_contract(wheel_files, sdist_files)
     wheel_files["alelyon_compute_kit/__init__.py"] = wheel_files[
         "alelyon_compute_kit/__init__.py"
-    ].replace(b'__version__ = "0.1.0a0"', b'__version__ = "9"')
+    ].replace(b'__version__ = "0.1.0a1"', b'__version__ = "9"')
     with pytest.raises(distribution.DistributionError,
                        match="^package-version-mismatch$"):
         distribution._verify_source_contract(wheel_files, sdist_files)

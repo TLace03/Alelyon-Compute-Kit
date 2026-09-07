@@ -6,7 +6,7 @@ backends for different device architectures, compiler targets and driver APIs.
 Support is determined by explicit capabilities and workload tests.
 
 The PyPI distribution name is **`alelyon-ai`**. The Python namespace is
-**`alelyon_compute_kit`**. This repository uses the [MIT license](LICENSE).
+**`alelyon_compute_kit`**. This repository uses the [MIT license](https://github.com/TLace03/Alelyon-Compute-Kit/blob/main/LICENSE).
 
 ## Current state
 
@@ -68,8 +68,8 @@ The current source targets Python 3.10 and later. A pure-Python wheel's platform
 tag describes these capability modules, not native accelerator support. Native
 packages will require separate platform and installation checks.
 
-[Architecture and extension boundaries](docs/ARCHITECTURE.md) describe the
+[Architecture and extension boundaries](https://github.com/TLace03/Alelyon-Compute-Kit/blob/main/docs/ARCHITECTURE.md) describe the
 planned runtime layers and the acceptance required before backend adoption.
-The [release guide](docs/RELEASING.md) describes the manually dispatched
+The [release guide](https://github.com/TLace03/Alelyon-Compute-Kit/blob/main/docs/RELEASING.md) describes the manually dispatched
 validation and PyPI publishing workflow. Publishing is an explicit option;
 ordinary pushes do not release a package.
