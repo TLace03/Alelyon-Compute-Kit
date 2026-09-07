@@ -1,0 +1,6 @@
+include LICENSE README.md pyproject.toml
+include docs/ARCHITECTURE.md
+include docs/RELEASING.md
+include tools/verify_distribution.py
+recursive-include src/alelyon_compute_kit *.py py.typed
+recursive-include tests test_*.py
