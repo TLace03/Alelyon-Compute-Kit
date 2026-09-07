@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "alelyon-ai"
-version = "0.1.0a0"
+version = "0.1.0a1"
 description = "Vendor-neutral compute SDK with explicit backend capability contracts"
 readme = "README.md"
 requires-python = ">=3.10"

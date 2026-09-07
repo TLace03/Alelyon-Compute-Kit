@@ -28,7 +28,7 @@ from .capabilities import (
     match_capabilities,
 )
 
-__version__ = "0.1.0a0"
+__version__ = "0.1.0a1"
 
 __all__ = [
     "BACKEND_API_VERSION",
