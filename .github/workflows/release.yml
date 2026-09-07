@@ -1,0 +1,149 @@
+name: Publish Python distribution
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the verified artifacts to PyPI
+        required: true
+        type: boolean
+        default: false
+      expected_version:
+        description: Exact version expected in the source and artifacts
+        required: true
+        type: string
+        default: 0.1.0a0
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.14"]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install test dependency
+        run: >-
+          python -m pip install --disable-pip-version-check --no-input
+          "pip==26.2.1" "pytest==9.1.1"
+      - name: Validate requested version
+        env:
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+        run: >-
+          python -c "import os, pathlib, sys;
+          sys.path.insert(0, str(pathlib.Path('src').resolve()));
+          import alelyon_compute_kit as package;
+          expected = os.environ['EXPECTED_VERSION'];
+          raise SystemExit(0 if expected == '0.1.0a0' and package.__version__ == expected
+          else 'expected_version must equal the source version 0.1.0a0')"
+      - name: Run source tests
+        run: python -m pytest -q
+
+  build:
+    name: Build and verify distributions
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned build tools
+        run: >-
+          python -m pip install --disable-pip-version-check --no-input
+          "pip==26.2.1" "setuptools==84.0.0" "wheel==0.48.0"
+          "build==1.6.0" "twine==7.0.0"
+      - name: Validate requested version
+        env:
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+        run: >-
+          python -c "import os, pathlib, sys;
+          sys.path.insert(0, str(pathlib.Path('src').resolve()));
+          import alelyon_compute_kit as package;
+          expected = os.environ['EXPECTED_VERSION'];
+          raise SystemExit(0 if expected == '0.1.0a0' and package.__version__ == expected
+          else 'expected_version must equal the source version 0.1.0a0')"
+      - name: Build wheel and source distribution
+        run: python -m build --no-isolation --outdir dist
+      - name: Verify exact artifact contents
+        run: >-
+          python tools/verify_distribution.py
+          --wheel dist/alelyon_ai-0.1.0a0-py3-none-any.whl
+          --sdist dist/alelyon_ai-0.1.0a0.tar.gz
+      - name: Check package metadata rendering
+        run: >-
+          python -m twine check --strict
+          dist/alelyon_ai-0.1.0a0-py3-none-any.whl
+          dist/alelyon_ai-0.1.0a0.tar.gz
+      - name: Install wheel outside the checkout
+        env:
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          check_dir="${RUNNER_TEMP}/alelyon-wheel-check"
+          python -m venv "${check_dir}"
+          "${check_dir}/bin/python" -I -m pip install \
+            --disable-pip-version-check --no-input --no-deps \
+            "${GITHUB_WORKSPACE}/dist/alelyon_ai-0.1.0a0-py3-none-any.whl"
+          cd "${RUNNER_TEMP}"
+          "${check_dir}/bin/python" -I -m pip check
+          "${check_dir}/bin/python" -I -c \
+            "import os, alelyon_compute_kit as package; assert package.__version__ == os.environ['EXPECTED_VERSION']"
+      - name: Upload verified distributions
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verified-distributions
+          path: |
+            dist/alelyon_ai-0.1.0a0-py3-none-any.whl
+            dist/alelyon_ai-0.1.0a0.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish verified artifacts to PyPI
+    needs: build
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' &&
+          inputs.publish == true &&
+          github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/p/alelyon-ai
+    permissions:
+      id-token: write
+    steps:
+      - name: Download verified distributions
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: verified-distributions
+          path: dist
+      - name: Publish with PyPI trusted publishing
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist/
