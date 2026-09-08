@@ -8,7 +8,7 @@ version = "0.1.0a1"
 description = "Vendor-neutral compute SDK with explicit backend capability contracts"
 readme = "README.md"
 requires-python = ">=3.10"
-license = "MIT"
+license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{name = "Thomas Lacy"}]
 dependencies = []

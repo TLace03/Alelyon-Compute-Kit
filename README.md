@@ -6,7 +6,11 @@ backends for different device architectures, compiler targets and driver APIs.
 Support is determined by explicit capabilities and workload tests.
 
 The PyPI distribution name is **`alelyon-ai`**. The Python namespace is
-**`alelyon_compute_kit`**. This repository uses the [MIT license](https://github.com/TLace03/Alelyon-Compute-Kit/blob/main/LICENSE).
+**`alelyon_compute_kit`**. This repository uses the [Apache License 2.0](https://github.com/TLace03/Alelyon-Compute-Kit/blob/main/LICENSE).
+Releases `0.1.0a0` and `0.1.0a1` were published under the MIT License and
+remain under the terms they were published with; Apache-2.0 applies from the
+next release onward. Apache-2.0 was chosen for its explicit patent grant,
+which matters for a compute SDK shipping original kernels.
 
 ## Current state
 
