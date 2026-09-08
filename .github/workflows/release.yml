@@ -12,7 +12,10 @@ on:
         description: Exact version expected in the source and artifacts
         required: true
         type: string
-        default: 0.1.0a1
+        # No default. The dispatcher states the version they mean and the
+        # guard below refuses it unless it equals the SOURCE version, so a
+        # default here would only be a value somebody accepts without reading.
+        default: ""
 
 permissions:
   contents: read
@@ -52,8 +55,9 @@ jobs:
           sys.path.insert(0, str(pathlib.Path('src').resolve()));
           import alelyon_compute_kit as package;
           expected = os.environ['EXPECTED_VERSION'];
-          raise SystemExit(0 if expected == '0.1.0a1' and package.__version__ == expected
-          else 'expected_version must equal the source version 0.1.0a1')"
+          source = package.__version__;
+          raise SystemExit(0 if expected == source else
+          f'expected_version {expected!r} does not match the source version {source!r}')"
       - name: Run source tests
         run: python -m pytest -q
 
@@ -84,20 +88,41 @@ jobs:
           sys.path.insert(0, str(pathlib.Path('src').resolve()));
           import alelyon_compute_kit as package;
           expected = os.environ['EXPECTED_VERSION'];
-          raise SystemExit(0 if expected == '0.1.0a1' and package.__version__ == expected
-          else 'expected_version must equal the source version 0.1.0a1')"
+          source = package.__version__;
+          raise SystemExit(0 if expected == source else
+          f'expected_version {expected!r} does not match the source version {source!r}')"
       - name: Build wheel and source distribution
         run: python -m build --no-isolation --outdir dist
+      # Resolve the artifacts rather than construct their names. A constructed
+      # name pins the version AND the wheel tag, and the tag stops being
+      # `py3-none-any` the moment the distribution carries a native library.
+      # Exactly one of each is asserted, so a stale artifact left in dist/ is a
+      # failure here rather than an ambiguity later.
+      - name: Resolve the built artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          sdists=(dist/*.tar.gz)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "expected exactly one wheel in dist/, found ${#wheels[@]}" >&2
+            exit 1
+          fi
+          if [ "${#sdists[@]}" -ne 1 ]; then
+            echo "expected exactly one sdist in dist/, found ${#sdists[@]}" >&2
+            exit 1
+          fi
+          echo "WHEEL=${wheels[0]}" >> "${GITHUB_ENV}"
+          echo "SDIST=${sdists[0]}" >> "${GITHUB_ENV}"
+          echo "resolved ${wheels[0]} and ${sdists[0]}"
       - name: Verify exact artifact contents
         run: >-
           python tools/verify_distribution.py
-          --wheel dist/alelyon_ai-0.1.0a1-py3-none-any.whl
-          --sdist dist/alelyon_ai-0.1.0a1.tar.gz
+          --wheel "${{ env.WHEEL }}"
+          --sdist "${{ env.SDIST }}"
       - name: Check package metadata rendering
-        run: >-
-          python -m twine check --strict
-          dist/alelyon_ai-0.1.0a1-py3-none-any.whl
-          dist/alelyon_ai-0.1.0a1.tar.gz
+        run: python -m twine check --strict "${{ env.WHEEL }}" "${{ env.SDIST }}"
       - name: Install wheel outside the checkout
         env:
           EXPECTED_VERSION: ${{ inputs.expected_version }}
@@ -106,20 +131,17 @@ jobs:
           set -euo pipefail
           check_dir="${RUNNER_TEMP}/alelyon-wheel-check"
           python -m venv "${check_dir}"
-          "${check_dir}/bin/python" -I -m pip install \
-            --disable-pip-version-check --no-input --no-deps \
-            "${GITHUB_WORKSPACE}/dist/alelyon_ai-0.1.0a1-py3-none-any.whl"
+          "${check_dir}/bin/python" -I -m pip install --disable-pip-version-check --no-input --no-deps "${GITHUB_WORKSPACE}/${WHEEL}"
           cd "${RUNNER_TEMP}"
           "${check_dir}/bin/python" -I -m pip check
-          "${check_dir}/bin/python" -I -c \
-            "import os, alelyon_compute_kit as package; assert package.__version__ == os.environ['EXPECTED_VERSION']"
+          "${check_dir}/bin/python" -I -c "import os, alelyon_compute_kit as package; assert package.__version__ == os.environ['EXPECTED_VERSION']"
       - name: Upload verified distributions
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: verified-distributions
           path: |
-            dist/alelyon_ai-0.1.0a1-py3-none-any.whl
-            dist/alelyon_ai-0.1.0a1.tar.gz
+            ${{ env.WHEEL }}
+            ${{ env.SDIST }}
           if-no-files-found: error
           retention-days: 7
 

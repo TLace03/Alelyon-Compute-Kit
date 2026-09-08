@@ -37,13 +37,17 @@ artifact produced after the test and verification jobs.
    `alelyon_compute_kit.__version__` both remain `0.1.0a1`.
 2. Open **Actions**, select **Publish Python distribution**, and choose
    **Run workflow** on `main`.
-3. Leave `publish` false and set `expected_version` to `0.1.0a1`.
+3. Leave `publish` false and set `expected_version` to the version in the
+   source. The input has no default: the workflow refuses any value that does
+   not equal `alelyon_compute_kit.__version__`, so this states what you mean
+   rather than accepting a value somebody wrote once.
 4. Require all four source-test matrix jobs and the Ubuntu Python 3.12 build job
    to pass. The publish job must be skipped.
 5. Review the uploaded `verified-distributions` artifact. It is retained for
-   seven days and must contain exactly:
-   - `alelyon_ai-0.1.0a1-py3-none-any.whl`
-   - `alelyon_ai-0.1.0a1.tar.gz`
+   seven days and must contain exactly one wheel and one source distribution
+   for the version under release. The workflow resolves both from `dist/` and
+   refuses anything other than exactly one of each, so a stale artifact is a
+   failure there rather than an ambiguity here.
 
 The test matrix covers Ubuntu and Windows with Python 3.10 and 3.14. The build
 job uses pinned packaging tools, invokes the repository's bounded artifact
@@ -73,10 +77,18 @@ For a future release, update and review all version-bound locations together:
 
 - `[project].version` in `pyproject.toml`;
 - `alelyon_compute_kit.__version__`;
-- the version and archive names enforced by `tools/verify_distribution.py`;
+- the version enforced by `tools/verify_distribution.py`;
 - its verifier fixtures;
-- `expected_version` and artifact paths in `release.yml`;
 - this document.
+
+`release.yml` is no longer on that list. It used to hard-compare
+`expected_version` against a literal and name each artifact by filename, which
+made the input a formality and put a manual edit of the workflow on the
+critical path of every release. It now compares the input against the SOURCE
+version and resolves the artifacts from `dist/`, so it is version-agnostic.
+The verifier's own pin is deliberately kept: it is an independent second
+statement of the expected version, and it is what would catch a wrong version
+in the source that the workflow's own comparison cannot see.
 
 Run a non-publishing workflow first. A version-input mismatch, failed source
 test, artifact-verifier refusal, metadata warning, failed clean install, or
