@@ -31,7 +31,7 @@ METADATA = (
     "Name: alelyon-ai\n"
     "Version: 0.1.0a1\n"
     "Summary: Synthetic verifier fixture\n"
-    "License-Expression: MIT\n"
+    "License-Expression: Apache-2.0\n"
     "License-File: LICENSE\n"
     "Requires-Python: >=3.10\n"
     "Provides-Extra: dev\n"

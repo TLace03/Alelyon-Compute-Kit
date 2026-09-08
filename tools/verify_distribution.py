@@ -338,7 +338,7 @@ def _verify_metadata(data: bytes, label: str) -> None:
     _one_header(message, "Version", VERSION, f"{label}-version-mismatch")
     _one_header(message, "Requires-Python", PYTHON_REQUIRES,
                 f"{label}-python-requirement-mismatch")
-    _one_header(message, "License-Expression", "MIT", f"{label}-license-mismatch")
+    _one_header(message, "License-Expression", "Apache-2.0", f"{label}-license-mismatch")
     _one_header(message, "License-File", "LICENSE", f"{label}-license-file-mismatch")
     if message.get_all("Provides-Extra", []) != ["dev"]:
         _refuse(f"{label}-extras-mismatch")
