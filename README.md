@@ -10,7 +10,7 @@ Previously published `0.1.0a0` and `0.1.0a1` artifacts remain MIT-licensed.
 
 ## Current package
 
-Version `0.1.0a2` adds a Windows AMD64 native library, reviewed Rust and shader
+Version `0.1.0a3` adds a Windows AMD64 native library, reviewed Rust and shader
 sources, Python buffers and an experimental vector-coded expert API. The root
 import retains the immutable capability records and explicit backend registry:
 it does not load drivers, discover plugins, compile code or allocate a device.
@@ -39,7 +39,7 @@ a 48-hour training target and comparative performance remain unmeasured.
 Use 64-bit Windows and Python 3.10 or later, with a compatible Vulkan driver:
 
 ```console
-python -m pip install "alelyon-ai[numpy]==0.1.0a2"
+python -m pip install "alelyon-ai[numpy]==0.1.0a3"
 ```
 
 ```python
@@ -65,6 +65,42 @@ atomic pointer. `GainScheduler` prioritizes measured held-out improvement per
 second while reserving exploration. Bank capacity, materialized weights and
 actually updated weights are separate quantities. Declaring a large bank does
 not initialize or train it.
+
+## Run or update an expert without ROCm
+
+The model-facing harness uses the native Vulkan path directly. It reads a
+materialized expert from an `ExpertBank`, encodes input activations, runs packed
+matrix products, and can commit one clipped AdamW update with weights and both
+moments in the same generation. It does not import ROCm, CUDA, or a framework.
+
+Create a three-shard expert bank once:
+
+```python
+from alelyon_compute_kit import expert_bank
+
+bank = expert_bank.ExpertBank.create(
+    "./my-bank",
+    expert_bank.BankConfig(1, 1, ((128, 128),) * 3, group=16),
+)
+bank.initialize_expert(0, 0, seed=7, zero_optimizer_state=True)
+```
+
+Then run a forward pass or a durable training step from `.npy` arrays:
+
+```console
+python -m alelyon_compute_kit.harness --device --bank ./my-bank ^
+  --input ./batch.npy --output ./prediction.npy
+
+python -m alelyon_compute_kit.harness --device --bank ./my-bank ^
+  --input ./batch.npy --target ./target.npy --steps 4 ^
+  --output ./prediction.npy --force
+```
+
+`--device` is required so opening Vulkan is visible and explicit. The harness
+uses CPU codebook calibration and diagnostics, while packed matmul and AdamW
+run on the selected Vulkan device. It is a linear-expert adapter: model owners
+still supply tokenisation, routing, graph composition and checkpoint policy.
+The harness does not establish model quality or trillion-parameter capacity.
 
 ## Capability matching
 

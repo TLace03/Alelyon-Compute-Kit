@@ -1,4 +1,4 @@
-Third-party notices for alelyon-ai 0.1.0a2
+Third-party notices for alelyon-ai 0.1.0a3
 
 The crate lockfile pins the four external crates below. Rust 1.97.1 standard-library notices are retained in full; this is not a claim that every listed standard-library component is linked. No Vulkan driver or Microsoft runtime DLL is bundled.
 

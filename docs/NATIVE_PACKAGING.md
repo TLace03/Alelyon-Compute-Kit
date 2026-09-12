@@ -1,6 +1,6 @@
 # Experimental native package boundary
 
-Version 0.1.0a2 supplies a Windows AMD64 native library through the explicit
+Version 0.1.0a3 supplies a Windows AMD64 native library through the explicit
 `alelyon_compute_kit.ack` API. Root imports retain the capability declaration and
 registry API and do not load a DLL, discover devices, import NumPy/Torch, or
 register hardware. Install the `numpy` extra to use `vq` and `expert_bank`.
@@ -30,8 +30,8 @@ On Windows AMD64 with MSVC and Rust 1.97.1 installed, use fresh output paths:
 ```powershell
 python tools/build_native.py --target-dir C:/temp/ack-native-new
 python -m build --no-isolation --sdist --wheel --outdir dist
-python tools/verify_distribution.py --wheel dist/alelyon_ai-0.1.0a2-py3-none-win_amd64.whl --sdist dist/alelyon_ai-0.1.0a2.tar.gz
-python -m twine check --strict dist/alelyon_ai-0.1.0a2-py3-none-win_amd64.whl dist/alelyon_ai-0.1.0a2.tar.gz
+python tools/verify_distribution.py --wheel dist/alelyon_ai-0.1.0a3-py3-none-win_amd64.whl --sdist dist/alelyon_ai-0.1.0a3.tar.gz
+python -m twine check --strict dist/alelyon_ai-0.1.0a3-py3-none-win_amd64.whl dist/alelyon_ai-0.1.0a3.tar.gz
 ```
 
 Use both `--sdist --wheel`: the frontend's default wheel-from-sdist rebuild has

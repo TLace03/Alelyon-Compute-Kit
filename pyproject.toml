@@ -5,7 +5,7 @@ backend-path = ["tools"]
 
 [project]
 name = "alelyon-ai"
-version = "0.1.0a2"
+version = "0.1.0a3"
 description = "Experimental vendor-neutral compute SDK with explicit native execution"
 readme = "README.md"
 requires-python = ">=3.10"
