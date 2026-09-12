@@ -1,0 +1,97 @@
+#version 460
+// embedding-f32/v2: contiguous gather and deterministic dense weight gradient.
+// v3 (2026-09-08) lifts the diagnostic guards to the plan's v3 bounds: 65,536
+// tokens, a 65,536-entry vocabulary, 16,384 features, 2^30 dense elements --
+// the 1B `xl` model's d_model is 2,048 and v2's 1,024 refused it outright.
+// The immutable host plan owns the validated IDs / stable CSR upload image.
+// Each output has one writer. Backward visits matching positions in original
+// token order; no floating-point atomics, subgroup operations or shared memory.
+layout(local_size_x = 64) in;
+// Integer storage makes gather a bit-preserving copy, including signed zero
+// and subnormals, without a floating-point conversion or arithmetic operation.
+layout(set = 0, binding = 0, std430) readonly buffer Primary { uint primary[]; };
+layout(set = 0, binding = 1, std430) readonly buffer Indices { uint indices[]; };
+layout(set = 0, binding = 2, std430) readonly buffer Offsets { uint offsets[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer Output { uint output_bits[]; };
+layout(push_constant) uniform Plan { uint n; uint vocab; uint dim; uint op; } p;
+
+const uint NAN_BITS = 0x7fc00000u;
+
+// These four MIRROR src/embedding_ops.rs (MAX_N, MAX_VOCAB, MAX_DIM,
+// MAX_ELEMENTS) and drifted from it once already: v2's 1,024-feature literal
+// stayed here when the Rust bound went to 16,384 on 2026-09-08, and because the
+// guard below RETURNED SILENTLY the entry reported success while writing
+// nothing. Measured at dim 2,048: the output kept its zeros and rc was ACK_OK.
+// tests/languages/test_compute_kit_kernel_bounds.py now parses both sides and
+// refuses a mismatch, so a future drift fails a test instead of a model.
+// v4 (2026-09-08) raises MAX_VOCAB to 262,144: the registered contract's
+// vocabulary is 151,936, not the 32,768 the v3 bound was sized for, so the host
+// refused the gather and the dense backward on every microbatch pass.
+const uint MAX_N        = 65536u;
+const uint MAX_VOCAB    = 262144u;
+const uint MAX_DIM      = 16384u;
+const uint MAX_ELEMENTS = 1073741824u;
+
+void main() {
+    // These are diagnostics for accidental raw-ABI misuse, not a replacement
+    // for host validation, exact buffer sizes, ownership and synchronization.
+    uint i = gl_GlobalInvocationID.x;
+    // POISON, DO NOT RETURN. A bare return here leaves the caller's buffer
+    // exactly as it was and the C entry still reports ACK_OK, so a bound that
+    // has drifted from the host's produces a silently wrong answer rather than
+    // a refusal. Writing NaN makes the same drift loud, and costs nothing: the
+    // host plan validates all of this first, so a live dispatch never lands here.
+    if (p.n == 0u || p.n > MAX_N || p.vocab == 0u || p.vocab > MAX_VOCAB ||
+        p.dim == 0u || p.dim > MAX_DIM || p.op > 1u) {
+        if (i < uint(output_bits.length())) output_bits[i] = NAN_BITS;
+        return;
+    }
+    // DIVIDE, DO NOT MULTIPLY. `p.vocab * p.dim` at the v4 bounds reaches
+    // 262,144 x 16,384 = 2^32, which WRAPS TO ZERO in uint. A wrapped product
+    // passes an element guard written as `product > MAX_ELEMENTS`, makes `count`
+    // zero, and then every invocation takes the bare `i >= count` return below
+    // having written nothing -- while the C entry still reports ACK_OK. That is
+    // the silent no-op this crate has now fixed twice (PR #1006 matmul, PR #1011
+    // embedding). The division form is exactly equivalent for p.dim >= 1, which
+    // the dimension guard above has already established, and cannot overflow at
+    // any bound: a > E / b holds precisely when a * b > E over the integers.
+    if (p.n > MAX_ELEMENTS / p.dim || p.vocab > MAX_ELEMENTS / p.dim) {
+        if (i < uint(output_bits.length())) output_bits[i] = NAN_BITS;
+        return;
+    }
+    uint token_elements = p.n * p.dim;
+    uint weight_elements = p.vocab * p.dim;
+    uint count = p.op == 0u ? token_elements : weight_elements;
+    if (i >= count || i >= uint(output_bits.length())) return;
+    uint primary_count = p.op == 0u ? weight_elements : token_elements;
+    uint offsets_count = p.op == 0u ? 1u : p.vocab + 1u;
+    if (uint(primary.length()) < primary_count || uint(indices.length()) < p.n ||
+        uint(offsets.length()) < offsets_count) {
+        output_bits[i] = NAN_BITS;
+        return;
+    }
+    uint row = i / p.dim;
+    uint feature = i % p.dim;
+    if (p.op == 0u) {
+        uint id = indices[row];
+        output_bits[i] = id < p.vocab ? primary[id * p.dim + feature] : NAN_BITS;
+        return;
+    }
+    uint begin = offsets[row];
+    uint end = offsets[row + 1u];
+    if (begin > end || end > p.n) {
+        output_bits[i] = NAN_BITS;
+        return;
+    }
+    precise float sum = 0.0;
+    for (uint j = begin; j < end; ++j) {
+        uint position = indices[j];
+        if (position >= p.n) {
+            output_bits[i] = NAN_BITS;
+            return;
+        }
+        sum = sum + uintBitsToFloat(primary[position * p.dim + feature]);
+    }
+    // Empty CSR rows explicitly overwrite NaN-poisoned output with positive zero.
+    output_bits[i] = floatBitsToUint(sum);
+}

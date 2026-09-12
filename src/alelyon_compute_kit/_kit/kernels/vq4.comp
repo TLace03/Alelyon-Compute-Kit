@@ -1,0 +1,177 @@
+#version 450
+// vq4/v1: 16 FP32 codebook vectors of 8, 16 or 32 values. Eight
+// four-bit indices occupy each little-endian u32. No scales/master copy.
+// Read bindings 0..3; output 4; atomic status 5 (caller clears it).
+// Status bit 0 means nonfinite input/arithmetic; bit 1 means a defensive
+// layout/bounds failure; bit 2 means invalid AdamW coefficients/moments.
+// ACK_OK only records work: read status before using
+// any output. Input/output allocation aliasing is refused by the host.
+// Encode assigns one whole u32 per invocation, making unused high nibbles
+// zero without races. The final partial vector compares valid values only;
+// equal squared distances select the lowest index. All codebook values,
+// including unused entries/components, must be finite. Op3 consumes packed
+// [W,M,V,G] in b0, their four concatenated codebooks in b1, and seven FP32
+// [lr,beta1,beta2,eps,decay,correction1,correction2] values in b2. It writes
+// dense scratch [Wnew,Mnew,Vnew], never a persistent FP32 master copy.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer In0 { uint b0[]; };
+layout(set = 0, binding = 1, std430) readonly buffer In1 { uint b1[]; };
+layout(set = 0, binding = 2, std430) readonly buffer In2 { uint b2[]; };
+layout(set = 0, binding = 3, std430) readonly buffer In3 { uint b3[]; };
+layout(set = 0, binding = 4, std430) writeonly buffer Output { uint dst[]; };
+layout(set = 0, binding = 5, std430) buffer Status { uint status[]; };
+layout(push_constant) uniform Push {
+    uint op; uint m; uint n; uint k;
+    uint group; uint entries; uint flags; uint reserved;
+} p;
+
+const uint MAX_VALUES = 268435456u;
+const uint MAX_DIM = 65536u;
+const uint MAX_MATMUL_MACS = 268435456u;
+uint div_up(uint x, uint d) { return x / d + uint(x % d != 0u); }
+uint words_for(uint values) { return div_up(div_up(values, p.group), 8u); }
+bool finite_value(float x) { return !isnan(x) && !isinf(x); }
+void nonfinite() { atomicOr(status[0], 1u); }
+void invalid() { atomicOr(status[0], 2u); }
+void invalid_optimizer() { atomicOr(status[0], 4u); }
+
+bool valid_layout() {
+    if ((p.group != 8u && p.group != 16u && p.group != 32u) ||
+        p.entries != 16u || p.reserved != 0u || p.op > 3u || p.m == 0u)
+        return false;
+    if (p.op == 3u) {
+        if (p.n != 1u || p.k != 1u || p.flags != 0u || p.m > MAX_VALUES / 3u)
+            return false;
+        return uint(b0.length()) >= 4u * words_for(p.m) &&
+               uint(b1.length()) >= 64u * p.group &&
+               uint(b2.length()) >= 7u && uint(dst.length()) >= 3u * p.m;
+    }
+    if (p.op < 2u) {
+        if (p.n != 1u || p.k != 1u || p.flags != 0u || p.m > MAX_VALUES)
+            return false;
+        uint packed = words_for(p.m);
+        return uint(b1.length()) >= 16u * p.group &&
+            (p.op == 0u ? uint(b0.length()) >= p.m && uint(dst.length()) >= packed :
+                           uint(b0.length()) >= packed && uint(dst.length()) >= p.m);
+    }
+    if (p.n == 0u || p.k == 0u || p.m > MAX_DIM || p.n > MAX_DIM ||
+        p.k > MAX_DIM || p.flags > 3u || p.m > MAX_VALUES / p.n ||
+        p.m > MAX_VALUES / p.k || p.n > MAX_VALUES / p.k)
+        return false;
+    if (p.m * p.n > MAX_MATMUL_MACS / p.k) return false;
+    return uint(b0.length()) >= words_for(p.m * p.k) &&
+           uint(b1.length()) >= 16u * p.group &&
+           uint(b2.length()) >= words_for(p.k * p.n) &&
+           uint(b3.length()) >= 16u * p.group &&
+           uint(dst.length()) >= p.m * p.n;
+}
+
+float unpack_a(uint logical) {
+    uint vector = logical / p.group;
+    uint code = (b0[vector / 8u] >> (4u * (vector % 8u))) & 15u;
+    return uintBitsToFloat(b1[code * p.group + logical % p.group]);
+}
+float unpack_b(uint logical) {
+    uint vector = logical / p.group;
+    uint code = (b2[vector / 8u] >> (4u * (vector % 8u))) & 15u;
+    return uintBitsToFloat(b3[code * p.group + logical % p.group]);
+}
+
+float unpack_state(uint logical, uint state) {
+    uint vector = logical / p.group;
+    uint code = (b0[state * words_for(p.m) + vector / 8u] >>
+                 (4u * (vector % 8u))) & 15u;
+    return uintBitsToFloat(b1[state * 16u * p.group + code * p.group + logical % p.group]);
+}
+
+void adamw_value(uint i) {
+    float lr = uintBitsToFloat(b2[0]), beta1 = uintBitsToFloat(b2[1]);
+    float beta2 = uintBitsToFloat(b2[2]), eps = uintBitsToFloat(b2[3]);
+    float decay = uintBitsToFloat(b2[4]), correction1 = uintBitsToFloat(b2[5]);
+    float correction2 = uintBitsToFloat(b2[6]);
+    for (uint j = 0u; j < 7u; ++j) {
+        if (!finite_value(uintBitsToFloat(b2[j]))) { nonfinite(); return; }
+    }
+    if (lr < 0.0 || beta1 < 0.0 || beta1 >= 1.0 || beta2 < 0.0 || beta2 >= 1.0 ||
+        eps <= 0.0 || decay < 0.0 || correction1 <= 0.0 || correction1 > 1.0 ||
+        correction2 <= 0.0 || correction2 > 1.0) { invalid_optimizer(); return; }
+    float weight = unpack_state(i, 0u), moment = unpack_state(i, 1u);
+    float variance = unpack_state(i, 2u), gradient = unpack_state(i, 3u);
+    if (!finite_value(weight) || !finite_value(moment) || !finite_value(variance) ||
+        !finite_value(gradient)) { nonfinite(); return; }
+    if (variance < 0.0) { invalid_optimizer(); return; }
+    precise float next_m = beta1 * moment + (1.0 - beta1) * gradient;
+    precise float next_v = beta2 * variance + (1.0 - beta2) * (gradient * gradient);
+    precise float corrected_m = next_m / correction1;
+    precise float corrected_v = next_v / correction2;
+    precise float denominator = sqrt(corrected_v) + eps;
+    precise float decayed = weight * (1.0 - lr * decay);
+    precise float next_w = decayed - lr * corrected_m / denominator;
+    if (!finite_value(next_m) || !finite_value(next_v) || !finite_value(corrected_m) ||
+        !finite_value(corrected_v) || !finite_value(denominator) ||
+        !finite_value(decayed) || !finite_value(next_w)) nonfinite();
+    dst[i] = floatBitsToUint(next_w);
+    dst[p.m + i] = floatBitsToUint(next_m);
+    dst[2u * p.m + i] = floatBitsToUint(next_v);
+}
+
+void encode_word(uint word) {
+    uint packed = 0u;
+    uint vectors = div_up(p.m, p.group);
+    for (uint nibble = 0u; nibble < 8u; ++nibble) {
+        uint vector = word * 8u + nibble;
+        if (vector >= vectors) break;
+        uint start = vector * p.group;
+        uint valid = min(p.group, p.m - start);
+        float best = uintBitsToFloat(0x7f800000u);
+        uint selected = 0u;
+        for (uint code = 0u; code < 16u; ++code) {
+            precise float distance = 0.0;
+            for (uint j = 0u; j < valid; ++j) {
+                float value = uintBitsToFloat(b0[start + j]);
+                float book = uintBitsToFloat(b1[code * p.group + j]);
+                precise float delta = value - book;
+                precise float squared = delta * delta;
+                distance = distance + squared;
+                if (!finite_value(value) || !finite_value(book) ||
+                    !finite_value(distance)) nonfinite();
+            }
+            if (distance < best) { best = distance; selected = code; }
+        }
+        packed |= selected << (4u * nibble);
+    }
+    dst[word] = packed;
+}
+
+void main() {
+    // A caller bypassing the native ABI cannot receive a status without a
+    // status word. Every supported ABI call validates this before recording.
+    if (status.length() < 1) return;
+    if (!valid_layout()) { invalid(); return; }
+    uint i = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 64u +
+             gl_LocalInvocationID.x;
+    uint launched = gl_NumWorkGroups.x * gl_NumWorkGroups.y * 64u;
+    uint book_values = (p.op == 3u ? 64u : 16u) * p.group;
+    for (uint j = i; j < book_values; j += launched) {
+        if (!finite_value(uintBitsToFloat(b1[j]))) nonfinite();
+        if (p.op == 2u && !finite_value(uintBitsToFloat(b3[j]))) nonfinite();
+    }
+    if (p.op == 0u) {
+        if (i < words_for(p.m)) encode_word(i);
+    } else if (p.op == 1u) {
+        if (i < p.m) dst[i] = floatBitsToUint(unpack_a(i));
+    } else if (p.op == 3u) {
+        if (i < p.m) adamw_value(i);
+    } else if (i < p.m * p.n) {
+        uint row = i / p.n, col = i % p.n;
+        precise float total = 0.0;
+        for (uint inner = 0u; inner < p.k; ++inner) {
+            uint ai = (p.flags & 1u) != 0u ? inner * p.m + row : row * p.k + inner;
+            uint bi = (p.flags & 2u) != 0u ? col * p.k + inner : inner * p.n + col;
+            precise float product = unpack_a(ai) * unpack_b(bi);
+            total = total + product;
+            if (!finite_value(product) || !finite_value(total)) nonfinite();
+        }
+        dst[i] = floatBitsToUint(total);
+    }
+}

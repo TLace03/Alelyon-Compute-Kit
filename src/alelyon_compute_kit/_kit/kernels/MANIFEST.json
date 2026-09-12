@@ -1,0 +1,334 @@
+{
+  "compiler_version_declared": [
+    "shaderc v2026.1 v2026.1",
+    "spirv-tools v2026.1 v2022.4-1089-gfbe4f3ad",
+    "glslang 11.1.0-1366-gf0bd0257",
+    "",
+    "Target: SPIR-V 1.0"
+  ],
+  "export_source_manifest_sha256": "f15cea46a875988a831f0a22ba8704cc7f2bf011a96c324cec5a35ebf31dad9b",
+  "kernels": {
+    "cast_bf16_f32.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DMODE=1",
+      "reproduced": true,
+      "source": "cast_f32_bf16.comp",
+      "source_sha256": "c934380a18f8f81e6e599d42ee1e778a7f23007bb5de3c6db853dcd1e5a56966",
+      "spirv_bytes": 1336,
+      "spirv_sha256": "97519dc64d78d9abfdbda12d194e278d3ae58d8b9f84c2aed524c09b60ffa73a"
+    },
+    "cast_f32_bf16.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DMODE=0",
+      "reproduced": true,
+      "source": "cast_f32_bf16.comp",
+      "source_sha256": "c934380a18f8f81e6e599d42ee1e778a7f23007bb5de3c6db853dcd1e5a56966",
+      "spirv_bytes": 1848,
+      "spirv_sha256": "09c2afb63588970cefc1e02a216edc50a502c5daf49a4c5f43f621eed7586c5f"
+    },
+    "coopmat_bf16_v4_128x128_nn.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DBM=128 -DBN=128 -DBK=32 -DSG_ROWS=2 -DSG_COLS=2 -DA_T=0 -DB_T=0 -DPAD=1",
+      "reproduced": true,
+      "source": "coopmat_bf16_tiled_v4.comp",
+      "source_sha256": "af915f94182564c077d2a1ae9094736376237fedeac99b9d5e56cf5aab4fde8e",
+      "spirv_bytes": 8000,
+      "spirv_sha256": "de6612aaa921f45f55bc731b17d0e1b385e97f5ca6baf974c2bc9c52e31a6adb"
+    },
+    "coopmat_bf16_v4_128x128_nt.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DBM=128 -DBN=128 -DBK=32 -DSG_ROWS=2 -DSG_COLS=2 -DA_T=0 -DB_T=1 -DPAD=1",
+      "reproduced": true,
+      "source": "coopmat_bf16_tiled_v4.comp",
+      "source_sha256": "af915f94182564c077d2a1ae9094736376237fedeac99b9d5e56cf5aab4fde8e",
+      "spirv_bytes": 7928,
+      "spirv_sha256": "891f264ddbaa63eaf84d1e4038c16f0f22cb84b2e7aa868bcf85d53c2b8ede08"
+    },
+    "coopmat_bf16_v4_128x128_tn.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DBM=128 -DBN=128 -DBK=32 -DSG_ROWS=2 -DSG_COLS=2 -DA_T=1 -DB_T=0 -DPAD=1",
+      "reproduced": true,
+      "source": "coopmat_bf16_tiled_v4.comp",
+      "source_sha256": "af915f94182564c077d2a1ae9094736376237fedeac99b9d5e56cf5aab4fde8e",
+      "spirv_bytes": 7976,
+      "spirv_sha256": "f6eed1993b8a4248377650e3f81cbdf2d77abbad438e2ec45fdaf499c9c2f8e5"
+    },
+    "coopmat_bf16_v4_128x128_tt.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DBM=128 -DBN=128 -DBK=32 -DSG_ROWS=2 -DSG_COLS=2 -DA_T=1 -DB_T=1 -DPAD=1",
+      "reproduced": true,
+      "source": "coopmat_bf16_tiled_v4.comp",
+      "source_sha256": "af915f94182564c077d2a1ae9094736376237fedeac99b9d5e56cf5aab4fde8e",
+      "spirv_bytes": 8000,
+      "spirv_sha256": "c4c0a28e48ccbe030b5c07b1c3050d9c0999987babcc376bf1d8965204f9468c"
+    },
+    "coopmat_bf16_v4e_128x128_nn.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DBM=128 -DBN=128 -DBK=32 -DSG_ROWS=2 -DSG_COLS=2 -DA_T=0 -DB_T=0 -DPAD=1 -DEDGE=1",
+      "reproduced": true,
+      "source": "coopmat_bf16_tiled_v4.comp",
+      "source_sha256": "af915f94182564c077d2a1ae9094736376237fedeac99b9d5e56cf5aab4fde8e",
+      "spirv_bytes": 13564,
+      "spirv_sha256": "e345d9ae1e223dca08afb47eb71f02fa3e83e66983cd5a3817eee6f0aa26c7e1"
+    },
+    "coopmat_bf16_v4e_128x128_nt.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DBM=128 -DBN=128 -DBK=32 -DSG_ROWS=2 -DSG_COLS=2 -DA_T=0 -DB_T=1 -DPAD=1 -DEDGE=1",
+      "reproduced": true,
+      "source": "coopmat_bf16_tiled_v4.comp",
+      "source_sha256": "af915f94182564c077d2a1ae9094736376237fedeac99b9d5e56cf5aab4fde8e",
+      "spirv_bytes": 13492,
+      "spirv_sha256": "b64988a1aadc7793230052e88434e20621ddb045b61408c41cff9f16c5902717"
+    },
+    "coopmat_bf16_v4e_128x128_tn.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DBM=128 -DBN=128 -DBK=32 -DSG_ROWS=2 -DSG_COLS=2 -DA_T=1 -DB_T=0 -DPAD=1 -DEDGE=1",
+      "reproduced": true,
+      "source": "coopmat_bf16_tiled_v4.comp",
+      "source_sha256": "af915f94182564c077d2a1ae9094736376237fedeac99b9d5e56cf5aab4fde8e",
+      "spirv_bytes": 13540,
+      "spirv_sha256": "90fb66566524ff7e1d5e646dbbf0367ae385aaaec6e82ea983273a0a66dc1419"
+    },
+    "coopmat_bf16_v4e_128x128_tt.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DBM=128 -DBN=128 -DBK=32 -DSG_ROWS=2 -DSG_COLS=2 -DA_T=1 -DB_T=1 -DPAD=1 -DEDGE=1",
+      "reproduced": true,
+      "source": "coopmat_bf16_tiled_v4.comp",
+      "source_sha256": "af915f94182564c077d2a1ae9094736376237fedeac99b9d5e56cf5aab4fde8e",
+      "spirv_bytes": 13564,
+      "spirv_sha256": "816f29c8fe72cce7df4d4e0e94ef2d15224fb26519dfc1904c02565ec9c03842"
+    },
+    "embedding_f32.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O",
+      "reproduced": true,
+      "source": "embedding_f32.comp",
+      "source_sha256": "131034556f23b0513ef039975a38e7cb4452f95e56f9f1f554e4d1631bb51f22",
+      "spirv_bytes": 5144,
+      "spirv_sha256": "ffb69bfe8e5452e4b7cc48f3928398eb076f0e9acba4692fe0419d5678061b82"
+    },
+    "loss_f32.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O",
+      "reproduced": true,
+      "source": "loss_f32.comp",
+      "source_sha256": "85b901ac372c7f192aea95fd4bc9eeb0ab82b46e12429cb23125f175ea2216af",
+      "spirv_bytes": 8404,
+      "spirv_sha256": "90a21f9aa4aed487375a1de6daecdb77dc5e434e8c90e57d35181be539bb2dae"
+    },
+    "matmul_f32.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O",
+      "reproduced": true,
+      "source": "matmul_f32.comp",
+      "source_sha256": "8171173e0ae4bf97fca77040e2e1deb802fa0a8595d87a9533749f16044c8686",
+      "spirv_bytes": 11424,
+      "spirv_sha256": "ec528371b6d3f3d025639c95a9269a6711274e66be80da5b4c99196a04554156"
+    },
+    "matmul_f32_v2.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O",
+      "reproduced": true,
+      "source": "matmul_f32_v2.comp",
+      "source_sha256": "5afef453b477076d0bc37d7bb18a6e21bd8a1df12c7882019dd19930ea59881d",
+      "spirv_bytes": 13044,
+      "spirv_sha256": "ead4e36b1303f227f767a39bae26c28389bf85c1a61b35510a3c8df6d40d7395"
+    },
+    "pointwise_bf16_out.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DDT_X=0 -DDT_Y=0 -DDT_Z=0 -DDT_OUT=1",
+      "reproduced": true,
+      "source": "pointwise_f32.comp",
+      "source_sha256": "c5429fa817d60a9a74b2063f20b3e54b3081cdb03f874a6e788ce781cd66aaec",
+      "spirv_bytes": 20456,
+      "spirv_sha256": "3544bf4e51f1df1fb7283285e35b42fff428a9aca8def66d791d096e3ac7476b"
+    },
+    "pointwise_bf16_x.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DDT_X=1 -DDT_Y=0 -DDT_Z=0 -DDT_OUT=0",
+      "reproduced": true,
+      "source": "pointwise_f32.comp",
+      "source_sha256": "c5429fa817d60a9a74b2063f20b3e54b3081cdb03f874a6e788ce781cd66aaec",
+      "spirv_bytes": 19968,
+      "spirv_sha256": "616d046056c94a9d1676f6c8bfbe07bc7756eb0a3eafc65291b433e633e2f095"
+    },
+    "pointwise_bf16_xout.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DDT_X=1 -DDT_Y=0 -DDT_Z=0 -DDT_OUT=1",
+      "reproduced": true,
+      "source": "pointwise_f32.comp",
+      "source_sha256": "c5429fa817d60a9a74b2063f20b3e54b3081cdb03f874a6e788ce781cd66aaec",
+      "spirv_bytes": 20508,
+      "spirv_sha256": "00677d77b39de0ec3621a72626b255650bb8fd8143fb4fdceb498f6a0492b665"
+    },
+    "pointwise_bf16_xy.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DDT_X=1 -DDT_Y=1 -DDT_Z=0 -DDT_OUT=0",
+      "reproduced": true,
+      "source": "pointwise_f32.comp",
+      "source_sha256": "c5429fa817d60a9a74b2063f20b3e54b3081cdb03f874a6e788ce781cd66aaec",
+      "spirv_bytes": 20020,
+      "spirv_sha256": "f906a3b1307b21cc3a69710fb6e0d1309bae23939fab7f48ae77fac8a3c9c6b0"
+    },
+    "pointwise_bf16_xyout.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DDT_X=1 -DDT_Y=1 -DDT_Z=0 -DDT_OUT=1",
+      "reproduced": true,
+      "source": "pointwise_f32.comp",
+      "source_sha256": "c5429fa817d60a9a74b2063f20b3e54b3081cdb03f874a6e788ce781cd66aaec",
+      "spirv_bytes": 20560,
+      "spirv_sha256": "76406e8fedadfe20d819acb96db0c4e98c048c78b4a8291bc626981987bbfa1f"
+    },
+    "pointwise_bf16_xyz.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DDT_X=1 -DDT_Y=1 -DDT_Z=1 -DDT_OUT=0",
+      "reproduced": true,
+      "source": "pointwise_f32.comp",
+      "source_sha256": "c5429fa817d60a9a74b2063f20b3e54b3081cdb03f874a6e788ce781cd66aaec",
+      "spirv_bytes": 20072,
+      "spirv_sha256": "91431b5aa2613e6a29b6ea0eda072807e34ab94194df8a6472035d93c9c693a3"
+    },
+    "pointwise_bf16_xyzout.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DDT_X=1 -DDT_Y=1 -DDT_Z=1 -DDT_OUT=1",
+      "reproduced": true,
+      "source": "pointwise_f32.comp",
+      "source_sha256": "c5429fa817d60a9a74b2063f20b3e54b3081cdb03f874a6e788ce781cd66aaec",
+      "spirv_bytes": 20596,
+      "spirv_sha256": "10f7a85e6c2bc55a1d8a167999dc16ad323d6a8bd8ebc1d8280f88dbf54319bf"
+    },
+    "pointwise_bf16_xz.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DDT_X=1 -DDT_Y=0 -DDT_Z=1 -DDT_OUT=0",
+      "reproduced": true,
+      "source": "pointwise_f32.comp",
+      "source_sha256": "c5429fa817d60a9a74b2063f20b3e54b3081cdb03f874a6e788ce781cd66aaec",
+      "spirv_bytes": 20020,
+      "spirv_sha256": "54b0b306916d2e33d60d03c7c4a70b2bb88881c5d2b93f9472c6b1aa16eb92a7"
+    },
+    "pointwise_bf16_xzout.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DDT_X=1 -DDT_Y=0 -DDT_Z=1 -DDT_OUT=1",
+      "reproduced": true,
+      "source": "pointwise_f32.comp",
+      "source_sha256": "c5429fa817d60a9a74b2063f20b3e54b3081cdb03f874a6e788ce781cd66aaec",
+      "spirv_bytes": 20560,
+      "spirv_sha256": "adb4272aae2e8b152ecc1c9fad76673c9c4f5248e15fcea6da0a667b5a69d74d"
+    },
+    "pointwise_bf16_y.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DDT_X=0 -DDT_Y=1 -DDT_Z=0 -DDT_OUT=0",
+      "reproduced": true,
+      "source": "pointwise_f32.comp",
+      "source_sha256": "c5429fa817d60a9a74b2063f20b3e54b3081cdb03f874a6e788ce781cd66aaec",
+      "spirv_bytes": 19968,
+      "spirv_sha256": "248f9b8a0abd4a770611fd92c57e4d3229e5f9564e115223763eacf15a31f29b"
+    },
+    "pointwise_bf16_yout.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DDT_X=0 -DDT_Y=1 -DDT_Z=0 -DDT_OUT=1",
+      "reproduced": true,
+      "source": "pointwise_f32.comp",
+      "source_sha256": "c5429fa817d60a9a74b2063f20b3e54b3081cdb03f874a6e788ce781cd66aaec",
+      "spirv_bytes": 20508,
+      "spirv_sha256": "98c9dba822b477a25e70450b7509a68c9d31838e62ca2f3d265966737f12bfb2"
+    },
+    "pointwise_bf16_yz.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DDT_X=0 -DDT_Y=1 -DDT_Z=1 -DDT_OUT=0",
+      "reproduced": true,
+      "source": "pointwise_f32.comp",
+      "source_sha256": "c5429fa817d60a9a74b2063f20b3e54b3081cdb03f874a6e788ce781cd66aaec",
+      "spirv_bytes": 20020,
+      "spirv_sha256": "5e0384f3a7ed977f232ada655c68226377b384a9ef5422954038b84636cb6f9b"
+    },
+    "pointwise_bf16_yzout.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DDT_X=0 -DDT_Y=1 -DDT_Z=1 -DDT_OUT=1",
+      "reproduced": true,
+      "source": "pointwise_f32.comp",
+      "source_sha256": "c5429fa817d60a9a74b2063f20b3e54b3081cdb03f874a6e788ce781cd66aaec",
+      "spirv_bytes": 20560,
+      "spirv_sha256": "84d983c72e73c5d44fc0dd2e593f12b11adcabb57abf63501f5d84e0ad7ee15f"
+    },
+    "pointwise_bf16_z.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DDT_X=0 -DDT_Y=0 -DDT_Z=1 -DDT_OUT=0",
+      "reproduced": true,
+      "source": "pointwise_f32.comp",
+      "source_sha256": "c5429fa817d60a9a74b2063f20b3e54b3081cdb03f874a6e788ce781cd66aaec",
+      "spirv_bytes": 19968,
+      "spirv_sha256": "3a3252f4f364e9442df5a26f3138c84466655536069aa88e5ea178f08915b773"
+    },
+    "pointwise_bf16_zout.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DDT_X=0 -DDT_Y=0 -DDT_Z=1 -DDT_OUT=1",
+      "reproduced": true,
+      "source": "pointwise_f32.comp",
+      "source_sha256": "c5429fa817d60a9a74b2063f20b3e54b3081cdb03f874a6e788ce781cd66aaec",
+      "spirv_bytes": 20508,
+      "spirv_sha256": "25a788f97ea12d59a50c1ba2b699775ff831cbc35985bb9b671d5ce4d0c0fd3e"
+    },
+    "pointwise_f32.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O",
+      "reproduced": true,
+      "source": "pointwise_f32.comp",
+      "source_sha256": "c5429fa817d60a9a74b2063f20b3e54b3081cdb03f874a6e788ce781cd66aaec",
+      "spirv_bytes": 19852,
+      "spirv_sha256": "4c2f44d16b8ba0f2fd35a508235757b43b1cb0b3b2b64d4f9f585409916a4045"
+    },
+    "reduce_bf16_in.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DDT_IN=1 -DDT_OUT=0",
+      "reproduced": true,
+      "source": "reduce_f32.comp",
+      "source_sha256": "c85f24a432a528b6b35025a59e3f1dce6138b536234084ccff98003567d0e976",
+      "spirv_bytes": 7064,
+      "spirv_sha256": "934cfa55828779c0f25e82cbbd19527fc10a80e827c488a26ae9058e1e574044"
+    },
+    "reduce_bf16_inout.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DDT_IN=1 -DDT_OUT=1",
+      "reproduced": true,
+      "source": "reduce_f32.comp",
+      "source_sha256": "c85f24a432a528b6b35025a59e3f1dce6138b536234084ccff98003567d0e976",
+      "spirv_bytes": 7604,
+      "spirv_sha256": "0c8a0833bdd36851079b26b5fc3851727123665bf8476c04b2adcecd802b54fe"
+    },
+    "reduce_bf16_out.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DDT_IN=0 -DDT_OUT=1",
+      "reproduced": true,
+      "source": "reduce_f32.comp",
+      "source_sha256": "c85f24a432a528b6b35025a59e3f1dce6138b536234084ccff98003567d0e976",
+      "spirv_bytes": 7568,
+      "spirv_sha256": "136e16a949ce68e9f40ef9b74c4f43ba05f8ed4a8b567c5223033dcbb6cee084"
+    },
+    "reduce_f32.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O",
+      "reproduced": true,
+      "source": "reduce_f32.comp",
+      "source_sha256": "c85f24a432a528b6b35025a59e3f1dce6138b536234084ccff98003567d0e976",
+      "spirv_bytes": 6948,
+      "spirv_sha256": "03842b7803936bd0bbf69e996b3d0e90f410fa5e8b986d51f439dc0e50c42108"
+    },
+    "reduce_f32_v2.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O",
+      "reproduced": true,
+      "source": "reduce_f32_v2.comp",
+      "source_sha256": "7ec03919919873d24b1433ec9b078215636c9d6c4d9eb3e6bc2bb760ee7f5cf6",
+      "spirv_bytes": 11120,
+      "spirv_sha256": "d96caced3f2f79cc606117d5ec8fa91323e1b0da356d4b2d9ef5098a5cb74cf4"
+    },
+    "reduce_v2_bf16_in.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DDT_IN=1 -DDT_OUT=0",
+      "reproduced": true,
+      "source": "reduce_f32_v2.comp",
+      "source_sha256": "7ec03919919873d24b1433ec9b078215636c9d6c4d9eb3e6bc2bb760ee7f5cf6",
+      "spirv_bytes": 11236,
+      "spirv_sha256": "091c6ddf5e1d0973434fcd06f3eed1bc2366108b02c914b71476f5c8c31cd052"
+    },
+    "reduce_v2_bf16_inout.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DDT_IN=1 -DDT_OUT=1",
+      "reproduced": true,
+      "source": "reduce_f32_v2.comp",
+      "source_sha256": "7ec03919919873d24b1433ec9b078215636c9d6c4d9eb3e6bc2bb760ee7f5cf6",
+      "spirv_bytes": 11776,
+      "spirv_sha256": "d239f7e1f7f0e1ecf54ceee72176efc7b6d86b98d8831f4e1131eb0386a99aaf"
+    },
+    "reduce_v2_bf16_out.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O -DDT_IN=0 -DDT_OUT=1",
+      "reproduced": true,
+      "source": "reduce_f32_v2.comp",
+      "source_sha256": "7ec03919919873d24b1433ec9b078215636c9d6c4d9eb3e6bc2bb760ee7f5cf6",
+      "spirv_bytes": 11740,
+      "spirv_sha256": "8b0e530bc52b875e140b4b4984701313b6ec8f825c28cd069823df298c0757e9"
+    },
+    "rowwise_f32.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O",
+      "reproduced": true,
+      "source": "rowwise_f32.comp",
+      "source_sha256": "07a1bdf60b5ffb24f4ff66f88b4a8a904668e6243ff56e43db1465aa8fafc6de",
+      "spirv_bytes": 13048,
+      "spirv_sha256": "3db331eefcddb8dc6d1ca28790f7461154e67ec7d0cec97e70d57637d1e4ae35"
+    },
+    "vq4.spv": {
+      "compiler": "glslc --target-env=vulkan1.4 -O",
+      "reproduced": true,
+      "source": "vq4.comp",
+      "source_sha256": "dc6dfee56361d12869ecec4ded74294d8e0f20292a41f4be8327567a2826a5a4",
+      "spirv_bytes": 21784,
+      "spirv_sha256": "2fe601c8683c86d59736d91be5649d45f34597b3ad7f9948f08db934f1cc96ee"
+    }
+  },
+  "schema": 3,
+  "target": "--target-env=vulkan1.4"
+}

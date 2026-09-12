@@ -1,0 +1,179 @@
+#version 450
+// matmul-f32/v1: C[b,i,j] = sum_l A[b,i,l] * B[b,l,j].
+// Three FP32 storage buffers, positive element strides, no broadcasting.
+// Host planning validates geometry, extents and non-overlapping output.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer AValues { float a_values[]; };
+layout(set = 0, binding = 1, std430) readonly buffer BValues { float b_values[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer CValues { float c_values[]; };
+
+layout(push_constant) uniform Plan {
+    uint batch;
+    uint m;
+    uint n;
+    uint k;
+    uint a_offset;
+    uint a_batch_stride;
+    uint a_row_stride;
+    uint a_col_stride;
+    uint b_offset;
+    uint b_batch_stride;
+    uint b_row_stride;
+    uint b_col_stride;
+    uint c_offset;
+    uint c_batch_stride;
+    uint c_row_stride;
+    uint c_col_stride;
+} p;
+
+shared float a_tile[8][8];
+shared float b_tile[8][8];
+
+// EVERY CAPACITY LITERAL BELOW IS A COPY. The originals are Rust constants in
+// src/matmul_ops.rs (MAX_BATCH, MAX_DIM, MAX_K, MAX_ADDRESSED_ELEMENTS), also
+// mirrored in python/ack.py and torch_backend/ack_backend.cpp. A copy that
+// drifts BELOW the host's is silent: the guards in main() return having
+// written nothing, while the host call still reports ACK_OK. Parity across the
+// four sources and this compiled .spv is asserted by
+// tests/languages/test_compute_kit_matmul_bounds.py and by
+// tests/matmul_plan.rs::the_capacity_bounds_are_identical_in_every_copy.
+const uint LIMIT = 268435456u;   // MAX_ADDRESSED_ELEMENTS; a 32-bit uint, so it must fit u32
+
+bool valid_extent(
+    uint offset,
+    uint batch_stride,
+    uint row_stride,
+    uint col_stride,
+    uint batches,
+    uint rows,
+    uint cols,
+    uint available
+) {
+    if (batch_stride == 0u || row_stride == 0u || col_stride == 0u ||
+        offset >= LIMIT || available == 0u)
+        return false;
+    uint maximum = offset;
+    uint factor = batches - 1u;
+    if (factor > (LIMIT - 1u - maximum) / batch_stride) return false;
+    maximum += factor * batch_stride;
+    factor = rows - 1u;
+    if (factor > (LIMIT - 1u - maximum) / row_stride) return false;
+    maximum += factor * row_stride;
+    factor = cols - 1u;
+    if (factor > (LIMIT - 1u - maximum) / col_stride) return false;
+    maximum += factor * col_stride;
+    return maximum < available;
+}
+
+bool valid_output_layout() {
+    bool row_major = p.c_col_stride == 1u && p.c_row_stride >= p.n;
+    bool column_major = p.c_row_stride == 1u && p.c_col_stride >= p.m;
+    if (!row_major && !column_major) return false;
+    uint span = (p.m - 1u) * p.c_row_stride +
+                (p.n - 1u) * p.c_col_stride + 1u;
+    return p.batch == 1u || p.c_batch_stride >= span;
+}
+
+// Recover product rounding on the bounded finite-normal probe domain without
+// assuming GLSL.std.450 Fma is a correctly rounded fused operation. Clearing
+// twelve mantissa bits produces two twelve-bit pieces without a potentially
+// overflowing splitter multiplication. Every arithmetic step remains precise.
+// Subnormal/overflow and other-device accuracy require separate measurement;
+// this is not a claim of exact arithmetic for arbitrary IEEE-754 inputs.
+float product_residual(float left, float right, float product) {
+    float left_high = uintBitsToFloat(floatBitsToUint(left) & 0xfffff000u);
+    float right_high = uintBitsToFloat(floatBitsToUint(right) & 0xfffff000u);
+    precise float left_low = left - left_high;
+    precise float right_low = right - right_high;
+    precise float error1 = product - left_high * right_high;
+    precise float error2 = error1 - left_low * right_high;
+    precise float error3 = error2 - left_high * right_low;
+    precise float residual = left_low * right_low - error3;
+    return residual;
+}
+
+void main() {
+    // This validation and every early return are uniform for a workgroup.
+    // The four literals mirror, in order, MAX_BATCH, MAX_DIM (m), MAX_DIM (n)
+    // and MAX_K (k). MAX_K is a SEPARATE constant from MAX_DIM even though the
+    // two are equal today: m and n are bounded by addressing, k by measured
+    // accuracy over the reduction. See the note beside LIMIT above.
+    if (p.batch == 0u || p.batch > 4096u || p.m == 0u || p.m > 65536u ||
+        p.n == 0u || p.n > 65536u || p.k == 0u || p.k > 65536u ||
+        p.batch > LIMIT / p.m || p.batch * p.m > LIMIT / p.k ||
+        p.batch > LIMIT / p.k || p.batch * p.k > LIMIT / p.n ||
+        p.batch > LIMIT / p.m || p.batch * p.m > LIMIT / p.n)
+        return;
+    if (!valid_extent(p.a_offset, p.a_batch_stride, p.a_row_stride,
+                      p.a_col_stride, p.batch, p.m, p.k,
+                      uint(a_values.length())))
+        return;
+    if (!valid_extent(p.b_offset, p.b_batch_stride, p.b_row_stride,
+                      p.b_col_stride, p.batch, p.k, p.n,
+                      uint(b_values.length())))
+        return;
+    if (!valid_extent(p.c_offset, p.c_batch_stride, p.c_row_stride,
+                      p.c_col_stride, p.batch, p.m, p.n,
+                      uint(c_values.length())))
+        return;
+    // Extent validation above proves this span arithmetic is below LIMIT.
+    if (!valid_output_layout())
+        return;
+
+    uint batch_index = gl_WorkGroupID.z;
+    if (batch_index >= p.batch) return;
+
+    uint local_col = gl_LocalInvocationID.x;
+    uint local_row = gl_LocalInvocationID.y;
+    uint row = gl_WorkGroupID.y * 8u + local_row;
+    uint col = gl_WorkGroupID.x * 8u + local_col;
+    precise float accumulator = 0.0;
+    precise float correction = 0.0;
+
+    // Tail lanes load positive zero and remain in both barriers. A lane must
+    // never return based on row, col, or the current K tail.
+    for (uint tile = 0u; tile < (p.k + 7u) / 8u; ++tile) {
+        uint a_col = tile * 8u + local_col;
+        uint b_row = tile * 8u + local_row;
+        if (row < p.m && a_col < p.k) {
+            uint address = p.a_offset + batch_index * p.a_batch_stride +
+                           row * p.a_row_stride + a_col * p.a_col_stride;
+            a_tile[local_row][local_col] = a_values[address];
+        } else {
+            a_tile[local_row][local_col] = 0.0;
+        }
+        if (b_row < p.k && col < p.n) {
+            uint address = p.b_offset + batch_index * p.b_batch_stride +
+                           b_row * p.b_row_stride + col * p.b_col_stride;
+            b_tile[local_row][local_col] = b_values[address];
+        } else {
+            b_tile[local_row][local_col] = 0.0;
+        }
+        barrier();
+        for (uint inner = 0u; inner < 8u; ++inner) {
+            float left = a_tile[local_row][inner];
+            float right = b_tile[inner][local_col];
+            precise float product = left * right;
+            precise float partial = accumulator + product;
+            // Neumaier addition correction plus the product residual closes
+            // the recorded near-zero cancellation failures at K=128 and 2048.
+            precise float addition_error;
+            if (abs(accumulator) >= abs(product)) {
+                addition_error = (accumulator - partial) + product;
+            } else {
+                addition_error = (product - partial) + accumulator;
+            }
+            correction = correction + addition_error;
+            correction = correction + product_residual(left, right, product);
+            accumulator = partial;
+        }
+        barrier();
+    }
+
+    if (row < p.m && col < p.n) {
+        uint address = p.c_offset + batch_index * p.c_batch_stride +
+                       row * p.c_row_stride + col * p.c_col_stride;
+        precise float result = accumulator + correction;
+        c_values[address] = result;
+    }
+}

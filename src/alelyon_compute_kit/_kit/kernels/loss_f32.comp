@@ -1,0 +1,127 @@
+#version 450
+// indexed-cross-entropy-f32/v2. Four distinct buffers, fixed 64-lane reductions.
+// The host plan (src/loss_ops.rs) owns and uploads canonical target indices.
+// ops: 0 cross-entropy forward from logits (per row), 1 cross-entropy backward,
+// 2 reduce per-row values (sum or mean by the host normalizer), 3 negative
+// log-likelihood forward from log probabilities (per row, -logp[target]),
+// 4 negative log-likelihood backward (-dy * normalizer at the target, else 0).
+// Ops 3 and 4 read only the target column of each row.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer Primary { float primary[]; };
+layout(set = 0, binding = 1, std430) readonly buffer Targets { int targets[]; };
+layout(set = 0, binding = 2, std430) readonly buffer Upstream { float upstream[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer Output { float output_values[]; };
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+    uint op;
+    uint reduction;
+    uint normalizer_bits;
+} p;
+
+shared float partial[64];
+
+float sum_workgroup(float value) {
+    uint lane = gl_LocalInvocationID.x;
+    partial[lane] = value;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) partial[lane] += partial[lane + stride];
+        barrier();
+    }
+    float result = partial[0];
+    // All invocations must consume this result before shared storage is reused.
+    barrier();
+    return result;
+}
+
+float max_workgroup(float value) {
+    uint lane = gl_LocalInvocationID.x;
+    partial[lane] = value;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) partial[lane] = max(partial[lane], partial[lane + stride]);
+        barrier();
+    }
+    float result = partial[0];
+    barrier();
+    return result;
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x;
+    float normalizer = uintBitsToFloat(p.normalizer_bits);
+    float invalid = uintBitsToFloat(0x7fc00000u);
+    // Each branch containing a return is uniform over the workgroup.
+    if (p.op == 2u) {
+        if (row != 0u) return;
+        float total = 0.0;
+        for (uint i = lane; i < p.rows; i += 64u) {
+            int target = targets[i];
+            if (target < -1 || target >= int(p.cols)) total += invalid;
+            else if (target != -1) total += primary[i];
+        }
+        total = sum_workgroup(total);
+        if (lane == 0u)
+            output_values[0] = p.reduction == 1u || p.reduction == 2u
+                ? total * normalizer : invalid;
+        return;
+    }
+    if (row >= p.rows) return;
+    uint base = row * p.cols;
+    int target = targets[row];
+    if (p.op > 4u || p.reduction > 2u || target < -1 || target >= int(p.cols)) {
+        if (p.op == 0u || p.op == 3u) {
+            if (lane == 0u) output_values[row] = invalid;
+        } else {
+            for (uint col = lane; col < p.cols; col += 64u)
+                output_values[base + col] = invalid;
+        }
+        return;
+    }
+    if (target == -1) {
+        if (p.op == 0u || p.op == 3u) {
+            if (lane == 0u) output_values[row] = 0.0;
+        } else {
+            for (uint col = lane; col < p.cols; col += 64u)
+                output_values[base + col] = 0.0;
+        }
+        return;
+    }
+    if (p.op == 3u) {
+        if (lane == 0u) output_values[row] = -primary[base + uint(target)];
+        return;
+    }
+    if (p.op == 4u) {
+        float dy = upstream[p.reduction == 0u ? row : 0u];
+        for (uint col = lane; col < p.cols; col += 64u)
+            output_values[base + col] = col == uint(target) ? -dy * normalizer : 0.0;
+        return;
+    }
+    float largest = -uintBitsToFloat(0x7f800000u);
+    for (uint col = lane; col < p.cols; col += 64u)
+        largest = max(largest, primary[base + col]);
+    largest = max_workgroup(largest);
+    float total = 0.0;
+    for (uint col = lane; col < p.cols; col += 64u)
+        total += exp(primary[base + col] - largest);
+    total = sum_workgroup(total);
+    if (p.op == 0u) {
+        // Subtract the target before adding log(total): large equal logits must
+        // retain log(class_count), rather than lose it in large-logit addition.
+        if (lane == 0u) {
+            // Parentheses alone permit driver reassociation. Keep the target
+            // subtraction and final addition as distinct precise operations.
+            precise float loss = (largest - primary[base + uint(target)]) + log(total);
+            output_values[row] = loss;
+        }
+    } else {
+        float dy = upstream[p.reduction == 0u ? row : 0u];
+        for (uint col = lane; col < p.cols; col += 64u) {
+            float probability = exp(primary[base + col] - largest) / total;
+            float indicator = col == uint(target) ? 1.0 : 0.0;
+            output_values[base + col] = (probability - indicator) * dy * normalizer;
+        }
+    }
+}

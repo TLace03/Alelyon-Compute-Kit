@@ -1,0 +1,173 @@
+#version 450
+// ACK rowwise-f32/v2: four storage buffers, FP32 and workgroup barriers only.
+// One workgroup owns each row (ops 0..3, 5, 6), or each column (op 4). Inputs
+// and outputs must be distinct. The host plan (src/row_ops.rs) owns lengths
+// and refusals. ops: 0 softmax forward, 1 softmax backward (primary = saved
+// probabilities), 2 RMSNorm forward, 3 RMSNorm backward, 4 gamma reduction,
+// 5 log-softmax forward, 6 log-softmax backward (primary = saved log
+// probabilities). Masked logits are -inf entries: a row with at least one
+// finite entry has a finite maximum, exp(-inf - max) is 0 and the masked
+// output is 0 (softmax) or -inf (log-softmax); a fully masked row is refused
+// by the host and would produce NaN here.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer Primary { float primary[]; };
+layout(set = 0, binding = 1, std430) readonly buffer Upstream { float upstream[]; };
+layout(set = 0, binding = 2, std430) readonly buffer Gamma { float gamma[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer Output { float output_values[]; };
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+    uint op;
+    uint epsilon_bits;
+} p;
+
+shared float partial[64];
+
+float sum_workgroup(float value) {
+    uint lane = gl_LocalInvocationID.x;
+    partial[lane] = value;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) partial[lane] += partial[lane + stride];
+        barrier();
+    }
+    float result = partial[0];
+    // Every invocation must read the result before a subsequent reduction
+    // overwrites partial[0]. The last tree barrier alone cannot ensure that.
+    barrier();
+    return result;
+}
+
+float max_workgroup(float value) {
+    uint lane = gl_LocalInvocationID.x;
+    partial[lane] = value;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) partial[lane] = max(partial[lane], partial[lane + stride]);
+        barrier();
+    }
+    float result = partial[0];
+    barrier();
+    return result;
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint group = gl_WorkGroupID.x;
+    uint count = p.rows * p.cols;
+    // These branches are uniform across the entire workgroup, including tails.
+    if (p.op == 4u) {
+        if (group >= p.cols) return;
+        float total = 0.0;
+        for (uint row = lane; row < p.rows; row += 64u)
+            total += primary[count + row * p.cols + group];
+        total = sum_workgroup(total);
+        if (lane == 0u) output_values[group] = total;
+        return;
+    }
+    if (group >= p.rows) return;
+    uint base = group * p.cols;
+    if (p.op == 0u) {
+        float largest = -uintBitsToFloat(0x7f800000u);
+        for (uint col = lane; col < p.cols; col += 64u)
+            largest = max(largest, primary[base + col]);
+        largest = max_workgroup(largest);
+        float total = 0.0;
+        for (uint col = lane; col < p.cols; col += 64u)
+            total += exp(primary[base + col] - largest);
+        total = sum_workgroup(total);
+        for (uint col = lane; col < p.cols; col += 64u)
+            output_values[base + col] = exp(primary[base + col] - largest) / total;
+    } else if (p.op == 1u) {
+        float dot = 0.0;
+        for (uint col = lane; col < p.cols; col += 64u)
+            dot += primary[base + col] * upstream[base + col];
+        dot = sum_workgroup(dot);
+        for (uint col = lane; col < p.cols; col += 64u) {
+            uint i = base + col;
+            output_values[i] = primary[i] * (upstream[i] - dot);
+        }
+    } else if (p.op == 2u || p.op == 3u) {
+        // Scaling before squaring avoids overflow for finite large inputs.
+        // Including sqrt(epsilon) also handles an entirely zero row without
+        // either dividing by zero or squaring an unrepresentably large ratio.
+        float epsilon = uintBitsToFloat(p.epsilon_bits);
+        float scale = sqrt(epsilon);
+        for (uint col = lane; col < p.cols; col += 64u)
+            scale = max(scale, abs(primary[base + col]));
+        // FP32 OpFDiv only guarantees accuracy for divisors through 2^126.
+        // Capping the scale there keeps |x/scale| <= 4 for every finite x;
+        // squared magnitudes <= 16 keep the admitted row's sum finite.
+        scale = min(max_workgroup(scale), uintBitsToFloat(0x7e800000u));
+        // Keep the complete expressions precise: reassociating x/scale/d
+        // into x/(scale*d) can recreate an out-of-range divisor, and moving
+        // the square before the scaling can overflow otherwise finite rows.
+        precise float squares = 0.0;
+        for (uint col = lane; col < p.cols; col += 64u) {
+            precise float normalized = primary[base + col] / scale;
+            squares += normalized * normalized;
+        }
+        squares = sum_workgroup(squares);
+        precise float denominator = sqrt(squares / float(p.cols) + (epsilon / scale) / scale);
+        if (p.op == 2u) {
+            for (uint col = lane; col < p.cols; col += 64u) {
+                precise float value = gamma[col] * ((primary[base + col] / scale) / denominator);
+                output_values[base + col] = value;
+            }
+        } else {
+            precise float dot = 0.0;
+            for (uint col = lane; col < p.cols; col += 64u) {
+                uint i = base + col;
+                precise float normalized = (primary[i] / scale) / denominator;
+                dot += upstream[i] * gamma[col] * normalized;
+            }
+            dot = sum_workgroup(dot) / float(p.cols);
+            // Do not materialize 1/rms: it can be subnormal (and flushed)
+            // while the final gradient is normal. Two divisions by sqrt(rms)
+            // also avoid overflowing g/scale for a small scale. For admitted
+            // epsilon and finite rows the factor is about [1e-3, 2^64],
+            // within OpFDiv's accuracy domain. With a finite numerator and
+            // representable result the intermediate lies between those two.
+            precise float rms_root = sqrt(scale) * sqrt(denominator);
+            for (uint col = lane; col < p.cols; col += 64u) {
+                uint i = base + col;
+                precise float normalized = (primary[i] / scale) / denominator;
+                precise float value = ((upstream[i] * gamma[col] - normalized * dot) / rms_root) / rms_root;
+                precise float contribution = upstream[i] * normalized;
+                output_values[i] = value;
+                output_values[count + i] = contribution;
+            }
+        }
+    } else if (p.op == 5u) {
+        float largest = -uintBitsToFloat(0x7f800000u);
+        for (uint col = lane; col < p.cols; col += 64u)
+            largest = max(largest, primary[base + col]);
+        largest = max_workgroup(largest);
+        float total = 0.0;
+        for (uint col = lane; col < p.cols; col += 64u)
+            total += exp(primary[base + col] - largest);
+        total = sum_workgroup(total);
+        float log_total = log(total);
+        for (uint col = lane; col < p.cols; col += 64u) {
+            // The whole expression feeds a precise result: the shifted logit
+            // is formed first, so a masked (-inf) entry stays -inf and a large
+            // logit keeps its log(class count) instead of losing it to a
+            // reassociated (largest + log_total). Declaring only the
+            // intermediate precise was observed insufficient on LLPC 26.8.1.
+            precise float value = (primary[base + col] - largest) - log_total;
+            output_values[base + col] = value;
+        }
+    } else if (p.op == 6u) {
+        float dot = 0.0;
+        for (uint col = lane; col < p.cols; col += 64u)
+            dot += upstream[base + col];
+        dot = sum_workgroup(dot);
+        for (uint col = lane; col < p.cols; col += 64u) {
+            uint i = base + col;
+            output_values[i] = upstream[i] - exp(primary[i]) * dot;
+        }
+    } else {
+        for (uint col = lane; col < p.cols; col += 64u)
+            output_values[base + col] = uintBitsToFloat(0x7fc00000u);
+    }
+}
