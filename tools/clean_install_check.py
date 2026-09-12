@@ -27,7 +27,7 @@ def main():
         import alelyon_compute_kit as package
     finally:
         builtins.__import__ = original
-    assert package.__version__ == "0.1.0a2"
+    assert package.__version__ == "0.1.0a3"
     assert "site-packages" in pathlib.Path(package.__file__).parts
     assert package.BackendRegistry().registered() == ()
     if args.native_identity:

@@ -1,6 +1,6 @@
 # Releasing alelyon-ai
 
-The `0.1.0a2` candidate adds the experimental Windows AMD64 Vulkan library and
+The `0.1.0a3` candidate adds the experimental Windows AMD64 Vulkan library and
 vector-coded expert primitives. Earlier `0.1.0a0` and `0.1.0a1` packages were
 MIT-licensed declaration-only releases. The current source and new release use
 Apache-2.0 with dependency notices. Publication does not establish universal
@@ -31,7 +31,7 @@ metadata. Follow [native packaging](NATIVE_PACKAGING.md) for local artifact
 checks. Then run:
 
 ```console
-gh workflow run release.yml --repo TLace03/Alelyon-Compute-Kit --ref main -f expected_version=0.1.0a2 -f publish=false
+gh workflow run release.yml --repo TLace03/Alelyon-Compute-Kit --ref main -f expected_version=0.1.0a3 -f publish=false
 ```
 
 The four source-test jobs cover Windows and Ubuntu with Python 3.10 and 3.14.
@@ -52,7 +52,7 @@ Source or artifact changes require fresh acceptance.
 After the dry run passes and the target version is confirmed absent from PyPI:
 
 ```console
-gh workflow run release.yml --repo TLace03/Alelyon-Compute-Kit --ref main -f expected_version=0.1.0a2 -f publish=true
+gh workflow run release.yml --repo TLace03/Alelyon-Compute-Kit --ref main -f expected_version=0.1.0a3 -f publish=true
 ```
 
 Publication requires both the explicit Boolean input and `refs/heads/main`.

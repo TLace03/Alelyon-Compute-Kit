@@ -18,7 +18,7 @@ def backend():
 def test_reviewed_source_manifest_and_version():
     module = backend()
     files = module.sources()
-    assert b'__version__ = "0.1.0a2"' in files["src/alelyon_compute_kit/__init__.py"]
+    assert b'__version__ = "0.1.0a3"' in files["src/alelyon_compute_kit/__init__.py"]
     assert module.DLL not in files
     assert module.RECEIPT not in files
 

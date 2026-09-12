@@ -315,22 +315,38 @@ class ExpertBank:
                 "parameter_update_applications": pointer["parameter_update_applications"],
                 "generation_bytes": sum(shard["bytes"] for shard in pointer["shards"])}
 
-    def initialize_expert(self, layer: int, expert: int, *, seed: int = 0) -> dict:
+    def initialize_expert(self, layer: int, expert: int, *, seed: int = 0,
+                          zero_optimizer_state: bool = False) -> dict:
+        """Materialize deterministic payloads for an expert.
+
+        ``zero_optimizer_state=True`` is the initialization contract for the
+        VQ AdamW harness: the first matrix is seeded as a weight and the next
+        two matrices are zero momentum and variance. The default keeps the
+        generic bank initializer's historical deterministic random payloads.
+        """
         self._check()
         self._id(layer, expert)
         _integer(seed, "seed", 0, (1 << 64) - 1)
+        if not isinstance(zero_optimizer_state, bool):
+            raise ExpertBankError("zero_optimizer_state must be bool")
+        if zero_optimizer_state and len(self.config.matrix_shapes) < 3:
+            raise ExpertBankError("zero optimizer state needs three matrix roles")
         if self._pointer(layer, expert) is not None:
             raise ExpertBankError("expert is already materialized")
         tensors = []
         for index, shape in enumerate(self.config.matrix_shapes):
             layout = storage_layout(shape, self.config.group)
-            rng = np.random.default_rng(np.random.SeedSequence([seed, layer, expert, index]))
-            codes = rng.integers(0, 1 << 32, layout["code_bytes"] // 4, dtype=np.uint32)
-            tail = layout["vectors"] % 8
-            if tail:
-                codes[-1] &= np.uint32((1 << (tail * 4)) - 1)
-            book = rng.standard_normal((ENTRIES, self.config.group), dtype=np.float32)
-            book *= np.float32(1.0 / math.sqrt(shape[0]))
+            if zero_optimizer_state and index in (1, 2):
+                codes = np.zeros(layout["code_bytes"] // 4, dtype=np.uint32)
+                book = np.zeros((ENTRIES, self.config.group), dtype=np.float32)
+            else:
+                rng = np.random.default_rng(np.random.SeedSequence([seed, layer, expert, index]))
+                codes = rng.integers(0, 1 << 32, layout["code_bytes"] // 4, dtype=np.uint32)
+                tail = layout["vectors"] % 8
+                if tail:
+                    codes[-1] &= np.uint32((1 << (tail * 4)) - 1)
+                book = rng.standard_normal((ENTRIES, self.config.group), dtype=np.float32)
+                book *= np.float32(1.0 / math.sqrt(shape[0]))
             tensors.append(VQArray(shape, self.config.group, codes, book))
         return self.write_expert(layer, expert, tensors)
 

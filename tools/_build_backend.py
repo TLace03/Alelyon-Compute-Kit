@@ -21,7 +21,7 @@ import struct
 import tarfile
 import zipfile
 
-VERSION = "0.1.0a2"
+VERSION = "0.1.0a3"
 NAME = "alelyon_ai"
 TAG = "py3-none-win_amd64"
 INFO = f"{NAME}-{VERSION}.dist-info"
