@@ -12,7 +12,7 @@
     "src/alelyon_compute_kit/__init__.py": "ab1e6ad45a76f75ee13940e12fa449fc023631c1edeadab013277c9541f025fa",
     "src/alelyon_compute_kit/_kit/Cargo.lock": "f7ce6708fcb5ead952c826cb635bf4af74f831cd9f65218300c6cbf325b578cf",
     "src/alelyon_compute_kit/_kit/Cargo.toml": "3f14e079a14a980f4fa08e1081a147a436b04972c987a1734cd674c256e65f0d",
-    "src/alelyon_compute_kit/_kit/UPSTREAM.json": "51862cd580f5905fae903015c284ccedc3e3041827d432dcd152be7a98fe629a",
+    "src/alelyon_compute_kit/_kit/UPSTREAM.json": "0bece55dabf10ec7db290da1680da9c176c4307684ae0643253e6091b70c0d01",
     "src/alelyon_compute_kit/_kit/__init__.py": "9ee2efa607f7f596596d60a80ca1de1c29bcb830a5ee529204494d63217a8eda",
     "src/alelyon_compute_kit/_kit/kernels/MANIFEST.json": "345c77e65b85c8a50225cc48795c2f05a2edb6a4a8ee31128d7cbd88d108c674",
     "src/alelyon_compute_kit/_kit/kernels/cast_bf16_f32.spv": "97519dc64d78d9abfdbda12d194e278d3ae58d8b9f84c2aed524c09b60ffa73a",
