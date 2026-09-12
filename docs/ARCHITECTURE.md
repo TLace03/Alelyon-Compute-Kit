@@ -1,74 +1,89 @@
 # SDK architecture and extension boundaries
 
-The SDK is organized around explicit contracts, not a list of chip vendors.
-A backend must identify an actual device and the exact operations, storage
-types, arithmetic policies and limits it supports. Unsupported requirements
-must remain visible before allocating model state or starting a training step.
+The SDK separates device declarations, execution and workload evidence. An
+operator is an exact schema, dtype, arithmetic policy and layout contract;
+unsupported combinations are refused before dispatch.
 
-## Layers
+| Layer | Current implementation |
+|---|---|
+| Capability registry | Immutable supplied declarations; no discovery or device execution |
+| Device runtime | Vulkan queues, buffers, ownership, transfers, synchronization and terminal failures |
+| Kernels | Versioned plans and SPIR-V modules with shape, stride and byte-capacity checks |
+| Vector-coded tensors | Optional VQ schema 1, Python images, packed matmul and compressed-state AdamW |
+| Expert persistence and selection | Atomic local generations and held-out gain-per-second scheduling |
+| Framework integration | Legacy optional host-copy adapter; complete framework backend excluded |
+| Complete model training and serving | Requires model, routing, graph, checkpoint and workload integration |
 
-| Layer | Responsibility | Current standalone status |
-|---|---|---|
-| Capability and backend registry | Immutable device/operator declarations, version checks, requirement matching, named refusals | Implemented; no driver execution |
-| Device runtime | Contexts, queues, buffers, ownership, transfers, synchronization, terminal failure | Vulkan source integration pending |
-| Kernel implementation | Versioned bindings, shape/stride contracts, compiler targets and numerical policies | Vulkan source integration pending |
-| Framework integration | Tensor views, autograd, optimizer state, RNG, serialization and execution accounting | Experimental integration pending |
-| Workload admission | Complete updates, fresh-process resume, residency and stability | Pending standalone validation |
-| Backend optimization | Device-specific accelerated paths under the same declared semantics | Requires per-device measurements |
+The capability registry does not automatically turn a declaration into an
+executable backend. Explicitly importing `ack` makes the binding available;
+constructing `ack.Device` opens a device. The base package remains free of
+implicit network, compiler and driver activity.
 
-The initial registry holds declarations supplied explicitly by the caller. It
-does not execute plugin callbacks or discover entry points. A future executable
-backend interface must version that additional authority separately. Importing
-the SDK must remain free of implicit device, network and compiler activity.
+## Portability and extension
 
-## Portability
+Vulkan is the implemented native path. The published native wheel targets
+Windows AMD64. Other platforms require separately built and tested artifacts.
+Metal, DirectX, WebGPU, CPU and CUDA/HIP compatibility are possible future
+backends, not implemented universal support. A chip with no suitable driver or
+compiler target requires additional implementation.
 
-Vulkan is the first native implementation path. Other driver/compiler targets
-can be added without changing device selection into vendor-name conditionals.
-Future targets may include Metal, DirectX, WebGPU, CPU implementations and
-optional compatibility with CUDA or HIP libraries. These are extension targets,
-not currently implemented or tested standalone backends.
+The C interface currently requires ABI 10. Optional VQ support is discovered
+through `ack_vq_schema`, independently of the existing ABI layout. New schemas
+must preserve closed admission and explicit unsupported states. Capability
+matching must not invent combinations from separately supported variants.
 
-Architectures with no compatible driver or compiler target need a new backend.
-An API abstraction cannot supply missing device instructions or memory. Device
-capabilities must include relevant compiler, driver and arithmetic behavior;
-matching a brand or CPU instruction set is insufficient.
+## Fractional storage and bounded execution
 
-An operator capability is an exact schema/dtype/precision variant. Combining
-separate records must not invent a Cartesian product of supported variants.
-Limits have names and units. Future limits, layouts and execution contracts
-must retain explicit versioning and refusal for unsupported requirements.
+VQ uses a nibble index into 16 FP32 vectors. Group sizes 8, 16 and 32 amortize
+the index across logical tensor values. Full codebooks, padded words and wire
+metadata count toward storage. Sharing vector entries restricts representational
+freedom; logical capacity is not independent full-precision capacity.
 
-## Correctness and performance
+The native extension executes encode, decode, packed-pair matmul and AdamW
+from four encoded states into three FP32 scratch arrays. Convenience bindings
+transfer operands/results per call, and CPU codebook calibration follows an
+optimizer update. There is no claim of a GPU-resident graph or sub-bit arithmetic.
+Each call owns its buffers, checks device status and releases resources on failure.
 
-Kernel validation checks complete outputs, tails, strides, alias/ownership
-refusals, deterministic repeats and nonfinite behavior on its declared domain.
-FP32 alone does not describe accumulation order, contraction, denormal treatment
-or rounding. An optimized path must declare and satisfy its numerical contract.
+Active tensors are bounded to 2^28 values. Three-array AdamW scratch must fit
+that bound. Matrix dimensions are at most 65,536; the scalar packed kernel
+admits at most 2^28 multiply-accumulates in one dispatch. Larger products need
+explicit bounded chunks. No complete mixture-of-experts token router is supplied.
 
-Training admission additionally checks forward/backward, every gradient and
-update, optimizer slots, tied parameters, accumulation, clipping, RNG and exact
-same-backend resume in a fresh process. Transfer and per-operator fallback
-accounting must be coherent and bound to a fresh execution identity. Resource
-ownership failures remain terminal evidence across counter resets.
+## Expert generations and value measurements
 
-Performance comparisons require matching model, data, precision and completion
-criteria, synchronized timings, repeated fresh processes, and separate setup,
-training, diagnostics and checkpoint costs. Device-specific speed does not
-establish a universal advantage over every available backend.
+`ExpertBank.create` writes configuration, not every potential expert. Initializing
+an expert writes deterministic compressed random tensors without a dense full
+bank allocation. Each update writes unique shards, then atomically replaces one
+expert pointer. Weights, moments and optimizer-step metadata can commit together.
+Readers use one committed pointer snapshot. Incomplete and old generations are
+retained; automatic garbage collection is not implemented.
 
-## Public package boundary
+The bank assumes a trusted local single writer and concurrent readers. Checksums
+detect changed bytes but do not authenticate a hostile same-user writer. File
+fsync and pointer replacement address process interruption; Windows directory
+power-loss durability is unmeasured. There is no multi-bank transaction. Run
+aggregate statistics with writers quiescent; file-byte counts include historical
+and orphan generations and do not measure filesystem allocated blocks.
 
-The SDK export will contain only explicitly inventoried compute implementation,
-its build inputs and focused tests/examples. It will exclude private trading,
-identity/signing, hosted-service, research-model, dataset and checkpoint code.
-Every exported source file must have a source revision/digest and reviewed
-license/dependency provenance. Build-only helpers must not import the private
-application Runtime.
+The gain scheduler compares positive held-out loss reduction per elapsed second
+and reserves exploration. Comparable tasks, sample counts and timing scopes are
+the caller's responsibility. A score is a measurement, not a promise of future
+expert usefulness. Potential, materialized, active and updated counts must remain
+separate; cumulative update applications are not unique parameter coverage.
 
-The package keeps source-distribution, Python wheel, native library and shader
-artifacts distinct. Native wheels must name their actual platform/architecture
-and include required licenses. A clean installation must refuse unavailable
-drivers or incompatible ABIs without compiling, downloading or changing the
-machine implicitly. Release uploads and credentials are separate from local
-builds and tests.
+## Validation and package boundary
+
+Kernel tests cover outputs, tails, transposes, ownership, nonfinite status and
+refusals on their declared domains. Lossy optimizer quality and convergence
+require separate experiments. Full training acceptance needs the complete
+forward/backward/update graph, state and RNG restoration, routing, residency and
+evaluation. Performance comparisons need matching workloads and completion
+criteria, synchronized timing and separate setup/checkpoint costs.
+
+The public export is an explicit source allowlist with hashes, shader provenance,
+locked dependencies and license notices. It excludes private application Runtime,
+trading, hosted identity, signing, research models, datasets and checkpoints.
+Manifests are declared traceability, not authenticated provenance. Native wheel,
+source archive, DLL and shaders have distinct checks. Publication is a separate,
+explicit action after artifact and clean-install acceptance.

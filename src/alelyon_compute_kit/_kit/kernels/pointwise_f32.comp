@@ -1,0 +1,464 @@
+#version 450
+// pointwise-f32/v1, operation schema 2: out[i] = f(x[i], y[i], z[i]) over
+// one shape of up to four dimensions. Four FP32 storage buffers (x, y, z,
+// out) share the shape; each has its own element offset and per-dimension
+// element strides, and a broadcast dimension is stride 0. Host planning
+// (src/pointwise_ops.rs) validates the geometry, every extent against a
+// declared capacity, and the output's aliasing; this shader re-checks the
+// extents of the operands the operation reads against the buffers actually
+// bound and writes nothing when they disagree.
+//
+// Operations, with the operand slots each reads and the scalar words it
+// consumes (a = word 28, b = word 29, both float bits unless stated; flags
+// bit 0 makes y the scalar b instead of the y buffer for every operation
+// that reads y). Schema 1 is 0-5; schema 2 appends 6-23 with the same block,
+// buffers and entry:
+//    0  x + a*y            x, y    a alpha
+//    1  x - a*y            x, y    a alpha
+//    2  x*y                x, y
+//    3  x/y                x, y
+//    4  fill(a)            -       a value
+//    5  copy(x)            x
+//    6  1/x                x
+//    7  |x|                x
+//    8  sqrt(x)            x       NaN for x < 0, as the CPU (GLSL sqrt is undefined there)
+//    9  1/sqrt(x)          x
+//   10  -x                 x
+//   11  x^y                x, y    y the exponent, a tensor or the scalar b; the
+//                                  CPU's own forms for y = 2 (x*x), 3 (x*x*x),
+//                                  -2 (1/(x*x)), 0.5 (sqrt), -0.5 (1/sqrt) and
+//                                  -1 (1/x), otherwise std::pow's semantics
+//                                  (NaN for a negative base and a non-integer
+//                                  exponent; the sign kept for an odd integer)
+//   12  a^x                x       a the base, std::pow's semantics
+//   13  clamp(x, a, b)     x       a lower bound, b upper bound (the host encodes an
+//                                  absent bound as -inf / +inf); a NaN x propagates;
+//                                  a > b gives b everywhere, as torch does
+//   14  silu(x)            x       x / (1 + exp(-x))
+//   15  sigmoid(x)         x       1 / (1 + exp(-x))
+//   16  sigmoid_backward   x, y    x the gradient, y the sigmoid output: x * (1 - y) * y,
+//                                  evaluated in the CPU kernel's order
+//   17  addcmul            x, y, z x + a*y*z, evaluated x + ((a*y)*z)
+//   18  addcdiv            x, y, z x + a*y/z, evaluated x + ((a*y)/z)
+//   19  lerp(x, y, a)      x, y    torch's two branches: |a| < 0.5 ? x + a*(y-x) : y - (y-x)*(1-a)
+//   20  cos(x)             x       quadrant reduction and polynomials, below;
+//                                  NaN outside the reduction's proven domain
+//                                  |x| <= 411774.03125, so a wrong answer is
+//                                  loud rather than plausible
+//   21  sin(x)             x       the same domain and the same NaN
+//   22  iota               -       a + float(i)*b over the row-major linear index i
+//                                  (start a, step b; float(i) is exact below 2^24)
+//   23  triu(x)            x       the last two dimensions are rows and columns:
+//                                  column - row >= b keeps x, else 0 (b an int32)
+// Every arithmetic step is precise (no contraction into a fused multiply-add).
+// An unknown operation writes NaN so it cannot masquerade as a computed
+// tensor. Flag bit 1 (a scalar z) stays reserved: nothing here consumes it
+// and the host refuses a block that sets it.
+//
+// Each invocation handles four consecutive linear indices, so a 4.2M-element
+// tensor needs about 4,100 workgroups on one dispatch axis. An in-place
+// operation binds the same buffer to an input and to out with bit-identical
+// views: each lane then reads only the addresses it writes, and the host plan
+// refuses every other aliasing.
+// STORAGE (2026-09-10). DT_X, DT_Y, DT_Z and DT_OUT are 0 for f32 and 1
+// for bf16 and decide only how a value is READ and WRITTEN: every
+// operation below runs in f32 whatever they are.
+//
+// One switch PER BUFFER, not one for the inputs together. The first
+// version shared a switch across the three inputs on the assumption that
+// torch promotes an f32 against a bf16 before the backend is called.
+// Measured on 2026-09-10: it does not -- `aten::mul.out` arrives with one
+// of each, 6,912 times in a registered pass -- so a shared switch would
+// keep all of those on the host. Separate switches also make f32 in with
+// bf16 out a strided cast through any view, which is what the copy path
+// needs and a whole-block `ack_cast` cannot express.
+#ifndef DT_X
+#define DT_X 0
+#endif
+#ifndef DT_Y
+#define DT_Y 0
+#endif
+#ifndef DT_Z
+#define DT_Z 0
+#endif
+#ifndef DT_OUT
+#define DT_OUT 0
+#endif
+#if DT_X || DT_Y || DT_Z || DT_OUT
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#endif
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+#if DT_X
+layout(set = 0, binding = 0, std430) readonly buffer XValues { uint16_t x_values[]; };
+#else
+layout(set = 0, binding = 0, std430) readonly buffer XValues { float x_values[]; };
+#endif
+#if DT_Y
+layout(set = 0, binding = 1, std430) readonly buffer YValues { uint16_t y_values[]; };
+#else
+layout(set = 0, binding = 1, std430) readonly buffer YValues { float y_values[]; };
+#endif
+#if DT_Z
+layout(set = 0, binding = 2, std430) readonly buffer ZValues { uint16_t z_values[]; };
+#else
+layout(set = 0, binding = 2, std430) readonly buffer ZValues { float z_values[]; };
+#endif
+#if DT_OUT
+layout(set = 0, binding = 3, std430) writeonly buffer OutValues { uint16_t out_values[]; };
+#else
+layout(set = 0, binding = 3, std430) writeonly buffer OutValues { float out_values[]; };
+#endif
+
+// bf16 -> f32 is exact: the 16 bits ARE the top half of the f32 word.
+// f32 -> bf16 is round-to-nearest-even with the NaN payload kept quiet,
+// copied from kernels/cast_f32_bf16.comp so a value stored here equals
+// what that cast would have written for the same input.
+#if DT_X || DT_Y || DT_Z
+float widen(uint16_t bits) { return uintBitsToFloat(uint(bits) << 16); }
+#endif
+#if DT_OUT
+uint16_t narrow(float x) {
+    const uint bits = floatBitsToUint(x);
+    if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu) != 0u) {
+        return uint16_t((bits >> 16) | 0x0040u);   // quiet NaN
+    }
+    const uint lsb = (bits >> 16) & 1u;
+    return uint16_t((bits + 0x7FFFu + lsb) >> 16);
+}
+#endif
+
+#if DT_X
+#define LOAD_X(i) widen(x_values[i])
+#else
+#define LOAD_X(i) x_values[i]
+#endif
+#if DT_Y
+#define LOAD_Y(i) widen(y_values[i])
+#else
+#define LOAD_Y(i) y_values[i]
+#endif
+#if DT_Z
+#define LOAD_Z(i) widen(z_values[i])
+#else
+#define LOAD_Z(i) z_values[i]
+#endif
+#if DT_OUT
+#define STORE_OUT(i, v) out_values[i] = narrow(v)
+#else
+#define STORE_OUT(i, v) out_values[i] = (v)
+#endif
+
+// Thirty little-endian u32 words, 120 bytes; the offsets are explicit so the
+// layout is the one src/pointwise_ops.rs writes, not a default.
+layout(push_constant) uniform Plan {
+    layout(offset = 0) uint op;
+    layout(offset = 4) uint ndim;
+    layout(offset = 8) uint n;
+    layout(offset = 12) uint flags;        // bit 0: y is scalar_b; bit 1: reserved (z scalar)
+    layout(offset = 16) uint shape[4];
+    layout(offset = 32) uint x_stride[4];
+    layout(offset = 48) uint x_offset;
+    layout(offset = 52) uint y_stride[4];
+    layout(offset = 68) uint y_offset;
+    layout(offset = 72) uint z_stride[4];
+    layout(offset = 88) uint z_offset;
+    layout(offset = 92) uint out_stride[4];
+    layout(offset = 108) uint out_offset;
+    layout(offset = 112) uint scalar_a;    // the scalar word a, as float bits
+    layout(offset = 116) uint scalar_b;    // the scalar word b: float bits, or the triu diagonal as int32
+} p;
+
+const uint OP_FILL = 4u;
+const uint OP_POW = 11u;
+const uint OP_SIGMOID_BACKWARD = 16u;
+const uint OP_ADDCMUL = 17u;
+const uint OP_ADDCDIV = 18u;
+const uint OP_LERP = 19u;
+const uint OP_IOTA = 22u;
+const uint OP_LAST = 23u;
+
+// glslang folds no bit cast into a global constant, so the quiet NaN and
+// the infinity are functions; every literal below is the exact decimal of
+// the fp32 constant it names, and is read back to that fp32 exactly.
+float nan_value() { return uintBitsToFloat(0x7fc00000u); }
+float inf_value() { return uintBitsToFloat(0x7f800000u); }
+
+// Every address is below LIMIT, as the host plan requires (it refuses a
+// maximum index at or above 2^31), so the extent arithmetic cannot wrap.
+const uint LIMIT = 2147483648u;
+
+bool op_reads_x(uint op) {
+    return op <= OP_LAST && op != OP_FILL && op != OP_IOTA;
+}
+
+bool op_reads_y(uint op) {
+    return op <= 3u || op == OP_POW || op == OP_SIGMOID_BACKWARD || op == OP_ADDCMUL
+        || op == OP_ADDCDIV || op == OP_LERP;
+}
+
+bool op_reads_z(uint op) {
+    return op == OP_ADDCMUL || op == OP_ADDCDIV;
+}
+
+// True when the highest address a view of p.shape touches is inside the bound
+// buffer and the arithmetic reaching it stays below LIMIT. Dimensions beyond
+// p.ndim are padding and are not visited.
+bool valid_extent(uint offset, uint strides[4], uint available) {
+    if (offset >= LIMIT || available == 0u) return false;
+    uint maximum = offset;
+    for (uint d = 0u; d < p.ndim; ++d) {
+        uint factor = p.shape[d] - 1u;
+        if (strides[d] != 0u) {
+            if (factor > (LIMIT - 1u - maximum) / strides[d]) return false;
+            maximum += factor * strides[d];
+        }
+    }
+    return maximum < available;
+}
+
+// sqrt with the CPU's NaN for a negative argument; GLSL leaves it undefined.
+float sqrt_ieee(float x) {
+    return x < 0.0 ? nan_value() : sqrt(x);
+}
+
+// std::pow(x, y): GLSL pow is undefined for x < 0 and for x == 0 with y <= 0,
+// so C's sign, zero and infinity rules are written out and only a finite
+// positive base reaches the hardware pow (Vulkan: inherited from
+// exp2(y * log2(x))).
+float pow_ieee(float x, float y) {
+    if (y == 0.0 || x == 1.0) return 1.0;   // even against a NaN in the other operand
+    if (isnan(x) || isnan(y)) return nan_value();
+    float ay = abs(y);
+    // every float at or above 2^24 is an even integer, so an odd exponent is
+    // one below 2^24 = 16777216 (mod(ay, 2.0) is exact throughout: for ay in
+    // [2^23, 2^24) the quotient ay/2 lands where the ulp is 0.5)
+    bool y_integer = ay >= 16777216.0 || floor(ay) == ay;
+    bool y_odd = y_integer && ay < 16777216.0 && mod(ay, 2.0) == 1.0;
+    if (x == 0.0) {
+        bool negative = y_odd && (floatBitsToUint(x) >> 31) != 0u;   // -0 keeps its sign for an odd y
+        float magnitude = y < 0.0 ? inf_value() : 0.0;
+        return negative ? -magnitude : magnitude;
+    }
+    if (isinf(y)) {
+        if (x == -1.0) return 1.0;
+        return ((abs(x) < 1.0) == (y < 0.0)) ? inf_value() : 0.0;
+    }
+    if (isinf(x)) {
+        float magnitude = y < 0.0 ? 0.0 : inf_value();
+        return (x < 0.0 && y_odd) ? -magnitude : magnitude;
+    }
+    if (x < 0.0 && !y_integer) return nan_value();
+    float magnitude = pow(abs(x), y);
+    return (x < 0.0 && y_odd) ? -magnitude : magnitude;
+}
+
+// x^y with the CPU pow kernel's own special cases, so those exponents are
+// bitwise the host's; every other exponent is std::pow's.
+float pow_exponent(float x, float y) {
+    if (y == 2.0) {
+        precise float r = x * x;
+        return r;
+    }
+    if (y == 3.0) {
+        precise float r = x * x * x;
+        return r;
+    }
+    if (y == -2.0) {
+        precise float r = 1.0 / (x * x);
+        return r;
+    }
+    if (y == 0.5) return sqrt_ieee(x);
+    if (y == -0.5) return 1.0 / sqrt_ieee(x);
+    if (y == -1.0) return 1.0 / x;
+    return pow_ieee(x, y);
+}
+
+// std::min(std::max(x, low), high) with the CPU's comparisons, so a NaN x
+// propagates (GLSL min/max leave a NaN operand undefined) and low > high
+// yields high everywhere, as torch.clamp does.
+float clamp_torch(float x, float low, float high) {
+    if (isnan(x)) return x;
+    float r = x < low ? low : x;
+    return r > high ? high : r;
+}
+
+// torch's lerp: the branch keeps the result exact at weight 0 and weight 1.
+float lerp_torch(float start, float end, float weight) {
+    precise float d = end - start;
+    precise float r = abs(weight) < 0.5 ? start + weight * d : end - d * (1.0 - weight);
+    return r;
+}
+
+// sin and cos. The argument is reduced by the quadrant: r = x - k*(π/2) with
+// k = round(x*2/π) and π/2 = DP1 + DP2 + DP3 + DP4 + DP5, a five-word
+// Cody-Waite split. DP1..DP4 carry 5, 6, 5 and 6 significant bits, so k*DPn
+// is exact while k carries at most 24 - 6 = 18 bits, and DP5 is the
+// full-precision remainder whose product rounds. (Until 2026-09-07 this was
+// the three-constant Cephes split of π/4 doubled, whose DP2 carried 11 bits
+// and so held only k <= 8191, |x| < 12867.) sin(r) and cos(r) on |r| <= π/4
+// are the Cephes single-precision polynomials in IEEE arithmetic, and the
+// quadrant picks and signs the result. No hardware sin/cos: Vulkan
+// guarantees them only 2^-11 absolute inside [-π, π], and a reduction to
+// [-π, π] alone leaves ½ulp(π) = 1.2e-7 in the argument, which is above the
+// family's 1e-7 floor next to the zeros of sin (a two-constant split of 2π
+// exceeded the family tolerance at one of the 32,768 AKV RoPE angles in a
+// host emulation, 2026-09-07).
+// Domain (DERIVED): every k*DPn is exact while |k| <= 2^18 - 1 = 262143, and
+// SINCOS_MAX = 411774.03125 is the largest float32 whose k reaches that
+// bound (measured: over every one of the 4,788,162 float32 values in
+// [262144, SINCOS_MAX], max |k| is exactly 262143). The guard is also what
+// keeps int(k) inside int32. Outside the domain -- |x| > SINCOS_MAX, an
+// infinity, or a NaN -- both results are NaN: the wrongness is loud, never a
+// plausible number, never a value outside [-1, 1] and never an infinity for
+// a finite argument. sin(±0) is ±0.
+// Error (DERIVED, |k| <= 262143): the reduced argument carries
+// k*|π/2 - DP1 - DP2 - DP3 - DP4 - DP5| + ½ulp(k*DP5) <= 1.6e-11 + 2.3e-10
+// absolute plus the subtraction chain's roundings (each at most ½ulp of its
+// own result, so 2^-24 relative to |r|), and the polynomials add their
+// recorded 1.2e-7 relative. Emulated on the host in fp32 without contraction
+// (2026-09-07), against float64 sin/cos of the same float32 arguments: over
+// every float32 in [262144, SINCOS_MAX] (4,788,162 values, exhaustive) and
+// over 4 million uniform draws from the whole domain, 0 were outside the
+// family tolerance 1e-7 + 1e-4*|reference|, relative error <= 2.9e-7 where
+// |result| > 1e-3 and absolute error <= 2.9e-10 below it, worst share of the
+// tolerance 0.0024. Where the three-word split was already sound the widened
+// one reproduces it, on the same samples: over 2.2 million points in
+// |x| < 1608 the figures are 1.19e-7 relative and 1.06e-10 absolute (the
+// three-word split's recorded 1.19e-7 / 1.1e-10) and 2,199,831 of the
+// 2,200,000 sines are bitwise identical between the two splits; at the 32,768
+// RoPE angles of T=1024, D=64, theta=1e4 they are 1.12e-7 and 5.1e-11, with
+// 32,766 of 32,768 sines and all 32,768 cosines bitwise identical. The same
+// exhaustive sweep of the three-word split over that binade put 3,560,495 of
+// the 4,788,162 outside the tolerance. The bound is conservative: the emulation's first
+// breach above it is at x = 798593.75, 1.94x SINCOS_MAX (exhaustive float32
+// scan of [SINCOS_MAX, 2^20)); the three-word split's first breach above
+// 12867.18 was at 12988.91, 1.009x. The device is measured in
+// tests/pointwise_abi.rs.
+// The exact-semantics fix is a device-side amax(|x|) guard in the entry once
+// the reduce family lands: one scalar readback would let ack_sin_out and
+// ack_cos_out refuse by name and compute on the host rather than write NaN.
+// Not built here -- the entry cannot see operand values without a readback.
+const float TWO_OVER_PI = 0.6366197466850281;         // 0x3f22f983
+const float SINCOS_MAX = 411774.03125;                // 0x48c90fc1
+const float DP1 = 1.5625;                             // 0x3fc80000, 5 bits
+const float DP2 = 0.008056640625;                     // 0x3c040000, 6 bits
+const float DP3 = 0.00023651123046875;                // 0x39780000, 5 bits
+const float DP4 = 3.159046173095703e-06;              // 0x36540000, 6 bits
+const float DP5 = 1.5893254712295857e-08;             // 0x328885a3, the remainder
+const float SIN_C0 = -0.00019515295571181923;         // 0xb94ca1f9
+const float SIN_C1 = 0.008332161232829094;            // 0x3c08839e
+const float SIN_C2 = -0.16666655242443085;            // 0xbe2aaaa3
+const float COS_C0 = 2.44331567955669e-05;            // 0x37ccf5ce
+const float COS_C1 = -0.0013887316454201937;          // 0xbab6061a
+const float COS_C2 = 0.04166664555668831;             // 0x3d2aaaa5
+
+void sincos_reduced(float x, out float s, out float c) {
+    // outside the proven domain, and for an infinity or a NaN, NaN
+    if (isnan(x) || isinf(x) || abs(x) > SINCOS_MAX) {
+        s = nan_value();
+        c = nan_value();
+        return;
+    }
+    float k = round(x * TWO_OVER_PI);
+    precise float r = k == 0.0 ? x
+                               : ((((x - k * DP1) - k * DP2) - k * DP3) - k * DP4) - k * DP5;
+    precise float z = r * r;
+    precise float sp = ((SIN_C0 * z + SIN_C1) * z + SIN_C2) * z * r + r;
+    precise float cp = ((COS_C0 * z + COS_C1) * z + COS_C2) * z * z - 0.5 * z + 1.0;
+    int q = int(k) & 3;
+    bool odd = (q & 1) != 0;
+    float sv = odd ? cp : sp;
+    float cv = odd ? sp : cp;
+    s = (q & 2) != 0 ? -sv : sv;
+    c = (q == 1 || q == 2) ? -cv : cv;
+    s = x == 0.0 ? x : s;
+}
+
+void main() {
+    // This validation and every early return are uniform for the dispatch: a
+    // plan the host did not validate writes nothing, not a partial result.
+    if (p.ndim > 4u || p.n == 0u) return;
+    uint count = 1u;
+    for (uint d = 0u; d < p.ndim; ++d) {
+        if (p.shape[d] == 0u || count > LIMIT / p.shape[d]) return;
+        count *= p.shape[d];
+    }
+    if (count != p.n) return;
+    bool y_scalar = (p.flags & 1u) != 0u;
+    bool reads_x = op_reads_x(p.op);
+    bool reads_y = op_reads_y(p.op) && !y_scalar;
+    bool reads_z = op_reads_z(p.op);
+    if (reads_x && !valid_extent(p.x_offset, p.x_stride, uint(x_values.length()))) return;
+    if (reads_y && !valid_extent(p.y_offset, p.y_stride, uint(y_values.length()))) return;
+    if (reads_z && !valid_extent(p.z_offset, p.z_stride, uint(z_values.length()))) return;
+    if (!valid_extent(p.out_offset, p.out_stride, uint(out_values.length()))) return;
+
+    float a = uintBitsToFloat(p.scalar_a);
+    float b = uintBitsToFloat(p.scalar_b);
+    int diagonal = int(p.scalar_b);
+    uint base = gl_GlobalInvocationID.x * 4u;
+    for (uint i = 0u; i < 4u; ++i) {
+        uint index = base + i;
+        if (index >= p.n) break;
+        // Row-major unravelling by shape: the last dimension varies fastest.
+        // Extent validation above proves every address stays below LIMIT.
+        uint remainder = index;
+        uint x_address = p.x_offset;
+        uint y_address = p.y_offset;
+        uint z_address = p.z_offset;
+        uint out_address = p.out_offset;
+        uint row = 0u;
+        uint column = 0u;
+        for (uint d = p.ndim; d > 0u; --d) {
+            uint coordinate = remainder % p.shape[d - 1u];
+            remainder /= p.shape[d - 1u];
+            if (d == p.ndim) column = coordinate;
+            else if (d + 1u == p.ndim) row = coordinate;
+            x_address += coordinate * p.x_stride[d - 1u];
+            y_address += coordinate * p.y_stride[d - 1u];
+            z_address += coordinate * p.z_stride[d - 1u];
+            out_address += coordinate * p.out_stride[d - 1u];
+        }
+        float x_value = 0.0;
+        if (reads_x) x_value = LOAD_X(x_address);
+        float y_value = b;
+        if (reads_y) y_value = LOAD_Y(y_address);
+        float z_value = 0.0;
+        if (reads_z) z_value = LOAD_Z(z_address);
+        float sine = 0.0;
+        float cosine = 0.0;
+        if (p.op == 20u || p.op == 21u) sincos_reduced(x_value, sine, cosine);
+        precise float result;
+        switch (p.op) {
+            case 0u: result = x_value + a * y_value; break;
+            case 1u: result = x_value - a * y_value; break;
+            case 2u: result = x_value * y_value; break;
+            case 3u: result = x_value / y_value; break;
+            case 4u: result = a; break;
+            case 5u: result = x_value; break;
+            case 6u: result = 1.0 / x_value; break;
+            case 7u: result = abs(x_value); break;
+            case 8u: result = sqrt_ieee(x_value); break;
+            case 9u: result = 1.0 / sqrt_ieee(x_value); break;
+            case 10u: result = -x_value; break;
+            case 11u: result = pow_exponent(x_value, y_value); break;
+            case 12u: result = pow_ieee(a, x_value); break;
+            case 13u: result = clamp_torch(x_value, a, b); break;
+            case 14u: result = x_value / (1.0 + exp(-x_value)); break;
+            case 15u: result = 1.0 / (1.0 + exp(-x_value)); break;
+            case 16u: result = x_value * (1.0 - y_value) * y_value; break;
+            case 17u: result = x_value + a * y_value * z_value; break;
+            case 18u: result = x_value + a * y_value / z_value; break;
+            case 19u: result = lerp_torch(x_value, y_value, a); break;
+            case 20u: result = cosine; break;
+            case 21u: result = sine; break;
+            case 22u: result = a + float(index) * b; break;
+            case 23u: result = (int(column) - int(row) >= diagonal) ? x_value : 0.0; break;
+            // An invalid op cannot masquerade as a valid computed tensor.
+            default: result = nan_value(); break;
+        }
+        STORE_OUT(out_address, result);
+    }
+}

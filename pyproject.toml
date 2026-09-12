@@ -1,40 +1,26 @@
 [build-system]
-requires = ["setuptools>=77"]
-build-backend = "setuptools.build_meta"
+requires = []
+build-backend = "_build_backend"
+backend-path = ["tools"]
 
 [project]
 name = "alelyon-ai"
-version = "0.1.0a1"
-description = "Vendor-neutral compute SDK with explicit backend capability contracts"
+version = "0.1.0a2"
+description = "Experimental vendor-neutral compute SDK with explicit native execution"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
-license-files = ["LICENSE"]
-authors = [{name = "Thomas Lacy"}]
+license-files = ["LICENSE", "THIRD-PARTY-NOTICES.txt"]
 dependencies = []
-classifiers = [
-  "Development Status :: 2 - Pre-Alpha",
-  "Intended Audience :: Developers",
-  "Intended Audience :: Science/Research",
-  "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3 :: Only",
-  "Topic :: Scientific/Engineering :: Artificial Intelligence",
-]
 
 [project.optional-dependencies]
+numpy = ["numpy>=1.26"]
+torch = ["numpy>=1.26", "torch>=2.9"]
 dev = ["build>=1.2", "pytest>=8"]
 
 [project.urls]
 Repository = "https://github.com/TLace03/Alelyon-Compute-Kit"
 Issues = "https://github.com/TLace03/Alelyon-Compute-Kit/issues"
-
-[tool.setuptools.packages.find]
-where = ["src"]
-include = ["alelyon_compute_kit", "alelyon_compute_kit.*"]
-namespaces = false
-
-[tool.setuptools.package-data]
-alelyon_compute_kit = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

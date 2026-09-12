@@ -9,12 +9,9 @@ on:
         type: boolean
         default: false
       expected_version:
-        description: Exact version expected in the source and artifacts
+        description: Exact experimental source version
         required: true
         type: string
-        # No default. The dispatcher states the version they mean and the
-        # guard below refuses it unless it equals the SOURCE version, so a
-        # default here would only be a value somebody accepts without reading.
         default: ""
 
 permissions:
@@ -26,7 +23,6 @@ concurrency:
 
 jobs:
   test:
-    name: Test ${{ matrix.os }} / Python ${{ matrix.python }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
@@ -35,123 +31,79 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         python: ["3.10", "3.14"]
     steps:
-      - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
-      - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: ${{ matrix.python }}
-      - name: Install test dependency
-        run: >-
-          python -m pip install --disable-pip-version-check --no-input
-          "pip==26.2.1" "pytest==9.1.1"
-      - name: Validate requested version
+      - run: python -m pip install --disable-pip-version-check --no-input "pip==26.2.1" "pytest==9.1.1"
+      - name: Check requested source version without package import
         env:
           EXPECTED_VERSION: ${{ inputs.expected_version }}
-        run: >-
-          python -c "import os, pathlib, sys;
-          sys.path.insert(0, str(pathlib.Path('src').resolve()));
-          import alelyon_compute_kit as package;
-          expected = os.environ['EXPECTED_VERSION'];
-          source = package.__version__;
-          raise SystemExit(0 if expected == source else
-          f'expected_version {expected!r} does not match the source version {source!r}')"
-      - name: Run source tests
-        run: python -m pytest -q
+        working-directory: tools
+        run: python -c "import os, _build_backend as b; assert os.environ['EXPECTED_VERSION'] == b.VERSION; b.sources()"
+      - run: python -m pytest -q
 
   build:
-    name: Build and verify distributions
     needs: test
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    runs-on: windows-latest
+    timeout-minutes: 25
     steps:
-      - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
-      - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: "3.12"
-      - name: Install pinned build tools
-        run: >-
-          python -m pip install --disable-pip-version-check --no-input
-          "pip==26.2.1" "setuptools==84.0.0" "wheel==0.48.0"
-          "build==1.6.0" "twine==7.0.0"
-      - name: Validate requested version
-        env:
-          EXPECTED_VERSION: ${{ inputs.expected_version }}
-        run: >-
-          python -c "import os, pathlib, sys;
-          sys.path.insert(0, str(pathlib.Path('src').resolve()));
-          import alelyon_compute_kit as package;
-          expected = os.environ['EXPECTED_VERSION'];
-          source = package.__version__;
-          raise SystemExit(0 if expected == source else
-          f'expected_version {expected!r} does not match the source version {source!r}')"
-      - name: Build wheel and source distribution
-        run: python -m build --no-isolation --outdir dist
-      # Resolve the artifacts rather than construct their names. A constructed
-      # name pins the version AND the wheel tag, and the tag stops being
-      # `py3-none-any` the moment the distribution carries a native library.
-      # Exactly one of each is asserted, so a stale artifact left in dist/ is a
-      # failure here rather than an ambiguity later.
-      - name: Resolve the built artifacts
-        shell: bash
+      - run: python -m pip install --disable-pip-version-check --no-input "pip==26.2.1" "build==1.6.0" "twine==7.0.0"
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - name: Build plain release DLL from fresh target
+        shell: pwsh
         run: |
-          set -euo pipefail
-          shopt -s nullglob
-          wheels=(dist/*.whl)
-          sdists=(dist/*.tar.gz)
-          if [ "${#wheels[@]}" -ne 1 ]; then
-            echo "expected exactly one wheel in dist/, found ${#wheels[@]}" >&2
-            exit 1
-          fi
-          if [ "${#sdists[@]}" -ne 1 ]; then
-            echo "expected exactly one sdist in dist/, found ${#sdists[@]}" >&2
-            exit 1
-          fi
-          echo "WHEEL=${wheels[0]}" >> "${GITHUB_ENV}"
-          echo "SDIST=${sdists[0]}" >> "${GITHUB_ENV}"
-          echo "resolved ${wheels[0]} and ${sdists[0]}"
-      - name: Verify exact artifact contents
-        run: >-
-          python tools/verify_distribution.py
-          --wheel "${{ env.WHEEL }}"
-          --sdist "${{ env.SDIST }}"
-      - name: Check package metadata rendering
-        run: python -m twine check --strict "${{ env.WHEEL }}" "${{ env.SDIST }}"
-      - name: Install wheel outside the checkout
-        env:
-          EXPECTED_VERSION: ${{ inputs.expected_version }}
-        shell: bash
+          python tools/build_native.py --target-dir "$env:RUNNER_TEMP/ack-native-target"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package exact wheel and source-only sdist
+        run: python -m build --no-isolation --sdist --wheel --outdir dist
+      - name: Resolve and verify exact artifacts
+        shell: pwsh
         run: |
-          set -euo pipefail
-          check_dir="${RUNNER_TEMP}/alelyon-wheel-check"
-          python -m venv "${check_dir}"
-          "${check_dir}/bin/python" -I -m pip install --disable-pip-version-check --no-input --no-deps "${GITHUB_WORKSPACE}/${WHEEL}"
-          cd "${RUNNER_TEMP}"
-          "${check_dir}/bin/python" -I -m pip check
-          "${check_dir}/bin/python" -I -c "import os, alelyon_compute_kit as package; assert package.__version__ == os.environ['EXPECTED_VERSION']"
-      - name: Upload verified distributions
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+          $wheels = @(Get-ChildItem -LiteralPath dist -Filter *.whl)
+          $sdists = @(Get-ChildItem -LiteralPath dist -Filter *.tar.gz)
+          if ($wheels.Count -ne 1 -or $sdists.Count -ne 1) { throw 'artifact-count-refused' }
+          python tools/verify_distribution.py --wheel $wheels[0].FullName --sdist $sdists[0].FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m twine check --strict $wheels[0].FullName $sdists[0].FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Clean install outside checkout; no device construction
+        shell: pwsh
+        run: |
+          $checkRoot = Join-Path $env:RUNNER_TEMP 'ack-clean-install'
+          if (Test-Path -LiteralPath $checkRoot) { throw 'clean-check-target-exists' }
+          python -m venv $checkRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $checkPython = Join-Path $checkRoot 'Scripts/python.exe'
+          $wheel = @(Get-ChildItem -LiteralPath dist -Filter *.whl)[0].FullName
+          & $checkPython -I -m pip install --no-deps --disable-pip-version-check --no-input $wheel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item -LiteralPath tools/clean_install_check.py -Destination $checkRoot
+          Push-Location $checkRoot
+          try {
+            & $checkPython -I -m pip check
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            & $checkPython -I clean_install_check.py --native-identity
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally { Pop-Location }
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: verified-distributions
-          path: |
-            ${{ env.WHEEL }}
-            ${{ env.SDIST }}
+          path: dist/*
           if-no-files-found: error
           retention-days: 7
 
   publish:
-    name: Publish verified artifacts to PyPI
     needs: build
-    if: >-
-      ${{ github.event_name == 'workflow_dispatch' &&
-          inputs.publish == true &&
-          github.ref == 'refs/heads/main' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish == true && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment:
@@ -160,12 +112,10 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - name: Download verified distributions
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
         with:
           name: verified-distributions
           path: dist
-      - name: Publish with PyPI trusted publishing
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
         with:
           packages-dir: dist/

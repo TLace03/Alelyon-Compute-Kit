@@ -1,0 +1,25 @@
+[package]
+name = "alelyon-compute-kit"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.85"
+description = "Alelyon Compute Kit (ACK) - a portable GPU compute layer, Vulkan 1.4 first, so Alelyon's training and inference code can run on any GPU. Milestone 1: device enumeration and a BF16 cooperative-matrix matmul probe."
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "alelyon_compute_kit"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ash = { version = "0.38", features = ["loaded"] }
+
+[features]
+fault-injection = []
+batch-sabotage = []
+pool-sabotage = []
+
+[profile.release]
+lto = true
+codegen-units = 1

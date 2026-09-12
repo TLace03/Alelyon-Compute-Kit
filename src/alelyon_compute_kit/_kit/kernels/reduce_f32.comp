@@ -1,0 +1,160 @@
+#version 450
+// ACK reduce-f32/v1: fixed-order reduction of a strided FP32 view over any
+// subset of its dimensions. One workgroup owns one (output element, split)
+// pair; each split covers a fixed contiguous range of the reduced index
+// space, so every value is combined in an order that depends only on the
+// plan, never on timing. Two distinct buffers: input and output. The host
+// plan (src/reduce_ops.rs) validates every address; the guards here are
+// diagnostics against raw misuse, not the contract.
+//
+// op:     0 sum, 1 amax (NaN-propagating), 2 sum of squares
+// finish: 0 none, 1 multiply by scale, 2 square root (applied after combining)
+// A second dispatch over the [outputs, splits] partial buffer with splits=1
+// combines the splits; the host decides whether it is needed.
+// STORAGE (2026-09-10). DT_IN and DT_OUT are 0 for f32 and 1 for bf16 and
+// decide only how a value is READ and WRITTEN: every accumulation, split
+// combination and finish below runs in f32 whatever they are, so the
+// fixed-order guarantee above is unaffected.
+//
+// ONE SWITCH PER BUFFER, not one for the pair. A two-pass plan writes its
+// first pass into an f32 PARTIALS block and reads it back in the second, so a
+// bf16 reduction is pass 1 with (bf16 in, f32 out) and pass 2 with (f32 in,
+// bf16 out). A shared switch could express neither.
+#ifndef DT_IN
+#define DT_IN 0
+#endif
+#ifndef DT_OUT
+#define DT_OUT 0
+#endif
+#if DT_IN || DT_OUT
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#endif
+
+layout(local_size_x = 256) in;
+#if DT_IN
+layout(set = 0, binding = 0, std430) readonly buffer Input { uint16_t input_values[]; };
+#else
+layout(set = 0, binding = 0, std430) readonly buffer Input { float input_values[]; };
+#endif
+#if DT_OUT
+layout(set = 0, binding = 1, std430) writeonly buffer Output { uint16_t output_values[]; };
+#else
+layout(set = 0, binding = 1, std430) writeonly buffer Output { float output_values[]; };
+#endif
+
+// bf16 -> f32 is exact: the 16 bits ARE the top half of the f32 word.
+// f32 -> bf16 is round-to-nearest-even with the NaN payload kept quiet,
+// copied from kernels/cast_f32_bf16.comp so a value stored here equals what
+// that cast would have written for the same input.
+#if DT_IN
+float widen(uint16_t bits) { return uintBitsToFloat(uint(bits) << 16); }
+#define LOAD_IN(i) widen(input_values[i])
+#else
+#define LOAD_IN(i) input_values[i]
+#endif
+#if DT_OUT
+uint16_t narrow(float x) {
+    const uint bits = floatBitsToUint(x);
+    if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu) != 0u) {
+        return uint16_t((bits >> 16) | 0x0040u);   // quiet NaN
+    }
+    const uint lsb = (bits >> 16) & 1u;
+    return uint16_t((bits + 0x7FFFu + lsb) >> 16);
+}
+#define STORE_OUT(i, v) output_values[i] = narrow(v)
+#else
+#define STORE_OUT(i, v) output_values[i] = (v)
+#endif
+layout(push_constant) uniform Push {
+    uint op;
+    uint finish;
+    uint ndim;
+    uint reduced_mask;
+    uint shape[6];
+    uint stride[6];
+    uint in_offset;
+    uint splits;
+    uint chunk;
+    uint scale_bits;
+} p;
+
+shared float partial[256];
+shared uint nan_seen[256];
+
+const uint NAN_BITS = 0x7fc00000u;
+const uint NEG_INF_BITS = 0xff800000u;
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint group = gl_WorkGroupID.x;
+    // Uniform diagnostics: an invalid plan cannot masquerade as a computed value.
+    bool invalid = p.op > 2u || p.finish > 2u || p.ndim == 0u || p.ndim > 6u ||
+                   p.splits == 0u || p.chunk == 0u || p.reduced_mask == 0u ||
+                   (p.reduced_mask >> p.ndim) != 0u;
+    uint kept = group / p.splits;
+    uint split = group - kept * p.splits;
+    if (!invalid && group >= uint(output_values.length())) invalid = true;
+    if (invalid) {
+        if (lane == 0u && group < uint(output_values.length())) STORE_OUT(group, uintBitsToFloat(NAN_BITS));
+        return;
+    }
+    // Decompose the kept index (row-major over the kept dims in original order)
+    // and count the reduced index space.
+    uint kept_base = p.in_offset;
+    uint reduced_count = 1u;
+    uint rem = kept;
+    for (int d = int(p.ndim) - 1; d >= 0; --d) {
+        uint extent = p.shape[d];
+        if ((p.reduced_mask & (1u << uint(d))) != 0u) {
+            reduced_count *= extent;
+        } else {
+            uint idx = rem % extent;
+            rem /= extent;
+            kept_base += idx * p.stride[d];
+        }
+    }
+    uint start = split * p.chunk;
+    uint stop = min(start + p.chunk, reduced_count);
+    float acc = p.op == 1u ? uintBitsToFloat(NEG_INF_BITS) : 0.0;
+    uint saw_nan = 0u;
+    for (uint r = start + lane; r < stop; r += 256u) {
+        // Decompose r over the reduced dims (row-major, original order).
+        uint address = kept_base;
+        uint q = r;
+        for (int d = int(p.ndim) - 1; d >= 0; --d) {
+            if ((p.reduced_mask & (1u << uint(d))) != 0u) {
+                uint extent = p.shape[d];
+                uint idx = q % extent;
+                q /= extent;
+                address += idx * p.stride[d];
+            }
+        }
+        float v = LOAD_IN(address);
+        if (p.op == 0u) {
+            acc += v;
+        } else if (p.op == 1u) {
+            if (v != v) saw_nan = 1u;
+            acc = max(acc, v);
+        } else {
+            acc += v * v;
+        }
+    }
+    partial[lane] = acc;
+    nan_seen[lane] = saw_nan;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+            partial[lane] = p.op == 1u ? max(partial[lane], partial[lane + s]) : partial[lane] + partial[lane + s];
+            nan_seen[lane] |= nan_seen[lane + s];
+        }
+        barrier();
+    }
+    if (lane == 0u) {
+        float result = partial[0];
+        if (p.op == 1u && nan_seen[0] != 0u) result = uintBitsToFloat(NAN_BITS);
+        if (p.finish == 1u) result *= uintBitsToFloat(p.scale_bits);
+        else if (p.finish == 2u) result = sqrt(result);
+        STORE_OUT(group, result);
+    }
+}

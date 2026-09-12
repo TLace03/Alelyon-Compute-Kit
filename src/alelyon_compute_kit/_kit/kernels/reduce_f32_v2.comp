@@ -1,0 +1,218 @@
+#version 450
+// ACK reduce-f32/v2 (2026-09-09): the fixed-order reduction of a strided FP32
+// view with the KEPT index space laid across the lanes, for plans whose kept
+// space has a unit-stride dimension. v1 (reduce_f32.comp) owns one workgroup
+// per (output, split) and strides the reduced index space across its lanes,
+// which is right when the reduced side is contiguous and wrong when the kept
+// side is: a sum over the leading dims of a [T, C] activation reads C strided
+// columns, and a sum over a repeat dim of extent 2 launches one 256-lane
+// workgroup per output to add two numbers (262,144 workgroups in a registered
+// AKV pass). Here a workgroup owns `tile_cols` CONSECUTIVE kept elements along
+// the unit-stride kept dim (`cdim`, flattened with a second kept dim `cdim2`
+// whose stride is `cdim`'s extent, when there is one) and `256 / tile_cols`
+// row lanes that split the reduced index space by residue, so every load a
+// wavefront issues is contiguous and every element is read exactly once.
+//
+// Same buffers, same operations and finishes, same split law and the same
+// [kept, splits] partial layout as v1, so a two-pass plan's second pass stays
+// v1. The order of combination is a function of the plan alone: row lane q
+// sums rows q, q + row_lanes, ... of its split in increasing order and the
+// row lanes are combined in increasing order, so two dispatches of one plan
+// are bit-identical. It is a DIFFERENT order from v1's, inside the family's
+// declared tolerance and not bitwise equal to it. The host plan
+// (src/reduce_ops.rs) chooses this kernel and validates every address; the
+// guards here are diagnostics against raw misuse, not the contract.
+//
+// op:     0 sum, 1 amax (NaN-propagating), 2 sum of squares
+// finish: 0 none, 1 multiply by scale, 2 square root (applied after combining)
+// grid:   x = ceil(k_flat / tile_cols), y = splits, z = outer kept count
+// STORAGE (2026-09-10). DT_IN and DT_OUT are 0 for f32 and 1 for bf16 and
+// decide only how a value is READ and WRITTEN: every accumulation, split
+// combination and finish below runs in f32 whatever they are, so the
+// fixed-order guarantee above is unaffected.
+//
+// ONE SWITCH PER BUFFER, not one for the pair. A two-pass plan writes its
+// first pass into an f32 PARTIALS block and reads it back in the second, so a
+// bf16 reduction is pass 1 with (bf16 in, f32 out) and pass 2 with (f32 in,
+// bf16 out). A shared switch could express neither.
+#ifndef DT_IN
+#define DT_IN 0
+#endif
+#ifndef DT_OUT
+#define DT_OUT 0
+#endif
+#if DT_IN || DT_OUT
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#endif
+
+layout(local_size_x = 256) in;
+#if DT_IN
+layout(set = 0, binding = 0, std430) readonly buffer Input { uint16_t input_values[]; };
+#else
+layout(set = 0, binding = 0, std430) readonly buffer Input { float input_values[]; };
+#endif
+#if DT_OUT
+layout(set = 0, binding = 1, std430) writeonly buffer Output { uint16_t output_values[]; };
+#else
+layout(set = 0, binding = 1, std430) writeonly buffer Output { float output_values[]; };
+#endif
+
+// bf16 -> f32 is exact: the 16 bits ARE the top half of the f32 word.
+// f32 -> bf16 is round-to-nearest-even with the NaN payload kept quiet,
+// copied from kernels/cast_f32_bf16.comp so a value stored here equals what
+// that cast would have written for the same input.
+#if DT_IN
+float widen(uint16_t bits) { return uintBitsToFloat(uint(bits) << 16); }
+#define LOAD_IN(i) widen(input_values[i])
+#else
+#define LOAD_IN(i) input_values[i]
+#endif
+#if DT_OUT
+uint16_t narrow(float x) {
+    const uint bits = floatBitsToUint(x);
+    if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu) != 0u) {
+        return uint16_t((bits >> 16) | 0x0040u);   // quiet NaN
+    }
+    const uint lsb = (bits >> 16) & 1u;
+    return uint16_t((bits + 0x7FFFu + lsb) >> 16);
+}
+#define STORE_OUT(i, v) output_values[i] = narrow(v)
+#else
+#define STORE_OUT(i, v) output_values[i] = (v)
+#endif
+layout(push_constant) uniform Push {
+    uint op;
+    uint finish;
+    uint ndim;
+    uint reduced_mask;
+    uint shape[6];
+    uint stride[6];
+    uint in_offset;
+    uint splits;
+    uint chunk;
+    uint scale_bits;
+    uint cdim;        // the kept dim the lanes run along (stride 1)
+    uint cdim2;       // a second kept dim flattened onto it, or NONE
+    uint tile_cols;   // kept elements per workgroup: 8, 16, ..., 256
+    uint outer_kept;  // product of the other kept extents (the z grid)
+} p;
+
+shared float partial[256];
+shared uint nan_seen[256];
+
+const uint NAN_BITS = 0x7fc00000u;
+const uint NEG_INF_BITS = 0xff800000u;
+const uint NONE = 0xffffffffu;
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint tile = gl_WorkGroupID.x;
+    uint split = gl_WorkGroupID.y;
+    uint outer = gl_WorkGroupID.z;
+    // Uniform diagnostics: an invalid plan cannot masquerade as a computed value.
+    bool invalid = p.op > 2u || p.finish > 2u || p.ndim == 0u || p.ndim > 6u ||
+                   p.splits == 0u || p.chunk == 0u || p.reduced_mask == 0u ||
+                   (p.reduced_mask >> p.ndim) != 0u ||
+                   p.tile_cols == 0u || p.tile_cols > 256u || (256u % p.tile_cols) != 0u ||
+                   p.cdim >= p.ndim || (p.reduced_mask & (1u << p.cdim)) != 0u ||
+                   (p.cdim2 != NONE && (p.cdim2 >= p.ndim || p.cdim2 == p.cdim ||
+                                        (p.reduced_mask & (1u << p.cdim2)) != 0u)) ||
+                   p.outer_kept == 0u || split >= p.splits || outer >= p.outer_kept;
+    if (invalid) {
+        if (lane == 0u && output_values.length() > 0) STORE_OUT(0, uintBitsToFloat(NAN_BITS));
+        return;
+    }
+    uint tile_cols = p.tile_cols;
+    uint row_lanes = 256u / tile_cols;
+    uint col = lane % tile_cols;
+    uint rl = lane / tile_cols;
+    uint k_inner = p.shape[p.cdim];
+    uint k_flat = k_inner * (p.cdim2 == NONE ? 1u : p.shape[p.cdim2]);
+    uint c = tile * tile_cols + col;
+    bool live = c < k_flat;
+    uint c0 = c % k_inner;
+    uint c1 = c / k_inner;
+
+    // Output strides over the kept dims in original order (dense output), the
+    // reduced count, and the decomposition of this workgroup's outer index
+    // over the kept dims that are neither cdim nor cdim2.
+    uint out_stride[6];
+    uint run = 1u;
+    uint reduced_count = 1u;
+    for (int d = 5; d >= 0; --d) {
+        out_stride[d] = 0u;
+        if (uint(d) < p.ndim) {
+            if ((p.reduced_mask & (1u << uint(d))) != 0u) {
+                reduced_count *= p.shape[d];
+            } else {
+                out_stride[d] = run;
+                run *= p.shape[d];
+            }
+        }
+    }
+    uint base_in = p.in_offset;
+    uint base_out = 0u;
+    uint rem = outer;
+    for (int d = 5; d >= 0; --d) {
+        uint ud = uint(d);
+        if (ud >= p.ndim) continue;
+        if ((p.reduced_mask & (1u << ud)) != 0u || ud == p.cdim || ud == p.cdim2) continue;
+        uint idx = rem % p.shape[d];
+        rem /= p.shape[d];
+        base_in += idx * p.stride[d];
+        base_out += idx * out_stride[d];
+    }
+    base_in += c0 * p.stride[p.cdim];
+    base_out += c0 * out_stride[p.cdim];
+    if (p.cdim2 != NONE) {
+        base_in += c1 * p.stride[p.cdim2];
+        base_out += c1 * out_stride[p.cdim2];
+    }
+
+    uint start = split * p.chunk;
+    uint stop = min(start + p.chunk, reduced_count);
+    float acc = p.op == 1u ? uintBitsToFloat(NEG_INF_BITS) : 0.0;
+    uint saw_nan = 0u;
+    if (live) {
+        for (uint r = start + rl; r < stop; r += row_lanes) {
+            // Decompose r over the reduced dims (row-major, original order).
+            uint address = base_in;
+            uint q = r;
+            for (int d = 5; d >= 0; --d) {
+                if (uint(d) < p.ndim && (p.reduced_mask & (1u << uint(d))) != 0u) {
+                    uint extent = p.shape[d];
+                    uint idx = q % extent;
+                    q /= extent;
+                    address += idx * p.stride[d];
+                }
+            }
+            float v = LOAD_IN(address);
+            if (p.op == 0u) {
+                acc += v;
+            } else if (p.op == 1u) {
+                if (v != v) saw_nan = 1u;
+                acc = max(acc, v);
+            } else {
+                acc += v * v;
+            }
+        }
+    }
+    partial[lane] = acc;
+    nan_seen[lane] = saw_nan;
+    barrier();
+    if (rl == 0u && live) {
+        // combine the row lanes of this column in increasing order: fixed
+        float result = partial[lane];
+        uint nan = nan_seen[lane];
+        for (uint q = 1u; q < row_lanes; ++q) {
+            uint j = q * tile_cols + col;
+            result = p.op == 1u ? max(result, partial[j]) : result + partial[j];
+            nan |= nan_seen[j];
+        }
+        if (p.op == 1u && nan != 0u) result = uintBitsToFloat(NAN_BITS);
+        if (p.finish == 1u) result *= uintBitsToFloat(p.scale_bits);
+        else if (p.finish == 2u) result = sqrt(result);
+        STORE_OUT(base_out * p.splits + split, result);
+    }
+}

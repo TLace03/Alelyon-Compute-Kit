@@ -1,0 +1,201 @@
+#version 450
+// matmul-f32/v2: C[b,i,j] = sum_l A[b,i,l] * B[b,l,j] in PLAIN FP32.
+//
+// The same three FP32 storage buffers, the same 64-byte push block and the
+// same capacity guards as matmul-f32/v1 (kernels/matmul_f32.comp); a
+// different arithmetic contract and a different tiling.
+//
+// ARITHMETIC. Every product is accumulated in FP32 with no compensation term:
+// no Neumaier addition correction and no product residual. The compiler may
+// contract a multiply and its add into a fused multiply-add. This is the
+// arithmetic of an ordinary fp32 GEMM -- the class the release criterion's
+// reference R (fp32 throughout on the host or on HIP) is computed in -- and
+// it is NOT the near-exact contract v1 keeps. Near-zero cancellation cases
+// that v1 recovers with its residuals can round to a wrong small number here,
+// which is why v1 stays the kernel of the strict fp32 diagnostic mode and
+// why the probe's exact.cancellation case is v1-only. Error against an f64
+// reference is MEASURED per shape by src/bin/matmul_probe.rs --kernel v2 and
+// recorded; nothing here claims a bound for arbitrary inputs.
+//
+// TILING. One workgroup of 16 x 16 invocations computes a 64 x 64 output tile
+// for one batch index (gl_WorkGroupID.z), walking k in steps of 16. Each k
+// step stages a 64 x 16 panel of A and a 16 x 64 panel of B in shared memory
+// (1,024 elements each, four loads per invocation) and every invocation
+// accumulates a 4 x 4 register micro-tile from them: 64 multiply-adds per
+// invocation per 2 x 1,024 staged elements, against v1's one multiply-add per
+// staged element. Rows and columns past m, n or k load positive zero and are
+// never written, so any shape is admitted; the extent and layout validation
+// above main() is v1's, verbatim, so a plan v1 refuses v2 refuses too.
+//
+// STAGING ORDER follows the operand's unit stride when it has one, so the
+// four consecutive loads an invocation issues are contiguous in memory for
+// a row-major A and a row-major B, and also for their transposed views
+// (whose ROW stride is one). An operand with no unit stride stages
+// correctly but uncoalesced.
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer AValues { float a_values[]; };
+layout(set = 0, binding = 1, std430) readonly buffer BValues { float b_values[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer CValues { float c_values[]; };
+
+layout(push_constant) uniform Plan {
+    uint batch;
+    uint m;
+    uint n;
+    uint k;
+    uint a_offset;
+    uint a_batch_stride;
+    uint a_row_stride;
+    uint a_col_stride;
+    uint b_offset;
+    uint b_batch_stride;
+    uint b_row_stride;
+    uint b_col_stride;
+    uint c_offset;
+    uint c_batch_stride;
+    uint c_row_stride;
+    uint c_col_stride;
+} p;
+
+const uint BM = 64u;
+const uint BN = 64u;
+const uint BK = 16u;
+const uint INVOCATIONS = 256u;
+// +1 pads the fastest dimension so a column read across lanes does not land
+// every lane on one bank.
+shared float a_tile[BK][BM + 1u];
+shared float b_tile[BK][BN + 1u];
+
+// EVERY CAPACITY LITERAL BELOW IS A COPY of src/matmul_ops.rs, exactly as in
+// matmul_f32.comp; tests/languages/test_compute_kit_matmul_bounds.py and
+// tests/matmul_plan.rs assert parity across every copy including this file.
+const uint LIMIT = 268435456u;   // MAX_ADDRESSED_ELEMENTS
+
+bool valid_extent(
+    uint offset,
+    uint batch_stride,
+    uint row_stride,
+    uint col_stride,
+    uint batches,
+    uint rows,
+    uint cols,
+    uint available
+) {
+    if (batch_stride == 0u || row_stride == 0u || col_stride == 0u ||
+        offset >= LIMIT || available == 0u)
+        return false;
+    uint maximum = offset;
+    uint factor = batches - 1u;
+    if (factor > (LIMIT - 1u - maximum) / batch_stride) return false;
+    maximum += factor * batch_stride;
+    factor = rows - 1u;
+    if (factor > (LIMIT - 1u - maximum) / row_stride) return false;
+    maximum += factor * row_stride;
+    factor = cols - 1u;
+    if (factor > (LIMIT - 1u - maximum) / col_stride) return false;
+    maximum += factor * col_stride;
+    return maximum < available;
+}
+
+bool valid_output_layout() {
+    bool row_major = p.c_col_stride == 1u && p.c_row_stride >= p.n;
+    bool column_major = p.c_row_stride == 1u && p.c_col_stride >= p.m;
+    if (!row_major && !column_major) return false;
+    uint span = (p.m - 1u) * p.c_row_stride +
+                (p.n - 1u) * p.c_col_stride + 1u;
+    return p.batch == 1u || p.c_batch_stride >= span;
+}
+
+void main() {
+    // Validation and every early return are uniform for a workgroup. The
+    // literals mirror MAX_BATCH, MAX_DIM (m), MAX_DIM (n) and MAX_K (k).
+    if (p.batch == 0u || p.batch > 4096u || p.m == 0u || p.m > 65536u ||
+        p.n == 0u || p.n > 65536u || p.k == 0u || p.k > 65536u ||
+        p.batch > LIMIT / p.m || p.batch * p.m > LIMIT / p.k ||
+        p.batch > LIMIT / p.k || p.batch * p.k > LIMIT / p.n ||
+        p.batch > LIMIT / p.m || p.batch * p.m > LIMIT / p.n)
+        return;
+    if (!valid_extent(p.a_offset, p.a_batch_stride, p.a_row_stride,
+                      p.a_col_stride, p.batch, p.m, p.k,
+                      uint(a_values.length())))
+        return;
+    if (!valid_extent(p.b_offset, p.b_batch_stride, p.b_row_stride,
+                      p.b_col_stride, p.batch, p.k, p.n,
+                      uint(b_values.length())))
+        return;
+    if (!valid_extent(p.c_offset, p.c_batch_stride, p.c_row_stride,
+                      p.c_col_stride, p.batch, p.m, p.n,
+                      uint(c_values.length())))
+        return;
+    if (!valid_output_layout())
+        return;
+
+    uint batch_index = gl_WorkGroupID.z;
+    if (batch_index >= p.batch) return;
+
+    uint lx = gl_LocalInvocationID.x;   // 0..15, the column group
+    uint ly = gl_LocalInvocationID.y;   // 0..15, the row group
+    uint lin = ly * 16u + lx;           // 0..255
+    uint m0 = gl_WorkGroupID.y * BM;
+    uint n0 = gl_WorkGroupID.x * BN;
+    uint a_base = p.a_offset + batch_index * p.a_batch_stride;
+    uint b_base = p.b_offset + batch_index * p.b_batch_stride;
+    // A is staged with k fastest when its column stride is one (row-major
+    // storage); otherwise with m fastest, which is contiguous for a
+    // transposed view whose row stride is one. Likewise B with n fastest
+    // unless its row stride is one.
+    bool a_k_fastest = p.a_col_stride == 1u;
+    bool b_n_fastest = p.b_col_stride == 1u;
+
+    float acc[4][4];
+    for (uint i = 0u; i < 4u; ++i)
+        for (uint j = 0u; j < 4u; ++j)
+            acc[i][j] = 0.0;
+
+    // Every lane stays in every barrier: tails load positive zero.
+    for (uint k0 = 0u; k0 < p.k; k0 += BK) {
+        for (uint e = lin; e < BM * BK; e += INVOCATIONS) {
+            uint mi, ki;
+            if (a_k_fastest) { mi = e / BK; ki = e - mi * BK; }
+            else             { ki = e / BM; mi = e - ki * BM; }
+            uint row = m0 + mi;
+            uint kk = k0 + ki;
+            float value = 0.0;
+            if (row < p.m && kk < p.k)
+                value = a_values[a_base + row * p.a_row_stride + kk * p.a_col_stride];
+            a_tile[ki][mi] = value;
+        }
+        for (uint e = lin; e < BK * BN; e += INVOCATIONS) {
+            uint ki, ni;
+            if (b_n_fastest) { ki = e / BN; ni = e - ki * BN; }
+            else             { ni = e / BK; ki = e - ni * BK; }
+            uint kk = k0 + ki;
+            uint col = n0 + ni;
+            float value = 0.0;
+            if (kk < p.k && col < p.n)
+                value = b_values[b_base + kk * p.b_row_stride + col * p.b_col_stride];
+            b_tile[ki][ni] = value;
+        }
+        barrier();
+        for (uint ki = 0u; ki < BK; ++ki) {
+            float a_reg[4];
+            float b_reg[4];
+            for (uint i = 0u; i < 4u; ++i) a_reg[i] = a_tile[ki][ly * 4u + i];
+            for (uint j = 0u; j < 4u; ++j) b_reg[j] = b_tile[ki][lx * 4u + j];
+            for (uint i = 0u; i < 4u; ++i)
+                for (uint j = 0u; j < 4u; ++j)
+                    acc[i][j] += a_reg[i] * b_reg[j];
+        }
+        barrier();
+    }
+
+    uint c_base = p.c_offset + batch_index * p.c_batch_stride;
+    for (uint i = 0u; i < 4u; ++i) {
+        uint row = m0 + ly * 4u + i;
+        if (row >= p.m) continue;
+        for (uint j = 0u; j < 4u; ++j) {
+            uint col = n0 + lx * 4u + j;
+            if (col >= p.n) continue;
+            c_values[c_base + row * p.c_row_stride + col * p.c_col_stride] = acc[i][j];
+        }
+    }
+}

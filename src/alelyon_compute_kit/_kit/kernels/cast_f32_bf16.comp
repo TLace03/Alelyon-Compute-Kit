@@ -1,0 +1,44 @@
+#version 450
+// Elementwise casts between f32 and bf16 on the device, so a kernel that
+// accumulates in f32 can hand back a bf16 tensor without a host round trip.
+// MODE 0: f32 -> bf16 (round to nearest even, ties to even; NaN payload kept
+// quiet). MODE 1: bf16 -> f32 (exact). Each invocation handles 4 elements;
+// n is the element count and the tail is masked.
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+
+#ifndef MODE
+#define MODE 0
+#endif
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+#if MODE == 0
+layout(std430, set = 0, binding = 0) readonly buffer Src { float src[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Dst { uint16_t dst[]; };
+#else
+layout(std430, set = 0, binding = 0) readonly buffer Src { uint16_t src[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Dst { float dst[]; };
+#endif
+layout(push_constant) uniform P { uint n; } p;
+
+uint16_t f32_to_bf16(float x) {
+    uint bits = floatBitsToUint(x);
+    if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu) != 0u) {
+        return uint16_t((bits >> 16) | 0x0040u);   // quiet NaN
+    }
+    uint lsb = (bits >> 16) & 1u;
+    uint rounded = bits + 0x7FFFu + lsb;
+    return uint16_t(rounded >> 16);
+}
+
+void main() {
+    uint base = gl_GlobalInvocationID.x * 4u;
+    for (uint i = 0u; i < 4u; ++i) {
+        uint idx = base + i;
+        if (idx >= p.n) break;
+#if MODE == 0
+        dst[idx] = f32_to_bf16(src[idx]);
+#else
+        dst[idx] = uintBitsToFloat(uint(src[idx]) << 16);
+#endif
+    }
+}

@@ -1,0 +1,330 @@
+#version 450
+// Milestone-2 kernel, version 4: version 3 plus padded shared-memory panels.
+// Measured on v3: fragment loads whose 16 elements are contiguous in shared
+// memory (A stored transposed, B stored normally) ran 25-30% faster than loads
+// that stride by one BK-long panel row (64 bytes at BK=32), which is the bank
+// conflict pattern. Panels whose rows are BK long (A when A_T=0, B when
+// B_T=1) get PAD extra uvec4 per row so consecutive fragment rows land on
+// different banks. Everything else is version 3.
+// Z GRID (2026-09-09, all eight variants): gl_WorkGroupID.z is a batch index
+// (zmode 0: A, B and C advance by za, zb, zc ELEMENTS per z) or a K-split
+// index (zmode 1: this z owns k in [z*kz, min(K, (z+1)*kz)) and writes its
+// PARTIAL product at C + z*zc; the caller sums the partials over z). A single
+// product is z = 1 with every z word zero, and takes exactly the path it
+// took before. The aligned variants require za and zb to be multiples of 8
+// (their operands are read as uvec4) and kz a multiple of BK; the edge
+// variants gather element-wise and need neither.
+// LEADING DIMENSIONS (2026-09-09): lda and ldb are the STORED row pitch of A
+// and of B in elements (A_T=0: the pitch of A's M rows of K; A_T=1: of its K
+// stored rows of M; B_T=0: B's K rows of N; B_T=1: its N rows of K), or 0
+// for the logical width, which is what every single-product caller passes.
+// A head-interleaved [batch, rows, cols] view (batch stride 64, pitch 512)
+// is then read in place through za and lda. The aligned variants need the
+// pitch to be a multiple of 8; the edge variants gather.
+//   forward   C[M,N] = A[M,K]      . B[K,N]        (A_T=0, B_T=0)
+//   grad in   dA     = dC[M,N]     . B[K,N]^T      (A_T=0, B_T=1: B stored N x K)
+//   grad w    dW     = A[M,K]^T    . dC[M,N]       (A_T=1, B_T=0: A stored K x M)
+// Requirements: M % BM == 0, N % BN == 0, K % BK == 0, every leading
+// dimension % 8 == 0, subgroup size 64 (required by the pipeline).
+//
+// EDGE=1 lifts every one of those shape requirements except the subgroup size,
+// and is compiled as a SEPARATE set of variants so the aligned modules keep
+// their exact bytes. It differs in only two places, and the interior arithmetic,
+// the shared-memory geometry, the PAD skew and the coopMatLoad/coopMatMulAdd
+// sequence are untouched:
+//
+//   1. Staging gathers through a `uint` view of A and B instead of a `uvec4`
+//      one, so a leading dimension is an element count rather than a count of
+//      8-element groups. The uvec4 view is what quantised the leading dimension
+//      to a multiple of 8: `a[i]` addresses bytes [16i, 16i+16), so a row pitch
+//      that is not a multiple of 8 is not addressable at all, and an explicit
+//      stride push constant would NOT have made it addressable. Elements
+//      outside the operand are staged as exact zero, which covers the M, N and
+//      K tails in one rule. Zero-filling BOTH operands in the K tail is what
+//      keeps 0*Inf out of a kept accumulator position.
+//   2. The store predicates. coopMatStore cannot be masked per element -- the
+//      KHR extension requires every invocation in the scope instance to be
+//      active and leaves the component-to-(row,column) mapping
+//      implementation-dependent -- so a fragment that crosses M or N is stored
+//      to a shared f32 scratch at stride 16 and copied out with ordinary
+//      predicated scalar writes. Fragments wholly inside the extent keep the
+//      direct store, guarded additionally on N % 4 == 0, which is the alignment
+//      OpCooperativeMatrixStoreKHR requires of its stride operand
+//      (VUID-RuntimeSpirv-OpCooperativeMatrixLoadKHR-08986: 4*N bytes must be a
+//      multiple of 16).
+//
+// EDGE=1 reads A and B as whole 32-bit words, so it touches the second half of
+// the word holding a final element that sits at an even index. Every buffer is
+// allocated to a whole word by Context::buffer for exactly this reason; that
+// half is read but never used for its value, so its contents do not matter.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_bfloat16 : require
+
+#ifndef BM
+#define BM 128
+#endif
+#ifndef BN
+#define BN 128
+#endif
+#ifndef BK
+#define BK 32
+#endif
+#ifndef SG_ROWS
+#define SG_ROWS 2
+#endif
+#ifndef SG_COLS
+#define SG_COLS 2
+#endif
+#ifndef A_T
+#define A_T 0
+#endif
+#ifndef B_T
+#define B_T 0
+#endif
+#ifndef PAD
+#define PAD 1
+#endif
+#ifndef EDGE
+#define EDGE 0
+#endif
+
+#define NSG (SG_ROWS * SG_COLS)
+#define WG (NSG * 64)
+#define TM (BM / SG_ROWS)
+#define TN (BN / SG_COLS)
+#define FM (TM / 16)
+#define FN (TN / 16)
+
+// staged panel geometry in uvec4 (8 bf16) units, as stored in memory;
+// *_VEC_PER_ROW is the useful width, *_STRIDE the padded shared stride
+#if A_T
+#define A_ROWS BK
+#define A_VEC_PER_ROW (BM / 8)
+#define A_STRIDE A_VEC_PER_ROW
+#else
+#define A_ROWS BM
+#define A_VEC_PER_ROW (BK / 8)
+#define A_STRIDE (A_VEC_PER_ROW + PAD)
+#endif
+#if B_T
+#define B_ROWS BN
+#define B_VEC_PER_ROW (BK / 8)
+#define B_STRIDE (B_VEC_PER_ROW + PAD)
+#else
+#define B_ROWS BK
+#define B_VEC_PER_ROW (BN / 8)
+#define B_STRIDE B_VEC_PER_ROW
+#endif
+#define A_VECS (A_ROWS * A_VEC_PER_ROW)
+#define B_VECS (B_ROWS * B_VEC_PER_ROW)
+
+layout(local_size_x = WG, local_size_y = 1, local_size_z = 1) in;
+#if EDGE
+layout(std430, set = 0, binding = 0) readonly buffer A { uint a[]; };
+layout(std430, set = 0, binding = 1) readonly buffer B { uint b[]; };
+#else
+layout(std430, set = 0, binding = 0) readonly buffer A { uvec4 a[]; };
+layout(std430, set = 0, binding = 1) readonly buffer B { uvec4 b[]; };
+#endif
+layout(std430, set = 0, binding = 2) buffer C { float c[]; };
+layout(push_constant) uniform P {
+    uint M; uint N; uint K;
+    uint zmode;   // 0: z is a batch; 1: z is a K-split
+    uint za;      // elements between consecutive z of A (zmode 0)
+    uint zb;      // elements between consecutive z of B (zmode 0)
+    uint zc;      // elements between consecutive z of C (both modes)
+    uint kz;      // k per split (zmode 1)
+    uint lda;     // stored row pitch of A in elements, 0 = logical width
+    uint ldb;     // stored row pitch of B in elements, 0 = logical width
+} p;
+// the element offsets of this workgroup's operands, set in main before any read
+uint aBase = 0u;
+uint bBase = 0u;
+
+shared uvec4 As[A_ROWS * A_STRIDE];
+shared uvec4 Bs[B_ROWS * B_STRIDE];
+#if EDGE
+// one 16x16 f32 fragment per subgroup: 4 KiB on top of the 18 KiB of panels,
+// against a 32 KiB maxComputeSharedMemorySize on this device
+shared float Cs[NSG * 256];
+
+// Eight consecutive bf16 as one uvec4, gathered element-wise so `ld` may be any
+// value. `row` indexes the STORED layout and `ld` is its pitch in ELEMENTS; the
+// eight columns start at `col0`. Anything at or past `rowLimit`/`colLimit` is
+// exact zero. Reading whole 32-bit words can touch the high half of the word
+// holding the operand's last element; that half is discarded by the `valid`
+// mask, and Context::buffer allocates every buffer to a whole word so the read
+// itself is in bounds.
+uvec4 gatherA(uint row, uint rowLimit, uint col0, uint colLimit, uint ld) {
+    if (row >= rowLimit || col0 >= colLimit) return uvec4(0u);
+    const uint valid = min(8u, colLimit - col0);
+    const uint base = aBase + row * ld + col0;
+    if (valid == 8u && (base & 1u) == 0u) {
+        const uint q = base >> 1u;
+        return uvec4(a[q], a[q + 1u], a[q + 2u], a[q + 3u]);
+    }
+    uvec4 r = uvec4(0u);
+    for (uint e = 0u; e < valid; ++e) {
+        const uint idx = base + e;
+        const uint w = a[idx >> 1u];
+        const uint h = ((idx & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);
+        r[e >> 1u] |= h << (16u * (e & 1u));
+    }
+    return r;
+}
+
+uvec4 gatherB(uint row, uint rowLimit, uint col0, uint colLimit, uint ld) {
+    if (row >= rowLimit || col0 >= colLimit) return uvec4(0u);
+    const uint valid = min(8u, colLimit - col0);
+    const uint base = bBase + row * ld + col0;
+    if (valid == 8u && (base & 1u) == 0u) {
+        const uint q = base >> 1u;
+        return uvec4(b[q], b[q + 1u], b[q + 2u], b[q + 3u]);
+    }
+    uvec4 r = uvec4(0u);
+    for (uint e = 0u; e < valid; ++e) {
+        const uint idx = base + e;
+        const uint w = b[idx >> 1u];
+        const uint h = ((idx & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);
+        r[e >> 1u] |= h << (16u * (e & 1u));
+    }
+    return r;
+}
+#endif
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint sg = gl_SubgroupID;
+    const uint sgRow = sg / SG_COLS;
+    const uint sgCol = sg % SG_COLS;
+    const uint tileRow = gl_WorkGroupID.y * BM;
+    const uint tileCol = gl_WorkGroupID.x * BN;
+    const uint z = gl_WorkGroupID.z;
+    uint kBegin = 0u;
+    uint kEnd = p.K;
+    const uint cBase = z * p.zc;
+    if (p.zmode == 1u) {
+        kBegin = z * p.kz;
+        kEnd = min(p.K, kBegin + p.kz);
+    } else {
+        aBase = z * p.za;
+        bBase = z * p.zb;
+    }
+#if A_T
+    const uint ldA = p.lda != 0u ? p.lda : p.M;
+#else
+    const uint ldA = p.lda != 0u ? p.lda : p.K;
+#endif
+#if B_T
+    const uint ldB = p.ldb != 0u ? p.ldb : p.K;
+#else
+    const uint ldB = p.ldb != 0u ? p.ldb : p.N;
+#endif
+#if !EDGE
+    const uint aLd = ldA / 8u;
+    const uint bLd = ldB / 8u;
+    const uint aVec = aBase / 8u;
+    const uint bVec = bBase / 8u;
+#endif
+
+    coopmat<float32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[FM][FN];
+    for (uint i = 0; i < FM; ++i)
+        for (uint j = 0; j < FN; ++j)
+            acc[i][j] = coopmat<float32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    for (uint k0 = kBegin; k0 < kEnd; k0 += BK) {
+        for (uint v = tid; v < A_VECS; v += WG) {
+            const uint row = v / A_VEC_PER_ROW;
+            const uint col = v % A_VEC_PER_ROW;
+#if EDGE
+#if A_T
+            As[row * A_STRIDE + col] = gatherA(k0 + row, kEnd, tileRow + col * 8u, p.M, ldA);
+#else
+            As[row * A_STRIDE + col] = gatherA(tileRow + row, p.M, k0 + col * 8u, kEnd, ldA);
+#endif
+#else
+#if A_T
+            As[row * A_STRIDE + col] = a[aVec + (k0 + row) * aLd + (tileRow / 8u) + col];
+#else
+            As[row * A_STRIDE + col] = a[aVec + (tileRow + row) * aLd + (k0 / 8u) + col];
+#endif
+#endif
+        }
+        for (uint v = tid; v < B_VECS; v += WG) {
+            const uint row = v / B_VEC_PER_ROW;
+            const uint col = v % B_VEC_PER_ROW;
+#if EDGE
+#if B_T
+            Bs[row * B_STRIDE + col] = gatherB(tileCol + row, p.N, k0 + col * 8u, kEnd, ldB);
+#else
+            Bs[row * B_STRIDE + col] = gatherB(k0 + row, kEnd, tileCol + col * 8u, p.N, ldB);
+#endif
+#else
+#if B_T
+            Bs[row * B_STRIDE + col] = b[bVec + (tileCol + row) * bLd + (k0 / 8u) + col];
+#else
+            Bs[row * B_STRIDE + col] = b[bVec + (k0 + row) * bLd + (tileCol / 8u) + col];
+#endif
+#endif
+        }
+        barrier();
+        for (uint kk = 0; kk < BK; kk += 16) {
+            coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma[FM];
+            coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb[FN];
+            for (uint i = 0; i < FM; ++i) {
+                const uint r0 = sgRow * TM + i * 16;
+#if A_T
+                coopMatLoad(ma[i], As, kk * A_STRIDE + r0 / 8u, A_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+#else
+                coopMatLoad(ma[i], As, r0 * A_STRIDE + kk / 8u, A_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+#endif
+            }
+            for (uint j = 0; j < FN; ++j) {
+                const uint c0 = sgCol * TN + j * 16;
+#if B_T
+                coopMatLoad(mb[j], Bs, c0 * B_STRIDE + kk / 8u, B_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+#else
+                coopMatLoad(mb[j], Bs, kk * B_STRIDE + c0 / 8u, B_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+#endif
+            }
+            for (uint i = 0; i < FM; ++i)
+                for (uint j = 0; j < FN; ++j)
+                    acc[i][j] = coopMatMulAdd(ma[i], mb[j], acc[i][j]);
+        }
+        barrier();
+    }
+#if EDGE
+    for (uint i = 0; i < FM; ++i) {
+        for (uint j = 0; j < FN; ++j) {
+            // subgroup-uniform: tileRow/tileCol/sgRow/sgCol/i/j and p.M/p.N are
+            // all uniform here, so the whole scope instance takes one branch,
+            // which is what the cooperative-matrix spec requires
+            const uint r0 = tileRow + sgRow * TM + i * 16;
+            const uint c0 = tileCol + sgCol * TN + j * 16;
+            if (r0 + 16u <= p.M && c0 + 16u <= p.N && (p.N & 3u) == 0u) {
+                coopMatStore(acc[i][j], c, cBase + r0 * p.N + c0, p.N, gl_CooperativeMatrixLayoutRowMajor);
+            } else if (r0 < p.M && c0 < p.N) {
+                coopMatStore(acc[i][j], Cs, sg * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+                subgroupMemoryBarrierShared();
+                subgroupBarrier();
+                for (uint t = gl_SubgroupInvocationID; t < 256u; t += gl_SubgroupSize) {
+                    const uint rr = t >> 4u;
+                    const uint cc = t & 15u;
+                    if (r0 + rr < p.M && c0 + cc < p.N)
+                        c[cBase + (r0 + rr) * p.N + c0 + cc] = Cs[sg * 256u + t];
+                }
+                // the scratch is reused by the next fragment
+                subgroupMemoryBarrierShared();
+                subgroupBarrier();
+            }
+        }
+    }
+#else
+    for (uint i = 0; i < FM; ++i)
+        for (uint j = 0; j < FN; ++j)
+            coopMatStore(acc[i][j], c, cBase + (tileRow + sgRow * TM + i * 16) * p.N + tileCol + sgCol * TN + j * 16, p.N, gl_CooperativeMatrixLayoutRowMajor);
+#endif
+}
