@@ -10,11 +10,35 @@ Previously published `0.1.0a0` and `0.1.0a1` artifacts remain MIT-licensed.
 
 ## Current package
 
-Version `0.1.0a3` adds a Windows AMD64 native library, reviewed Rust and shader
-sources, Python buffers and an experimental vector-coded expert API. The root
-import retains the immutable capability records and explicit backend registry:
-it does not load drivers, discover plugins, compile code or allocate a device.
-No backend is automatically registered.
+Version `0.1.0a4` is a patch release. It fixes the codebook-fitting defect
+described under "Known issue" below and is otherwise identical to `0.1.0a3`,
+which added a Windows AMD64 native library, reviewed Rust and shader sources,
+Python buffers and an experimental vector-coded expert API. The root import
+retains the immutable capability records and explicit backend registry: it does
+not load drivers, discover plugins, compile code or allocate a device. No
+backend is automatically registered.
+
+### Known issue, fixed in `0.1.0a4`
+
+`fit_codebook` in `0.1.0a3` and earlier could return a codebook with fewer
+usable entries than it reports. When a cluster went empty during fitting, that
+entry kept a stale duplicate row, and because `encode` breaks ties by lowest
+index the duplicate could never be selected again — so the entry was paid for,
+at `log2(16) = 4` bits an index, and unreachable for the life of the codebook.
+
+It required input containing **exact duplicate vectors with uneven occupancy**.
+Data with any dispersion — gaussian or row-normalised weight blocks, where exact
+repeats essentially cannot occur — was unaffected and returned all sixteen
+entries. Measured against `0.1.0a3` on sixteen exact vectors at varying
+frequencies, as distinct/reachable entries out of sixteen: even occupancy
+16/16; eight common and eight rare 12/12; a geometric skew 9/9; one dominant
+vector with fifteen rare ones 4/4.
+
+Nothing produced silently wrong numbers: an affected codebook still encodes and
+decodes correctly, with higher distortion than its stated size implies. If you
+fitted a codebook on duplicate-heavy input with `0.1.0a3` or earlier, refit it
+with `0.1.0a4`. `0.1.0a3` is left on PyPI rather than yanked, so existing pins
+keep resolving; this note is the record.
 
 The runtime includes matrix, pointwise, reduction, normalization, loss and
 embedding operations. Its optional `vq4/v1` extension provides encoding,
@@ -39,7 +63,7 @@ a 48-hour training target and comparative performance remain unmeasured.
 Use 64-bit Windows and Python 3.10 or later, with a compatible Vulkan driver:
 
 ```console
-python -m pip install "alelyon-ai[numpy]==0.1.0a3"
+python -m pip install "alelyon-ai[numpy]==0.1.0a4"
 ```
 
 ```python

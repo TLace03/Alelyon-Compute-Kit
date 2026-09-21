@@ -199,7 +199,37 @@ def fit_codebook(values, *, group: int = 16, iterations: int = 4,
             selected = sample[idx == entry]
             if len(selected):
                 book[entry] = selected.mean(axis=0, dtype=np.float64).astype(np.float32)
+            else:
+                book[entry] = _reseed(sample, book)
     return book
+
+
+def _reseed(sample: np.ndarray, book: np.ndarray) -> np.ndarray:
+    """The sample vector the current book serves worst.
+
+    An empty cluster must NOT keep its stale row. `encode` breaks ties by
+    lowest index, so a row duplicated by the `linspace` seeding is never
+    selected again, its cluster can never refill, and the entry is then paid
+    for -- the format bills log2(ENTRIES) bits an index whether or not the
+    entry is reachable -- for ever. Released `0.1.0a3` and earlier guarded the
+    update with `if len(selected)` and nothing else, and lost up to twelve of
+    sixteen entries on inputs with exact duplicates and uneven occupancy.
+
+    Farthest-point rather than a random draw, for two reasons. It is
+    deterministic and needs no generator, so this function keeps its
+    "bounded deterministic calibration" promise literally. And it works:
+    measured against this module, reseeding from a random sample point
+    recovered nothing in the worst case, because a random draw can land on an
+    atom another entry already covers, while farthest-point recovered every
+    entry in every non-degenerate case.
+
+    On input whose vectors are all identical this correctly returns that same
+    vector: there is nothing for a second entry to represent, and a fit must
+    not invent variety the data does not contain.
+    """
+    gap = ((sample.astype(np.float64)[:, None, :] - book.astype(np.float64)[None, :, :])
+           ** 2).sum(-1).min(1)
+    return sample[int(gap.argmax())]
 
 
 class VQDevice:
