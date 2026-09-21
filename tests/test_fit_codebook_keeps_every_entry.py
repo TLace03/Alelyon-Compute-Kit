@@ -35,7 +35,8 @@ centre. A fix is not expected to invent variety the data does not contain.
 import numpy as np
 import pytest
 
-from alelyon_compute_kit._kit.python.vq import ENTRIES, encode, fit_codebook
+from alelyon_compute_kit._kit.python.vq import (ENTRIES, VQAdamW, VQArray, encode,
+                                              fit_codebook)
 
 DIMS, SEED = 16, 1
 
@@ -124,3 +125,73 @@ def test_the_suite_can_see_the_defect_it_is_guarding_against():
     assert len(np.unique(unfixed(sample).round(6), axis=0)) < ENTRIES, (
         "the unfixed loop must lose entries here, otherwise these cases do not "
         "exercise the defect this file guards against")
+
+
+# ── the other half of the same finding ───────────────────────────────────────
+#
+# `docs/audits/2026-09-14-ack-lowbit-commit-review.md` finding 1 (private repo)
+# named TWO consequences of the empty-cluster defect: a codebook that loses
+# capacity, which everything above covers, and weights that "move without a
+# gradient", which none of it does -- those cases fit once, and this one is
+# about what `VQAdamW.step` does on every step.
+#
+# The mechanism: `step` refits the codebook from scratch each time. If that
+# refit collapses relative to the book the weights are currently encoded with,
+# re-encoding lands them on different centres and the values move even though
+# the gradient was exactly zero. MEASURED on this construction, changed values
+# out of 4,112 with max|dw|: pre-fix refit 912 and 2.68; the shipped
+# farthest-point refit 0 and 0. So the movement was a CONSEQUENCE of the
+# collapse rather than a second defect, and fixing the collapse closed it.
+#
+# Kept as its own test because that is a different claim from the ones above
+# and could regress on its own -- `step` still re-seeds from `linspace` rather
+# than warm-starting from the state's codebook, which is the other half of the
+# fix that audit prescribed and which is NOT done.
+
+
+class _CpuBackend:
+    """The arithmetic only, so this runs with no device. Mirrors the reference
+    AdamW in `tests/test_harness.py`."""
+
+    def encode(self, values, codebook, *, group):
+        return encode(values, codebook, group=group)
+
+    def decode(self, value):
+        return value.decode()
+
+    def adamw(self, weight, momentum, variance, gradient, *, lr, beta1, beta2,
+              eps, weight_decay, step):
+        w, m, v, g = (value.decode() for value in (weight, momentum, variance, gradient))
+        m = beta1 * m + (1.0 - beta1) * g
+        v = beta2 * v + (1.0 - beta2) * np.square(g)
+        w = w - lr * ((m / (1.0 - beta1 ** step)) / (np.sqrt(v / (1.0 - beta2 ** step)) + eps)
+                      + weight_decay * w)
+        return w.astype(np.float32), m.astype(np.float32), v.astype(np.float32)
+
+
+def test_a_zero_gradient_moves_no_weight():
+    """A step that learns nothing must change nothing.
+
+    The weights are encoded with a good book, so any movement comes from the
+    in-step refit disagreeing with it -- which is exactly what an entry-losing
+    fit does.
+    """
+    sample = sample_of([200] + [4] * (ENTRIES - 2) + [1])
+    book = fit(sample)
+    assert len(np.unique(book.round(6), axis=0)) == ENTRIES, "precondition: a sound encoding book"
+
+    weight = encode(sample, book, group=DIMS)
+    zero = VQArray(weight.shape, weight.group, np.zeros_like(weight.codes),
+                   np.zeros((ENTRIES, DIMS), dtype=np.float32))
+    optimizer = VQAdamW(_CpuBackend(), weight, lr=1e-3, weight_decay=0.0)
+
+    before = optimizer.weight.decode().copy()
+    optimizer.step(zero)
+    after = optimizer.weight.decode()
+
+    moved = int((before != after).sum())
+    assert moved == 0, (
+        f"{moved} of {before.size} weight values moved on a zero gradient; "
+        f"max|dw| {float(np.abs(after - before).max()):.6g}. The codebook came "
+        f"back with {len(np.unique(optimizer.weight.codebook, axis=0))} distinct "
+        f"rows of {ENTRIES}")
