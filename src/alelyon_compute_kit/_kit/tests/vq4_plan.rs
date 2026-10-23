@@ -1,5 +1,5 @@
 //! Host-only vq4 admission; no device/model allocation or timing claims.
-use alelyon_compute_kit::vq_ops::{
+use alelyon_compute_kit::vq4_ops::{
     VqOp, VqPlan, VqPlanError as E, MAX_DIM, MAX_VALUES, PUSH_BYTES,
 };
 

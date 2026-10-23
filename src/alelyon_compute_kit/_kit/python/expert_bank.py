@@ -16,6 +16,7 @@ import math
 import os
 import re
 import stat
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,13 @@ from .vq import ENTRIES, GROUPS, VQArray, storage_layout
 
 MAX_SHARD_BYTES = 128 * 1024 * 1024
 MAX_METADATA_BYTES = 128 * 1024
+#: Windows refuses to replace a file that another handle holds open -- a
+#: concurrent reader of the expert pointer -- with WinError 5 (observed
+#: 2026-09-14 and 2026-09-21). The replacement is retried this many times,
+#: `_REPLACE_DELAY_S` apart, which is about one second nominal. After that
+#: the commit is refused and cleaned up.
+_REPLACE_ATTEMPTS = 50
+_REPLACE_DELAY_S = 0.02
 _SCHEMA = "ack-expert-bank/v1"
 _POINTER = re.compile(r"expert-([0-9]+)-([0-9]+)\.json\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
@@ -249,7 +257,11 @@ class ExpertBank:
         base = self._id(pointer["layer"], pointer["expert"])
         result = []
         for index, (shard, shape) in enumerate(zip(pointer["shards"], self.config.matrix_shapes)):
-            data = self._read(self._shard_path(base, pointer["generation"], index), MAX_SHARD_BYTES)
+            path = self._shard_path(base, pointer["generation"], index)
+            try:
+                data = self._read(path, MAX_SHARD_BYTES)
+            except FileNotFoundError as exc:
+                raise ExpertBankError(f"missing shard {path.name} of a committed generation") from exc
             if len(data) != shard["bytes"] or _digest(data) != shard["sha256"]:
                 raise ExpertBankError("shard checksum mismatch")
             try:
@@ -296,24 +308,51 @@ class ExpertBank:
                    "update_commits": int(updated_count > 0) + (
                        0 if previous is None else previous["update_commits"])}
         _integer(pointer["parameter_update_applications"], "parameter_update_applications")
-        for index, array in enumerate(tensors):
-            data = array.to_bytes()
-            # A caller may have mutated exposed NumPy storage despite its flag.
-            VQArray.from_bytes(data, max_bytes=MAX_SHARD_BYTES)
-            self._write(self._shard_path(base, generation, index), data)
-            pointer["shards"].append({"bytes": len(data), "sha256": _digest(data)})
         pending = self.root / f"pending-{generation}.json"
-        self._write(pending, _json(pointer))
-        self._check()
-        if self._pointer(layer, expert) != previous:
-            raise ExpertBankError("another writer changed this expert")
-        os.replace(pending, self.root / f"{base}.json")
+        written: list[Path] = []
+        try:
+            for index, array in enumerate(tensors):
+                data = array.to_bytes()
+                # A caller may have mutated exposed NumPy storage despite its flag.
+                VQArray.from_bytes(data, max_bytes=MAX_SHARD_BYTES)
+                path = self._shard_path(base, generation, index)
+                self._write(path, data)
+                written.append(path)
+                pointer["shards"].append({"bytes": len(data), "sha256": _digest(data)})
+            self._write(pending, _json(pointer))
+            written.append(pending)
+            self._check()
+            if self._pointer(layer, expert) != previous:
+                raise ExpertBankError("another writer changed this expert")
+            self._replace_pointer(pending, self.root / f"{base}.json")
+        except BaseException:
+            # A refused commit removes what it wrote: its uncommitted shards
+            # and pending pointer. Before 2026-09-21 they were left behind.
+            for path in written:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+            raise
         return {"layer": layer, "expert": expert, "revision": pointer["revision"],
                 "optimizer_step": optimizer_step,
                 "materialized_parameters": self.config.parameters_per_expert,
                 "updated_count": updated_count,
                 "parameter_update_applications": pointer["parameter_update_applications"],
                 "generation_bytes": sum(shard["bytes"] for shard in pointer["shards"])}
+
+    @staticmethod
+    def _replace_pointer(pending: Path, target: Path) -> None:
+        """Publish `pending` as `target`, retrying the Windows sharing refusal."""
+        for attempt in range(_REPLACE_ATTEMPTS):
+            try:
+                os.replace(pending, target)
+                return
+            except PermissionError as exc:
+                if attempt + 1 == _REPLACE_ATTEMPTS:
+                    raise ExpertBankError(
+                        "pointer replacement refused; a reader may hold the pointer open") from exc
+                time.sleep(_REPLACE_DELAY_S)
 
     def initialize_expert(self, layer: int, expert: int, *, seed: int = 0,
                           zero_optimizer_state: bool = False) -> dict:
@@ -425,11 +464,12 @@ class GainScheduler:
         _integer(expert, "expert", 0, self.total_experts - 1)
         if heldout is not True:
             raise ExpertBankError("scheduler requires held-out loss observations")
+        # Only the reduction is scored, so a held-out loss may be negative (a
+        # log-likelihood, say); it must be finite. Elapsed time must be positive.
         for name, value in (("loss_before", loss_before), ("loss_after", loss_after), ("elapsed_s", elapsed_s)):
-            if isinstance(value, bool) or not isinstance(value, (float, int)) \
-                    or not math.isfinite(value) or value < 0:
-                raise ExpertBankError(f"{name} must be finite and nonnegative")
-        if elapsed_s == 0:
+            if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value):
+                raise ExpertBankError(f"{name} must be finite")
+        if elapsed_s <= 0:
             raise ExpertBankError("elapsed_s must be positive")
         _integer(samples, "samples", 1)
         _integer(updated_count, "updated_count")

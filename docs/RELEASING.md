@@ -1,9 +1,12 @@
 # Releasing alelyon-ai
 
-The `0.1.0a4` candidate is a patch: it fixes a `fit_codebook` defect that could
-leave codebook entries duplicated and unreachable on input with exact duplicate
-vectors at uneven frequencies, and is otherwise identical to `0.1.0a3`. That
-release, which added the experimental Windows AMD64 Vulkan library and
+The `0.1.0a5` source brings the kit payload up to date with the private source
+tree (new operators: fused attention, rotary position, SwiGLU, weighted-bag
+lookup, NF4, AMP casts, radix sort, index and integer element-wise operations,
+and the device-choice logic). It is not yet published; publication is a
+separate owner decision. `0.1.0a4` was a patch that fixed a `fit_codebook`
+defect that could leave codebook entries duplicated and unreachable on input
+with exact duplicate vectors at uneven frequencies. `0.1.0a3`, which added the experimental Windows AMD64 Vulkan library and
 vector-coded expert primitives, is left on PyPI rather than yanked, with the
 defect described in the repository README under "Known issue" — owner decision,
 2026-09-21, so existing pins keep resolving. Earlier `0.1.0a0` and `0.1.0a1`
@@ -36,7 +39,7 @@ metadata. Follow [native packaging](NATIVE_PACKAGING.md) for local artifact
 checks. Then run:
 
 ```console
-gh workflow run release.yml --repo TLace03/Alelyon-Compute-Kit --ref main -f expected_version=0.1.0a4 -f publish=false
+gh workflow run release.yml --repo TLace03/Alelyon-Compute-Kit --ref main -f expected_version=0.1.0a5 -f publish=false
 ```
 
 The four source-test jobs cover Windows and Ubuntu with Python 3.10 and 3.14.
@@ -57,7 +60,7 @@ Source or artifact changes require fresh acceptance.
 After the dry run passes and the target version is confirmed absent from PyPI:
 
 ```console
-gh workflow run release.yml --repo TLace03/Alelyon-Compute-Kit --ref main -f expected_version=0.1.0a4 -f publish=true
+gh workflow run release.yml --repo TLace03/Alelyon-Compute-Kit --ref main -f expected_version=0.1.0a5 -f publish=true
 ```
 
 Publication requires both the explicit Boolean input and `refs/heads/main`.

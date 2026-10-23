@@ -34,10 +34,20 @@ pub const ABI: &str = "pointwise-f32/v1";
 /// The operation schema the C ABI reports for the family
 /// (`ffi::ACK_OP_SCHEMA_POINTWISE`): 1 was operations 0-5, 2 adds 6-23,
 /// 3 (2026-09-10) adds flags bits 2 and 3, the bf16 storage switches, in
-/// the same block through the same entry.
-pub const SCHEMA: u32 = 3;
+/// the same block through the same entry, and 4 (2026-09-22) adds
+/// operations 24-36 (exp, round, the comparisons, the logical operations and
+/// where) and the bool storage bits 6-9, 5 (2026-09-28) adds operations
+/// 37-39, the SiLU-gated linear unit's arithmetic (silu_backward, `x * silu(y)`
+/// and the gate's gradient), 6 (2026-09-28) adds operations 40-42, tanh,
+/// log and torch's xlogy, each with the block and its flags unchanged, 7
+/// (2026-09-29) adds the binary16 storage bits 10-13 ([`FLAG_F16`]) with the
+/// operations and the block unchanged, and 8 (2026-10-16) adds operations
+/// 43-46, the selections `minimum`, `maximum`, `relu` and
+/// `threshold_backward`, decided on the bits, with the block and its flags
+/// unchanged.
+pub const SCHEMA: u32 = 8;
 /// The last operation word this schema decodes; `try_from` refuses beyond it.
-pub const LAST_OP: u32 = 23;
+pub const LAST_OP: u32 = 46;
 /// Dimensions the push block carries; fewer are padded with extent 1, stride 0.
 pub const MAX_NDIM: usize = 4;
 /// `x`, `y`, `z`, `out`, in binding order.
@@ -74,24 +84,178 @@ pub const FLAG_Y_SCALAR: u32 = 1;
 /// The arithmetic is f32 in every combination: a value is widened at the load
 /// and narrowed at the store, and nothing else changes.
 pub const FLAG_BF16: [u32; OPERANDS] = [4, 8, 16, 32];
-const STORAGE_FLAGS: u32 = FLAG_BF16[0] | FLAG_BF16[1] | FLAG_BF16[2] | FLAG_BF16[3];
+/// Flags bits 6-9 (schema 4, 2026-09-22): buffer `x`, `y`, `z` and `out` hold
+/// torch's bool, one byte per element: read as 1.0 when nonzero, written as 1
+/// when the f32 result is nonzero (a NaN included). A slot carries at most
+/// one storage bit; both is refused ([`PointwisePlanError::StorageConflict`]).
+pub const FLAG_U8: [u32; OPERANDS] = [64, 128, 256, 512];
+/// Flags bits 10-13 (schema 7, 2026-09-29): buffer `x`, `y`, `z` and `out`
+/// hold IEEE binary16. A value is read through the convert family's exact
+/// integer widening and written through its integer narrowing: round to
+/// nearest even, subnormals kept, an overflow to infinity, a NaN written
+/// sign | 0x7E00 as c10 writes it. The arithmetic is f32, as under every
+/// storage, so an operation over binary16 slots is the adapter's composed
+/// path (widen, the same f32 operation, narrow once) bit for bit by
+/// construction, in one dispatch instead of three or four. Only
+/// [`F16_MODULES`] and [`F16_BOOL_MODULES`] are built.
+pub const FLAG_F16: [u32; OPERANDS] = [1024, 2048, 4096, 8192];
+const STORAGE_FLAGS: u32 = FLAG_BF16[0]
+    | FLAG_BF16[1]
+    | FLAG_BF16[2]
+    | FLAG_BF16[3]
+    | FLAG_U8[0]
+    | FLAG_U8[1]
+    | FLAG_U8[2]
+    | FLAG_U8[3]
+    | FLAG_F16[0]
+    | FLAG_F16[1]
+    | FLAG_F16[2]
+    | FLAG_F16[3];
 
 /// Bytes one element of slot `index` occupies under a flags word.
 pub fn slot_element_bytes(flags: u32, index: usize) -> u64 {
-    if flags & FLAG_BF16[index] != 0 {
+    if flags & FLAG_U8[index] != 0 {
+        1
+    } else if flags & (FLAG_BF16[index] | FLAG_F16[index]) != 0 {
         2
     } else {
         4
     }
 }
 
-/// The module a flags word selects: the four bits, x in bit 0 through out in
-/// bit 3, as an index into the sixteen the context can build. 0 is the f32
-/// module every device builds at open.
-pub fn storage_module(flags: u32) -> usize {
-    (0..OPERANDS)
-        .map(|i| usize::from(flags & FLAG_BF16[i] != 0) << i)
-        .sum()
+/// Slot `index`'s storage under a flags word: 0 f32, 1 bf16, 2 bool, 3
+/// binary16; `None` when more than one of its storage bits is set.
+pub fn slot_dtype(flags: u32, index: usize) -> Option<u8> {
+    match (
+        flags & FLAG_BF16[index] != 0,
+        flags & FLAG_U8[index] != 0,
+        flags & FLAG_F16[index] != 0,
+    ) {
+        (false, false, false) => Some(0),
+        (true, false, false) => Some(1),
+        (false, true, false) => Some(2),
+        (false, false, true) => Some(3),
+        _ => None,
+    }
+}
+
+/// The bool-storage modules the context can build, as the (x, y, z, out)
+/// storage of each (0 f32, 1 bf16, 2 bool), numbered from 16 in this order.
+/// They are the combinations torch's bool operations arrive in through the
+/// adapter, whose rule is that a slot an operation does not read is bound to
+/// `x` and carries `x`'s storage (so its capacity is measured in `x`'s
+/// elements): a comparison with a scalar or a cast to bool (f32 or bf16 in,
+/// bool out), a comparison of two tensors of either float storage, a logical
+/// operation or a `not` on bools, `exp` of a bool, and `where` with a bool
+/// condition over f32 or bf16 values.
+pub const BOOL_MODULES: [[u8; OPERANDS]; 15] = [
+    [0, 0, 0, 2],
+    [1, 1, 1, 2],
+    [0, 1, 0, 2],
+    [1, 0, 1, 2],
+    [2, 2, 2, 2],
+    [2, 2, 2, 0],
+    [2, 2, 2, 1],
+    [2, 0, 0, 0],
+    [2, 0, 0, 1],
+    [2, 0, 1, 0],
+    [2, 0, 1, 1],
+    [2, 1, 0, 0],
+    [2, 1, 0, 1],
+    [2, 1, 1, 0],
+    [2, 1, 1, 1],
+];
+
+/// The binary16 modules with no bool slot (schema 7, 2026-09-29), as the
+/// (x, y, z, out) storage of each (0 f32, 3 binary16), numbered from
+/// [`F16_BASE`] in this order. They are the combinations the adapter's native
+/// fp16 path hands over, under its rule that an unread slot is bound to `x`
+/// (the output, for a fill) and carries that tensor's storage:
+/// * every slot binary16: an operation over binary16 values into binary16, a
+///   fill, and a unary operation;
+/// * `y` binary16 beside an f32 `x`: torch computes the pair in f32 into an
+///   f32 output;
+/// * `x` binary16 beside an f32 `y`, `z` bound to `x`: the same, mirrored.
+pub const F16_MODULES: [[u8; OPERANDS]; 3] = [[3, 3, 3, 3], [0, 3, 0, 0], [3, 0, 3, 0]];
+/// The binary16 modules with a bool slot, numbered after [`F16_MODULES`]: a
+/// comparison into bool over binary16 values, alone or beside an f32 one, and
+/// `where` with a bool condition over binary16 values, or over one binary16
+/// value beside an f32 one.
+pub const F16_BOOL_MODULES: [[u8; OPERANDS]; 6] = [
+    [3, 3, 3, 2],
+    [0, 3, 0, 2],
+    [3, 0, 3, 2],
+    [2, 3, 3, 3],
+    [2, 3, 0, 0],
+    [2, 0, 3, 0],
+];
+/// The number of the first binary16 module, after [`BOOL_MODULES`].
+pub const F16_BASE: usize = 16 + BOOL_MODULES.len();
+/// Modules a context can build: the f32 one, the fifteen bf16 ones,
+/// [`BOOL_MODULES`], [`F16_MODULES`] and [`F16_BOOL_MODULES`].
+pub const STORAGE_MODULES: usize = F16_BASE + F16_MODULES.len() + F16_BOOL_MODULES.len();
+/// Four-element vector modules (kernels/pointwise_f32.comp, VECTOR_MODULE):
+/// one for each storage module without a bool slot, numbered by
+/// [`vector_module`].
+pub const VECTOR_MODULES: usize = 16 + F16_MODULES.len();
+
+/// Whether storage module `module` has a bool slot, which needs the device's
+/// 8-bit storage.
+pub fn module_has_bool(module: usize) -> bool {
+    (16..F16_BASE).contains(&module) || module >= F16_BASE + F16_MODULES.len()
+}
+
+/// The vector module of storage module `module`, or `None` for a module with a
+/// bool slot (bool storage has no vector module). A module below 16 is its
+/// own number; [`F16_MODULES`]' follow from 16 in their order.
+pub fn vector_module(module: usize) -> Option<usize> {
+    if module < 16 {
+        Some(module)
+    } else if (F16_BASE..F16_BASE + F16_MODULES.len()).contains(&module) {
+        Some(16 + module - F16_BASE)
+    } else {
+        None
+    }
+}
+
+/// The module a flags word selects, or `None` when a slot carries more than
+/// one storage bit or no module is built for the combination. Without a bool
+/// or binary16 slot this is the four bf16 bits, x in bit 0 through out in
+/// bit 3, as an index into the sixteen f32/bf16 modules; 0 is the f32 module
+/// every device builds at open. With a binary16 slot it is [`F16_BASE`] plus
+/// the combination's position in [`F16_MODULES`], or in [`F16_BOOL_MODULES`]
+/// after those. Otherwise, with a bool slot, it is 16 plus the combination's
+/// position in [`BOOL_MODULES`].
+pub fn storage_module(flags: u32) -> Option<usize> {
+    let mut codes = [0u8; OPERANDS];
+    for (index, code) in codes.iter_mut().enumerate() {
+        *code = slot_dtype(flags, index)?;
+    }
+    if codes.iter().all(|&code| code < 2) {
+        return Some(
+            codes
+                .iter()
+                .enumerate()
+                .map(|(i, &code)| usize::from(code) << i)
+                .sum(),
+        );
+    }
+    if codes.contains(&3) {
+        return F16_MODULES
+            .iter()
+            .position(|module| *module == codes)
+            .map(|position| F16_BASE + position)
+            .or_else(|| {
+                F16_BOOL_MODULES
+                    .iter()
+                    .position(|module| *module == codes)
+                    .map(|position| F16_BASE + F16_MODULES.len() + position)
+            });
+    }
+    BOOL_MODULES
+        .iter()
+        .position(|module| *module == codes)
+        .map(|position| 16 + position)
 }
 /// Flags word bit 1: reserved for a scalar `z`; this version never sets it
 /// and refuses a block that does.
@@ -166,6 +330,73 @@ pub enum PointwiseOp {
     /// else 0; the diagonal is the `b` word as an `i32` ([`Scalars::triu`])
     /// and the shape needs at least two dimensions
     Triu = 23,
+    /// `exp(x)` (schema 4): `k*ln2` taken out exactly and Cephes' polynomial
+    /// on the rest, in the shader; `+inf` above 88.72283172607422, 0 at or
+    /// below -103.97208404541016
+    Exp = 24,
+    /// `round(x)`, halves to even as `torch.round`
+    Round = 25,
+    /// `x > y`, 1 or 0; `y` a buffer or the scalar `b`. The six comparisons
+    /// are IEEE: false against a NaN, except `!=`
+    Gt = 26,
+    /// `x < y`
+    Lt = 27,
+    /// `x >= y`
+    Ge = 28,
+    /// `x <= y`
+    Le = 29,
+    /// `x == y`
+    Eq = 30,
+    /// `x != y`
+    Ne = 31,
+    /// `x and y`, each true when nonzero
+    LogicalAnd = 32,
+    /// `x or y`
+    LogicalOr = 33,
+    /// `x xor y`
+    LogicalXor = 34,
+    /// `not x`
+    LogicalNot = 35,
+    /// `y` where `x` is nonzero, else `z`
+    Where = 36,
+    /// torch's `silu_backward` (schema 5): `x` the gradient, `y` the input;
+    /// `s = 1 / (1 + exp(-y))`, then `x * s * (1 + y * (1 - s))` in the CPU
+    /// kernel's order, ONE dispatch where torch's composite runs six
+    SiluBackward = 37,
+    /// `x * silu(y)`: the gated linear unit's product `u * silu(g)`, the silu
+    /// never rounded to the storage type
+    SiluMul = 38,
+    /// `x * y * dsilu(z)`: `x` the gradient, `y` the up half, `z` the gate;
+    /// `s = 1 / (1 + exp(-z))`, then `(x * y) * (s * (1 + z * (1 - s)))`
+    SwigluGradGate = 39,
+    /// `tanh(x)` (schema 6), in correctly rounded adds and multiplies only:
+    /// `x` itself below 2^-12, Cephes' odd polynomial below 0.625,
+    /// `1 - 2/(exp(2|x|) + 1)` with a Newton reciprocal (no division) below
+    /// 9.010913848876953, and +-1 from there. MEASURED 2026-09-28 by a host
+    /// emulation of those steps over every float32 of the polynomial and exp
+    /// regions: within 1.84 ulp of the exact value, and 2 ulp of torch's CPU
+    Tanh = 40,
+    /// `log(x)` (schema 6): the range reduction on the bits (subnormals
+    /// included), Cephes' polynomial on the rest; -inf at +-0, NaN below 0.
+    /// MEASURED as tanh over every positive finite float32: within 0.83 ulp,
+    /// and 1 ulp of torch's CPU
+    Log = 41,
+    /// torch's `xlogy(x, y)` (schema 6): NaN where `y` is NaN, 0 where `x` is
+    /// +-0, else `x * log(y)`; `y` a buffer or the scalar `b`
+    Xlogy = 42,
+    /// `minimum(x, y)` (schema 8), decided on the bits: `0xffffffff` where
+    /// either is NaN, `y` for zeros of opposite sign, else the smaller
+    /// operand's own word (torch's CPU vectorised body; its scalar loop gives
+    /// `0x7fc00000` and `x` in those two cases)
+    Minimum = 43,
+    /// `maximum(x, y)` (schema 8): as [`Self::Minimum`], the larger operand
+    Maximum = 44,
+    /// `relu(x)` (schema 8): `x` where `x` is NaN or not below zero (`-0`
+    /// kept), else `+0`
+    Relu = 45,
+    /// torch's `threshold_backward` (schema 8): `x` the gradient, `y` the
+    /// input, the scalar `a` the threshold; `+0` where `y <= a`, else `x`
+    ThresholdBackward = 46,
 }
 
 impl PointwiseOp {
@@ -185,11 +416,31 @@ impl PointwiseOp {
                 | Self::Addcmul
                 | Self::Addcdiv
                 | Self::Lerp
+                | Self::Gt
+                | Self::Lt
+                | Self::Ge
+                | Self::Le
+                | Self::Eq
+                | Self::Ne
+                | Self::LogicalAnd
+                | Self::LogicalOr
+                | Self::LogicalXor
+                | Self::Where
+                | Self::SiluBackward
+                | Self::SiluMul
+                | Self::SwigluGradGate
+                | Self::Xlogy
+                | Self::Minimum
+                | Self::Maximum
+                | Self::ThresholdBackward
         )
     }
 
     pub fn reads_z(self) -> bool {
-        matches!(self, Self::Addcmul | Self::Addcdiv)
+        matches!(
+            self,
+            Self::Addcmul | Self::Addcdiv | Self::Where | Self::SwigluGradGate
+        )
     }
 }
 
@@ -222,6 +473,29 @@ impl TryFrom<u32> for PointwiseOp {
             21 => Ok(Self::Sin),
             22 => Ok(Self::Iota),
             23 => Ok(Self::Triu),
+            24 => Ok(Self::Exp),
+            25 => Ok(Self::Round),
+            26 => Ok(Self::Gt),
+            27 => Ok(Self::Lt),
+            28 => Ok(Self::Ge),
+            29 => Ok(Self::Le),
+            30 => Ok(Self::Eq),
+            31 => Ok(Self::Ne),
+            32 => Ok(Self::LogicalAnd),
+            33 => Ok(Self::LogicalOr),
+            34 => Ok(Self::LogicalXor),
+            35 => Ok(Self::LogicalNot),
+            36 => Ok(Self::Where),
+            37 => Ok(Self::SiluBackward),
+            38 => Ok(Self::SiluMul),
+            39 => Ok(Self::SwigluGradGate),
+            40 => Ok(Self::Tanh),
+            41 => Ok(Self::Log),
+            42 => Ok(Self::Xlogy),
+            43 => Ok(Self::Minimum),
+            44 => Ok(Self::Maximum),
+            45 => Ok(Self::Relu),
+            46 => Ok(Self::ThresholdBackward),
             _ => Err(PointwisePlanError::OperationOutOfRange),
         }
     }
@@ -257,11 +531,17 @@ pub enum PointwisePlanError {
     OutputSelfOverlap,
     FlagsOutOfRange,
     ElementCountMismatch,
+    /// A slot carries both the bf16 and the bool storage bit (schema 4).
+    StorageConflict,
+    /// A storage combination no module is built for (schema 4).
+    StorageUnbuilt,
 }
 
 impl fmt::Display for PointwisePlanError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::StorageConflict => "pointwise-storage-conflict",
+            Self::StorageUnbuilt => "pointwise-storage-unbuilt",
             Self::OperationOutOfRange => "pointwise-operation-out-of-range",
             Self::NdimOutOfRange => "pointwise-ndim-out-of-range",
             Self::TriuNeedsTwoDimensions => "pointwise-triu-needs-two-dimensions",
@@ -521,6 +801,8 @@ pub struct PointwisePlan {
     /// FLAG_IN_BF16 | FLAG_OUT_BF16 as the block carried them, kept so a
     /// decoded plan re-encodes to the same bytes.
     storage_flags: u32,
+    /// The module `storage_flags` selects, checked when the plan was made.
+    module: usize,
     dispatch_groups: [u32; 3],
 }
 
@@ -554,6 +836,12 @@ impl PointwisePlan {
         if storage_flags & !STORAGE_FLAGS != 0 {
             return Err(PointwisePlanError::FlagsOutOfRange);
         }
+        // schema 4: a slot holds one storage, and only combinations a module
+        // is built for reach the device
+        if (0..OPERANDS).any(|index| slot_dtype(storage_flags, index).is_none()) {
+            return Err(PointwisePlanError::StorageConflict);
+        }
+        let module = storage_module(storage_flags).ok_or(PointwisePlanError::StorageUnbuilt)?;
         if shape.len() > MAX_NDIM {
             return Err(PointwisePlanError::NdimOutOfRange);
         }
@@ -575,10 +863,16 @@ impl PointwisePlan {
         if op != PointwiseOp::Fill && !output.addresses_are_distinct(shape) {
             return Err(PointwisePlanError::OutputSelfOverlap);
         }
+        // In place means the same elements AND the same element type: views
+        // are in elements of each slot's own storage, so an input of another
+        // width on the output's buffer (a bf16 or binary16 view of f32 memory)
+        // could match the output's view and still address other bytes (schema
+        // 7 tightened this for every storage, 2026-09-29).
+        let out_code = slot_dtype(storage_flags, Operand::Out.index());
         for operand in Operand::INPUTS {
             let index = operand.index();
             if storage[index].identity() == storage[Operand::Out.index()].identity()
-                && canonical[index] != output
+                && (canonical[index] != output || slot_dtype(storage_flags, index) != out_code)
             {
                 return Err(PointwisePlanError::OutputOverlapsInput);
             }
@@ -602,6 +896,7 @@ impl PointwisePlan {
             storage,
             scalars,
             storage_flags,
+            module,
             dispatch_groups: [n.div_ceil(ELEMENTS_PER_GROUP), 1, 1],
         })
     }
@@ -671,7 +966,7 @@ impl PointwisePlan {
 
     /// The module index this plan's storage selects; see `storage_module`.
     pub fn storage_module(&self) -> usize {
-        storage_module(self.storage_flags)
+        self.module
     }
     /// The shape padded to `MAX_NDIM` with extent 1.
     pub fn shape(&self) -> [u32; MAX_NDIM] {
@@ -690,6 +985,141 @@ impl PointwisePlan {
     }
     pub fn dispatch_groups(&self) -> [u32; 3] {
         self.dispatch_groups
+    }
+
+    /// Whether this call runs on the four-element VECTOR module for its storage
+    /// (2026-09-27; kernels/pointwise_f32.comp, VECTOR_MODULE). It is decided on
+    /// the COALESCED geometry the shader receives:
+    /// * no bool slot (there is no vector module for bool storage);
+    /// * the last dimension's extent a multiple of 4;
+    /// * every read operand either broadcast along the last dimension (stride 0),
+    ///   or unit-stride there with its offset and every other stride a multiple
+    ///   of 4, so each group of four starts on a whole vector;
+    /// * the output unit-stride there, under the same alignment;
+    /// * and it PAYS: a 16-bit slot, or a read operand broadcast along the last
+    ///   dimension. Measured in one A3r-X2 pass on an RX 9070 XT, those calls
+    ///   were faster four at a time, and four-byte unit-stride calls were not.
+    ///
+    /// The shader re-derives the geometry and writes nothing if it disagrees.
+    pub fn vector_eligible(&self) -> bool {
+        if vector_module(self.module).is_none() {
+            return false;
+        }
+        let block = self.dispatch_push_constants();
+        let word = |i: usize| {
+            u32::from_le_bytes([
+                block[4 * i],
+                block[4 * i + 1],
+                block[4 * i + 2],
+                block[4 * i + 3],
+            ])
+        };
+        let ndim = word(1) as usize;
+        if ndim == 0 || ndim > MAX_NDIM {
+            return false;
+        }
+        let last = ndim - 1;
+        if word(4 + last) % 4 != 0 {
+            return false;
+        }
+        let flags = self.flags();
+        let y_scalar = flags & FLAG_Y_SCALAR != 0;
+        let touched = [
+            self.op.reads_x(),
+            self.op.reads_y() && !y_scalar,
+            self.op.reads_z(),
+            true,
+        ];
+        let mut pays = false;
+        for (k, &touches) in touched.iter().enumerate() {
+            if !touches {
+                continue;
+            }
+            let base = 8 + k * (MAX_NDIM + 1);
+            let stride_last = word(base + last);
+            let offset = word(base + MAX_NDIM);
+            let is_out = k == OPERANDS - 1;
+            if stride_last == 0 && !is_out {
+                pays = true;
+                continue;
+            }
+            if stride_last != 1 || offset % 4 != 0 || (0..last).any(|d| word(base + d) % 4 != 0) {
+                return false;
+            }
+            if flags & (FLAG_BF16[k] | FLAG_F16[k]) != 0 {
+                pays = true;
+            }
+        }
+        pays
+    }
+
+    /// The block the SHADER receives (2026-09-27): this plan's geometry with
+    /// its dimensions COALESCED -- extent-1 dimensions dropped, and adjacent
+    /// dimensions merged wherever every operand the operation touches (the
+    /// ones it reads, and the output) is contiguous across them -- so a dense
+    /// or broadcast call reaches the kernel with one or two dimensions instead
+    /// of four, and an element's addresses cost one unravel step instead of
+    /// four divisions and four remainders. The element each lane visits, the
+    /// linear index (iota's) and every address a read or written operand
+    /// reaches are unchanged (tests below enumerate them); an unread
+    /// operand's strides are whatever the merge leaves and are never
+    /// dereferenced by the shader. `Triu` keeps its geometry: it reads the
+    /// row and column of the last two dimensions. `push_constants` stays the
+    /// caller's block, so a decoded plan still re-encodes to the same bytes.
+    pub fn dispatch_push_constants(&self) -> [u8; PUSH_BYTES] {
+        let bytes = self.push_constants();
+        if self.op == PointwiseOp::Triu || self.ndim <= 1 {
+            return bytes;
+        }
+        let y_scalar = self.scalars.flags() & FLAG_Y_SCALAR != 0;
+        let touched = [
+            self.op.reads_x(),
+            self.op.reads_y() && !y_scalar,
+            self.op.reads_z(),
+            true,
+        ];
+        // (extent, stride of each operand), outermost first
+        let mut dims: Vec<(u64, [u64; OPERANDS])> = Vec::with_capacity(MAX_NDIM);
+        for d in 0..self.ndim as usize {
+            let extent = u64::from(self.shape[d]);
+            if extent == 1 {
+                continue;
+            }
+            let mut strides = [0u64; OPERANDS];
+            for (k, stride) in strides.iter_mut().enumerate() {
+                *stride = self.views[k].strides[d];
+            }
+            if let Some(outer) = dims.last_mut() {
+                // the outer dimension steps exactly over the inner one for
+                // every touched operand: one dimension of their product
+                if (0..OPERANDS).all(|k| !touched[k] || outer.1[k] == strides[k] * extent) {
+                    outer.0 *= extent;
+                    outer.1 = strides;
+                    continue;
+                }
+            }
+            dims.push((extent, strides));
+        }
+        let mut words = [0u32; PUSH_WORDS];
+        for (word, chunk) in words.iter_mut().zip(bytes.chunks_exact(4)) {
+            *word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        words[1] = dims.len() as u32;
+        for d in 0..MAX_NDIM {
+            // extents below n (itself a u32) and strides below ADDRESS_LIMIT:
+            // the merge multiplies extents whose product is n and keeps an
+            // inner operand's own stride
+            words[4 + d] = dims.get(d).map_or(1, |dim| dim.0 as u32);
+            for operand in Operand::ALL {
+                let base = 8 + operand.index() * (MAX_NDIM + 1);
+                words[base + d] = dims.get(d).map_or(0, |dim| dim.1[operand.index()] as u32);
+            }
+        }
+        let mut out = [0u8; PUSH_BYTES];
+        for (index, word) in words.iter().enumerate() {
+            out[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        out
     }
 
     /// The shader's push block: `op, ndim, n, flags, shape[4]`, then
@@ -782,13 +1212,37 @@ mod tests {
             (21, Sin),
             (22, Iota),
             (23, Triu),
+            (24, Exp),
+            (25, Round),
+            (26, Gt),
+            (27, Lt),
+            (28, Ge),
+            (29, Le),
+            (30, Eq),
+            (31, Ne),
+            (32, LogicalAnd),
+            (33, LogicalOr),
+            (34, LogicalXor),
+            (35, LogicalNot),
+            (36, Where),
+            (37, SiluBackward),
+            (38, SiluMul),
+            (39, SwigluGradGate),
+            (40, Tanh),
+            (41, Log),
+            (42, Xlogy),
+            (43, Minimum),
+            (44, Maximum),
+            (45, Relu),
+            (46, ThresholdBackward),
         ];
         for (word, op) in table {
             assert_eq!(PointwiseOp::try_from(word), Ok(op));
             assert_eq!(op as u32, word);
         }
         assert_eq!(table.len() as u32, LAST_OP + 1);
-        assert_eq!((SCHEMA, LAST_OP), (3, 23));
+        // schema 7 added storage bits (binary16), not operations; 8 added 43-46
+        assert_eq!((SCHEMA, LAST_OP), (8, 46));
         assert_eq!(
             PointwiseOp::try_from(LAST_OP + 1),
             Err(PointwisePlanError::OperationOutOfRange)
@@ -815,13 +1269,33 @@ mod tests {
             Cos,
             Sin,
             Triu,
+            Exp,
+            Round,
+            LogicalNot,
         ] {
             assert!(op.reads_x() && !op.reads_y() && !op.reads_z(), "{op:?}");
         }
-        for op in [AddScaled, SubScaled, Mul, Div, Pow, SigmoidBackward, Lerp] {
+        for op in [
+            AddScaled,
+            SubScaled,
+            Mul,
+            Div,
+            Pow,
+            SigmoidBackward,
+            Lerp,
+            Gt,
+            Lt,
+            Ge,
+            Le,
+            Eq,
+            Ne,
+            LogicalAnd,
+            LogicalOr,
+            LogicalXor,
+        ] {
             assert!(op.reads_x() && op.reads_y() && !op.reads_z(), "{op:?}");
         }
-        for op in [Addcmul, Addcdiv] {
+        for op in [Addcmul, Addcdiv, Where] {
             assert!(op.reads_x() && op.reads_y() && op.reads_z(), "{op:?}");
         }
         for (error, name) in [
@@ -857,6 +1331,14 @@ mod tests {
             (
                 PointwisePlanError::ElementCountMismatch,
                 "pointwise-element-count-mismatch",
+            ),
+            (
+                PointwisePlanError::StorageConflict,
+                "pointwise-storage-conflict",
+            ),
+            (
+                PointwisePlanError::StorageUnbuilt,
+                "pointwise-storage-unbuilt",
             ),
         ] {
             assert_eq!(error.to_string(), name);
@@ -1364,10 +1846,22 @@ mod tests {
             Err(PointwisePlanError::FlagsOutOfRange)
         );
         // the lowest bit no version implements; 4 through 32 were that bit
-        // until schema 3 took them for the four storage switches
+        // until schema 3 took them for the four bf16 switches, 64 through
+        // 512 until schema 4 took them for the four bool switches, and 1024
+        // through 8192 until schema 7 took them for the four binary16 ones
         assert_eq!(
-            word(3, 64, expected_storage),
+            word(3, FLAG_F16[OPERANDS - 1] << 1, expected_storage),
             Err(PointwisePlanError::FlagsOutOfRange)
+        );
+        // schema 4: a slot holds one storage, and a combination no module is
+        // built for is refused rather than dispatched
+        assert_eq!(
+            word(3, FLAG_BF16[0] | FLAG_U8[0], expected_storage),
+            Err(PointwisePlanError::StorageConflict)
+        );
+        assert_eq!(
+            word(3, FLAG_U8[1], expected_storage),
+            Err(PointwisePlanError::StorageUnbuilt)
         );
         // and the four it DID take are accepted and survive a round trip,
         // which is what makes the assertion above a statement about unknown
@@ -1379,12 +1873,16 @@ mod tests {
             FLAG_BF16[3],
             FLAG_BF16[2],
             FLAG_BF16[0] | FLAG_BF16[1],
-            STORAGE_FLAGS,
+            FLAG_BF16[0] | FLAG_BF16[1] | FLAG_BF16[2] | FLAG_BF16[3],
+            FLAG_U8[3],
+            FLAG_U8[0],
+            FLAG_U8[0] | FLAG_U8[1] | FLAG_U8[2] | FLAG_U8[3],
+            FLAG_U8[0] | FLAG_BF16[1] | FLAG_BF16[2] | FLAG_BF16[3],
         ] {
             let plan = word(3, flags, expected_storage)
                 .unwrap_or_else(|e| panic!("flags {flags} refused: {e}"));
             assert_eq!(plan.flags() & STORAGE_FLAGS, flags);
-            assert_eq!(plan.storage_module(), storage_module(flags));
+            assert_eq!(Some(plan.storage_module()), storage_module(flags));
             let bytes = plan.push_constants();
             assert_eq!(
                 u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) & !FLAG_Y_SCALAR,
@@ -1581,5 +2079,490 @@ mod tests {
         // pair and the schema-1 constructors agree on the words they share
         assert_eq!(Scalars::pair(1.0, 0.0), Scalars::new(1.0));
         assert_ne!(Scalars::pair(1.0, 4.0), Scalars::with_scalar_y(1.0, 4.0));
+    }
+
+    #[test]
+    fn every_storage_combination_is_a_module_or_a_named_refusal() {
+        // all 4^4 storage combinations: the sixteen f32/bf16 ones are modules
+        // 0-15 by their bits, the fifteen BOOL_MODULES are 16 onwards in
+        // their order, F16_MODULES and then F16_BOOL_MODULES follow from
+        // F16_BASE in theirs, and every other combination has no module
+        let (mut bool_seen, mut f16_seen, mut f16_bool_seen) = (0, 0, 0);
+        for code in 0..256u32 {
+            let mut codes = [0u8; OPERANDS];
+            let mut flags = 0u32;
+            let mut rest = code;
+            for (index, slot) in codes.iter_mut().enumerate() {
+                *slot = (rest % 4) as u8;
+                rest /= 4;
+                flags |= match *slot {
+                    1 => FLAG_BF16[index],
+                    2 => FLAG_U8[index],
+                    3 => FLAG_F16[index],
+                    _ => 0,
+                };
+            }
+            for (index, &code) in codes.iter().enumerate() {
+                assert_eq!(slot_dtype(flags, index), Some(code));
+            }
+            let module = storage_module(flags);
+            if codes.iter().all(|&c| c < 2) {
+                let bits: usize = codes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &c)| usize::from(c) << i)
+                    .sum();
+                assert_eq!(module, Some(bits), "{codes:?}");
+            } else if let Some(position) = F16_MODULES.iter().position(|m| *m == codes) {
+                assert_eq!(module, Some(F16_BASE + position), "{codes:?}");
+                f16_seen += 1;
+            } else if let Some(position) = F16_BOOL_MODULES.iter().position(|m| *m == codes) {
+                assert_eq!(
+                    module,
+                    Some(F16_BASE + F16_MODULES.len() + position),
+                    "{codes:?}"
+                );
+                f16_bool_seen += 1;
+            } else if let Some(position) = BOOL_MODULES.iter().position(|m| *m == codes) {
+                assert_eq!(module, Some(16 + position), "{codes:?}");
+                bool_seen += 1;
+            } else {
+                assert_eq!(
+                    module, None,
+                    "{codes:?} has no module and must not select one"
+                );
+            }
+            for (index, &code) in codes.iter().enumerate() {
+                let expected = match code {
+                    2 => 1,
+                    1 | 3 => 2,
+                    _ => 4,
+                };
+                assert_eq!(slot_element_bytes(flags, index), expected);
+            }
+        }
+        assert_eq!(
+            bool_seen,
+            BOOL_MODULES.len(),
+            "a BOOL_MODULES entry is duplicated"
+        );
+        assert_eq!(
+            f16_seen,
+            F16_MODULES.len(),
+            "an F16_MODULES entry is duplicated"
+        );
+        assert_eq!(
+            f16_bool_seen,
+            F16_BOOL_MODULES.len(),
+            "an F16_BOOL_MODULES entry is duplicated"
+        );
+        assert_eq!(F16_BASE, 16 + BOOL_MODULES.len());
+        assert_eq!(
+            STORAGE_MODULES,
+            16 + BOOL_MODULES.len() + F16_MODULES.len() + F16_BOOL_MODULES.len()
+        );
+        // two storage bits on one slot is no storage at all, whichever two
+        for (a, b) in [
+            (FLAG_BF16, FLAG_U8),
+            (FLAG_BF16, FLAG_F16),
+            (FLAG_U8, FLAG_F16),
+        ] {
+            for index in 0..OPERANDS {
+                assert_eq!(slot_dtype(a[index] | b[index], index), None);
+                assert_eq!(storage_module(a[index] | b[index]), None);
+            }
+        }
+        // every binary16 module has a binary16 slot, and none holds bf16
+        for module in F16_MODULES.iter().chain(F16_BOOL_MODULES.iter()) {
+            assert!(module.contains(&3) && !module.contains(&1), "{module:?}");
+        }
+    }
+
+    /// Schema 7: the vector modules are exactly the storage modules without a
+    /// bool slot, numbered 0..VECTOR_MODULES one to one, and a bool module
+    /// needs 8-bit storage.
+    #[test]
+    fn every_module_without_a_bool_slot_has_one_vector_module() {
+        let mut seen = [false; VECTOR_MODULES];
+        for module in 0..STORAGE_MODULES {
+            let codes: [u8; OPERANDS] = if module < 16 {
+                [0usize, 1, 2, 3].map(|i| u8::from(((module >> i) & 1) == 1))
+            } else if module < F16_BASE {
+                BOOL_MODULES[module - 16]
+            } else if module < F16_BASE + F16_MODULES.len() {
+                F16_MODULES[module - F16_BASE]
+            } else {
+                F16_BOOL_MODULES[module - F16_BASE - F16_MODULES.len()]
+            };
+            assert_eq!(
+                module_has_bool(module),
+                codes.contains(&2),
+                "module {module}"
+            );
+            match vector_module(module) {
+                Some(v) => {
+                    assert!(
+                        !codes.contains(&2),
+                        "module {module} has bool storage and a vector module"
+                    );
+                    assert!(!seen[v], "vector module {v} is numbered twice");
+                    seen[v] = true;
+                }
+                None => assert!(
+                    codes.contains(&2),
+                    "module {module} has no bool slot and no vector module"
+                ),
+            }
+        }
+        assert!(seen.iter().all(|&s| s), "a vector module number is unused");
+    }
+
+    /// Schema 7 tightened the in-place rule for every storage: an input on the
+    /// output's buffer must be the output's own view AND its element type.
+    #[test]
+    fn in_place_needs_the_same_view_and_the_same_storage() {
+        let s = |i: u64| Storage::new(i, 1 << 20);
+        let d = StridedView::new(0, [64, 1, 0, 0]);
+        let shape = [16u64, 64];
+        let plan = |flags: u32, x_buffer: u64| {
+            PointwisePlan::new_with_storage_flags(
+                PointwiseOp::Mul,
+                &shape,
+                [d, d, d, d],
+                Scalars::new(1.0),
+                [s(x_buffer), s(2), s(3), s(4)],
+                flags,
+            )
+        };
+        let f16_all = FLAG_F16[0] | FLAG_F16[1] | FLAG_F16[2] | FLAG_F16[3];
+        let bf16_all = FLAG_BF16[0] | FLAG_BF16[1] | FLAG_BF16[2] | FLAG_BF16[3];
+        // in place with one storage: admitted, binary16 as bf16 and f32
+        assert!(plan(f16_all, 4).is_ok());
+        assert!(plan(bf16_all, 4).is_ok());
+        assert!(plan(0, 4).is_ok());
+        // x a binary16 view of the f32 output's buffer: the same element view,
+        // other bytes, so refused
+        assert_eq!(
+            plan(FLAG_F16[0] | FLAG_F16[2], 4).err(),
+            Some(PointwisePlanError::OutputOverlapsInput)
+        );
+        // an f32 x over a bf16 output's buffer: the same, for the older storage
+        assert_eq!(
+            plan(FLAG_BF16[1] | FLAG_BF16[2] | FLAG_BF16[3], 4).err(),
+            Some(PointwisePlanError::OutputOverlapsInput)
+        );
+        // no module mixes bf16 and binary16, so that is refused before any
+        // aliasing is looked at
+        assert_eq!(
+            plan(FLAG_BF16[0] | FLAG_F16[1] | FLAG_F16[2] | FLAG_F16[3], 4).err(),
+            Some(PointwisePlanError::StorageUnbuilt)
+        );
+        // on its own buffer the mixed module is fine: y binary16 beside an f32 x
+        assert!(plan(FLAG_F16[1], 1).is_ok());
+    }
+
+    #[test]
+    fn schema_four_operations_decode_and_read_their_slots() {
+        use PointwiseOp::*;
+        let expected = [
+            (24, Exp, false, false),
+            (25, Round, false, false),
+            (26, Gt, true, false),
+            (27, Lt, true, false),
+            (28, Ge, true, false),
+            (29, Le, true, false),
+            (30, Eq, true, false),
+            (31, Ne, true, false),
+            (32, LogicalAnd, true, false),
+            (33, LogicalOr, true, false),
+            (34, LogicalXor, true, false),
+            (35, LogicalNot, false, false),
+            (36, Where, true, true),
+        ];
+        for (word, op, reads_y, reads_z) in expected {
+            assert_eq!(PointwiseOp::try_from(word), Ok(op));
+            assert_eq!(op as u32, word);
+            assert!(op.reads_x(), "{op:?} reads x");
+            assert_eq!(op.reads_y(), reads_y, "{op:?} y");
+            assert_eq!(op.reads_z(), reads_z, "{op:?} z");
+        }
+        // 36 was schema 4's last word; schema 5 appends 37-39 (the test below)
+    }
+
+    #[test]
+    fn schema_five_operations_decode_and_read_their_slots() {
+        use PointwiseOp::*;
+        // silu_backward reads the gradient and the input; x * silu(y) reads u and
+        // the gate; the gate's gradient reads the gradient, u and the gate
+        let expected = [
+            (37, SiluBackward, true, false),
+            (38, SiluMul, true, false),
+            (39, SwigluGradGate, true, true),
+        ];
+        for (word, op, reads_y, reads_z) in expected {
+            assert_eq!(PointwiseOp::try_from(word), Ok(op));
+            assert_eq!(op as u32, word);
+            assert!(op.reads_x(), "{op:?} reads x");
+            assert_eq!(op.reads_y(), reads_y, "{op:?} y");
+            assert_eq!(op.reads_z(), reads_z, "{op:?} z");
+        }
+        // 39 was schema 5's last word; schema 6 appends 40-42 (the test below)
+    }
+
+    #[test]
+    fn schema_six_operations_decode_and_read_their_slots() {
+        use PointwiseOp::*;
+        // tanh and log read x alone; xlogy reads x and y (a buffer, or the
+        // scalar b under flag bit 0)
+        let expected = [(40, Tanh, false), (41, Log, false), (42, Xlogy, true)];
+        for (word, op, reads_y) in expected {
+            assert_eq!(PointwiseOp::try_from(word), Ok(op));
+            assert_eq!(op as u32, word);
+            assert!(op.reads_x(), "{op:?} reads x");
+            assert_eq!(op.reads_y(), reads_y, "{op:?} y");
+            assert!(!op.reads_z(), "{op:?} z");
+        }
+        // 42 was schema 6's last word (schema 7 added storage bits, not
+        // operations); schema 8 appends 43-46 (the test below)
+    }
+
+    #[test]
+    fn schema_eight_operations_decode_and_read_their_slots() {
+        use PointwiseOp::*;
+        // minimum, maximum and threshold_backward read x and y; relu x alone;
+        // none reads z
+        let expected = [
+            (43, Minimum, true),
+            (44, Maximum, true),
+            (45, Relu, false),
+            (46, ThresholdBackward, true),
+        ];
+        for (word, op, reads_y) in expected {
+            assert_eq!(PointwiseOp::try_from(word), Ok(op));
+            assert_eq!(op as u32, word);
+            assert!(op.reads_x(), "{op:?} reads x");
+            assert_eq!(op.reads_y(), reads_y, "{op:?} y");
+            assert!(!op.reads_z(), "{op:?} z");
+        }
+        assert_eq!((SCHEMA, LAST_OP), (8, 46));
+        assert_eq!(
+            PointwiseOp::try_from(LAST_OP + 1),
+            Err(PointwisePlanError::OperationOutOfRange)
+        );
+    }
+
+    /// The shader's unravel, as the kernel runs it: every operand's address of
+    /// linear index `index` under one push block.
+    fn shader_addresses(block: &[u8; PUSH_BYTES], index: u32) -> [u32; OPERANDS] {
+        let w = |i: usize| u32::from_le_bytes(block[4 * i..4 * i + 4].try_into().unwrap());
+        let ndim = w(1) as usize;
+        let mut remainder = index;
+        let mut addresses = [0u32; OPERANDS];
+        for (k, address) in addresses.iter_mut().enumerate() {
+            *address = w(8 + k * (MAX_NDIM + 1) + MAX_NDIM);
+        }
+        for d in (0..ndim).rev() {
+            let extent = w(4 + d);
+            let coordinate = remainder % extent;
+            remainder /= extent;
+            for (k, address) in addresses.iter_mut().enumerate() {
+                *address =
+                    address.wrapping_add(coordinate.wrapping_mul(w(8 + k * (MAX_NDIM + 1) + d)));
+            }
+        }
+        addresses
+    }
+
+    #[test]
+    fn the_coalesced_dispatch_block_reaches_every_touched_address_the_plan_does() {
+        let s = |i: u64| Storage::new(i, 1 << 22);
+        let v = |offset: u64, strides: [u64; MAX_NDIM]| StridedView::new(offset, strides);
+        // (op, shape, x, y, z, out views, expected coalesced ndim)
+        let cases: Vec<(PointwiseOp, Vec<u64>, [StridedView; OPERANDS], u32)> = vec![
+            // dense 3-D: one dimension
+            (
+                PointwiseOp::Mul,
+                vec![4, 16, 28],
+                [
+                    v(0, [448, 28, 1, 0]),
+                    v(0, [448, 28, 1, 0]),
+                    v(0, [448, 28, 1, 0]),
+                    v(0, [448, 28, 1, 0]),
+                ],
+                1,
+            ),
+            // [4, 16, 1] against [4, 16, 28] (a row statistic): two dimensions
+            (
+                PointwiseOp::Div,
+                vec![4, 16, 28],
+                [
+                    v(0, [448, 28, 1, 0]),
+                    v(0, [16, 1, 0, 0]),
+                    v(0, [448, 28, 1, 0]),
+                    v(0, [448, 28, 1, 0]),
+                ],
+                2,
+            ),
+            // [28] against [4, 16, 28] (a weight): two dimensions
+            (
+                PointwiseOp::Mul,
+                vec![4, 16, 28],
+                [
+                    v(0, [448, 28, 1, 0]),
+                    v(5, [0, 0, 1, 0]),
+                    v(0, [448, 28, 1, 0]),
+                    v(0, [448, 28, 1, 0]),
+                ],
+                2,
+            ),
+            // a transposed input: nothing merges across the swap
+            (
+                PointwiseOp::AddScaled,
+                vec![8, 6],
+                [
+                    v(0, [1, 8, 0, 0]),
+                    v(0, [6, 1, 0, 0]),
+                    v(0, [6, 1, 0, 0]),
+                    v(0, [6, 1, 0, 0]),
+                ],
+                2,
+            ),
+            // a slice with a row gap in the output
+            (
+                PointwiseOp::SubScaled,
+                vec![3, 5, 7],
+                [
+                    v(0, [35, 7, 1, 0]),
+                    v(0, [35, 7, 1, 0]),
+                    v(0, [35, 7, 1, 0]),
+                    v(2, [45, 9, 1, 0]),
+                ],
+                2,
+            ),
+            // extent-1 dimensions dropped; unread y and z ignored
+            (
+                PointwiseOp::Neg,
+                vec![1, 5, 1, 6],
+                [
+                    v(0, [30, 6, 6, 1]),
+                    v(0, [7, 3, 2, 99]),
+                    v(0, [0, 0, 0, 0]),
+                    v(0, [30, 6, 6, 1]),
+                ],
+                1,
+            ),
+            // iota: the linear index survives the merge
+            (
+                PointwiseOp::Iota,
+                vec![2, 3, 4],
+                [
+                    v(0, [12, 4, 1, 0]),
+                    v(0, [12, 4, 1, 0]),
+                    v(0, [12, 4, 1, 0]),
+                    v(0, [12, 4, 1, 0]),
+                ],
+                1,
+            ),
+            // addcmul reads z: a z with a gap keeps the dimension
+            (
+                PointwiseOp::Addcmul,
+                vec![4, 8],
+                [
+                    v(0, [8, 1, 0, 0]),
+                    v(0, [8, 1, 0, 0]),
+                    v(0, [10, 1, 0, 0]),
+                    v(0, [8, 1, 0, 0]),
+                ],
+                2,
+            ),
+        ];
+        for (i, (op, shape, views, want_ndim)) in cases.into_iter().enumerate() {
+            let storage = [s(1), s(2), s(3), s(4)];
+            let plan = PointwisePlan::new(op, &shape, views, Scalars::new(1.0), storage)
+                .unwrap_or_else(|e| panic!("case {i}: {e}"));
+            let caller = plan.push_constants();
+            let shader = plan.dispatch_push_constants();
+            let ndim = u32::from_le_bytes(shader[4..8].try_into().unwrap());
+            assert_eq!(ndim, want_ndim, "case {i} ({op:?}): coalesced ndim");
+            assert_eq!(caller[8..12], shader[8..12], "case {i}: n is unchanged");
+            let y_scalar = Scalars::new(1.0).flags() & FLAG_Y_SCALAR != 0;
+            let touched = [op.reads_x(), op.reads_y() && !y_scalar, op.reads_z(), true];
+            for index in 0..plan.n() {
+                let a = shader_addresses(&caller, index);
+                let b = shader_addresses(&shader, index);
+                for k in 0..OPERANDS {
+                    if touched[k] {
+                        assert_eq!(a[k], b[k], "case {i} ({op:?}) operand {k} index {index}");
+                    }
+                }
+            }
+        }
+        // triu keeps its rows and columns
+        let dense = v(0, [12, 4, 1, 0]);
+        let triu = PointwisePlan::new(
+            PointwiseOp::Triu,
+            &[2, 3, 4],
+            [dense; OPERANDS],
+            Scalars::new(1.0),
+            [s(1), s(2), s(3), s(4)],
+        )
+        .unwrap();
+        assert_eq!(triu.dispatch_push_constants(), triu.push_constants());
+    }
+
+    /// The vector module (2026-09-27) takes a call that has a 16-bit slot or a
+    /// last-dimension broadcast, and whose groups of four start on whole
+    /// vectors. Every other call keeps the scalar module.
+    #[test]
+    fn the_vector_module_takes_sixteen_bit_and_broadcast_calls_that_start_on_whole_vectors() {
+        let s = |i: u64| Storage::new(i, 1 << 22);
+        let v = |offset: u64, strides: [u64; MAX_NDIM]| StridedView::new(offset, strides);
+        let plan = |op, shape: &[u64], views: [StridedView; OPERANDS], flags: u32| {
+            PointwisePlan::new_with_storage_flags(
+                op,
+                shape,
+                views,
+                Scalars::new(1.0),
+                [s(1), s(2), s(3), s(4)],
+                flags,
+            )
+            .unwrap()
+        };
+        let d = v(0, [448, 28, 1, 0]);
+        let shape = [4u64, 16, 28];
+        let bf16 = FLAG_BF16[0] | FLAG_BF16[1] | FLAG_BF16[3];
+        // bf16 x * y into bf16, dense: a 16-bit slot pays
+        assert!(plan(PointwiseOp::Mul, &shape, [d, d, d, d], bf16).vector_eligible());
+        // the same in f32: all four-byte and unit-stride, so the scalar module
+        assert!(!plan(PointwiseOp::Mul, &shape, [d, d, d, d], 0).vector_eligible());
+        // f32 against a row statistic [4, 16, 1]: a last-dimension broadcast pays
+        let rows = v(0, [16, 1, 0, 0]);
+        assert!(plan(PointwiseOp::Div, &shape, [d, rows, d, d], 0).vector_eligible());
+        // f32 against a weight [28] broadcast over rows: unit-stride everywhere,
+        // nothing broadcast along the LAST dimension, so the scalar module
+        let weight = v(0, [0, 0, 1, 0]);
+        assert!(!plan(PointwiseOp::Mul, &shape, [d, weight, d, d], 0).vector_eligible());
+        // bf16, but 3 x 5 x 7 elements: no multiple of 4 in the last dimension
+        let odd = v(0, [35, 7, 1, 0]);
+        assert!(!plan(PointwiseOp::Mul, &[3, 5, 7], [odd, odd, odd, odd], bf16).vector_eligible());
+        // bf16 with x two elements in: its fours do not start on a vector
+        let shifted = v(2, [448, 28, 1, 0]);
+        assert!(!plan(PointwiseOp::Mul, &shape, [shifted, d, d, d], bf16).vector_eligible());
+        // bf16 with a strided x (every other element): no vector load
+        let strided = v(0, [896, 56, 2, 0]);
+        assert!(!plan(PointwiseOp::Mul, &shape, [strided, d, d, d], bf16).vector_eligible());
+        // a bool output: no vector module for bool storage
+        assert!(!plan(PointwiseOp::Gt, &shape, [d, d, d, d], FLAG_U8[3]).vector_eligible());
+        // a scalar y is not read, so a bf16 x and out alone decide: eligible
+        let scalar_y = PointwisePlan::new_with_storage_flags(
+            PointwiseOp::Mul,
+            &shape,
+            [d, d, d, d],
+            Scalars::with_scalar_y(1.0, 2.0),
+            [s(1), s(2), s(3), s(4)],
+            FLAG_BF16[0] | FLAG_BF16[3],
+        )
+        .unwrap();
+        assert!(scalar_y.vector_eligible());
     }
 }

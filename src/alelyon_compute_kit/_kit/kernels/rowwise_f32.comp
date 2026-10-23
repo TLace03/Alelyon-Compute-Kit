@@ -51,6 +51,18 @@ float max_workgroup(float value) {
     return result;
 }
 
+// x / (2^e * d) for RMSNorm: x = f * 2^ex (frexp, |f| in [0.5, 1) or 0), one
+// division f / d with d in [2^-13, 1], then an exact ldexp by ex - e. A
+// non-finite x, whose frexp is undefined, is divided plainly (inf / inf is NaN).
+float over_rms(float x, int e, float d) {
+    if (isinf(x) || isnan(x)) {
+        return x / d;
+    }
+    int ex;
+    float f = frexp(x, ex);
+    return ldexp(f / d, ex - e);
+}
+
 void main() {
     uint lane = gl_LocalInvocationID.x;
     uint group = gl_WorkGroupID.x;
@@ -88,54 +100,60 @@ void main() {
             output_values[i] = primary[i] * (upstream[i] - dot);
         }
     } else if (p.op == 2u || p.op == 3u) {
-        // Scaling before squaring avoids overflow for finite large inputs.
-        // Including sqrt(epsilon) also handles an entirely zero row without
-        // either dividing by zero or squaring an unrepresentably large ratio.
+        // POWER-OF-TWO SCALING (2026-09-27, ACK-RMS-EXTREME-02). The row's
+        // scale is 2^e, e from frexp(max(max|x|, sqrt(epsilon))), so every
+        // |x| < 2^e and the sum of squares reads ldexp(x, -e): exact, and no
+        // divisor. d = rms / 2^e then lies in [2^-13, 1] for cols <= 2^24 (the
+        // largest entry alone contributes at least 1/4 to the scaled sum), and
+        // every quotient by the RMS is over_rms() below: ONE division, by d,
+        // inside OpFDiv's accurate domain, then exact power-of-two steps that
+        // leave the representable range only when the true result does.
+        //
+        // The 2026-09-09 form divided twice, (x / scale) / d with the scale
+        // capped at 2^126, and relied on `precise` to keep the two divisions
+        // apart. NVIDIA's compiler (driver 580.159.04, Tesla T4) folded them
+        // anyway into x / (scale * d), whose divisor is infinite for any row
+        // with an RMS above 2^126, so those rows came out 0 in forward and
+        // backward (measured by session df5200c9 on two Kaggle T4s, fleet
+        // 7498dc23). No two-division chain is left here for a compiler to fold.
         float epsilon = uintBitsToFloat(p.epsilon_bits);
-        float scale = sqrt(epsilon);
+        float largest = sqrt(epsilon);
         for (uint col = lane; col < p.cols; col += 64u)
-            scale = max(scale, abs(primary[base + col]));
-        // FP32 OpFDiv only guarantees accuracy for divisors through 2^126.
-        // Capping the scale there keeps |x/scale| <= 4 for every finite x;
-        // squared magnitudes <= 16 keep the admitted row's sum finite.
-        scale = min(max_workgroup(scale), uintBitsToFloat(0x7e800000u));
-        // Keep the complete expressions precise: reassociating x/scale/d
-        // into x/(scale*d) can recreate an out-of-range divisor, and moving
-        // the square before the scaling can overflow otherwise finite rows.
+            largest = max(largest, abs(primary[base + col]));
+        largest = max_workgroup(largest);
+        // an infinite entry makes the RMS infinite: e = 0 keeps the plain
+        // arithmetic, which gives 0 for the finite entries and NaN for the
+        // infinite ones, as torch does; a NaN reaches every output through d
+        int e = 0;
+        if (!isinf(largest) && !isnan(largest)) {
+            frexp(largest, e);
+        }
         precise float squares = 0.0;
         for (uint col = lane; col < p.cols; col += 64u) {
-            precise float normalized = primary[base + col] / scale;
-            squares += normalized * normalized;
+            float scaled = ldexp(primary[base + col], -e);
+            squares += scaled * scaled;
         }
         squares = sum_workgroup(squares);
-        precise float denominator = sqrt(squares / float(p.cols) + (epsilon / scale) / scale);
+        precise float d = sqrt(squares / float(p.cols) + ldexp(epsilon, -2 * e));
         if (p.op == 2u) {
             for (uint col = lane; col < p.cols; col += 64u) {
-                precise float value = gamma[col] * ((primary[base + col] / scale) / denominator);
-                output_values[base + col] = value;
+                output_values[base + col] = gamma[col] * over_rms(primary[base + col], e, d);
             }
         } else {
+            // n = x / rms; dx = (g * gamma - n * dot) / rms with
+            // dot = mean(g * gamma * n); the gamma contribution is g * n
             precise float dot = 0.0;
             for (uint col = lane; col < p.cols; col += 64u) {
                 uint i = base + col;
-                precise float normalized = (primary[i] / scale) / denominator;
-                dot += upstream[i] * gamma[col] * normalized;
+                dot += upstream[i] * gamma[col] * over_rms(primary[i], e, d);
             }
             dot = sum_workgroup(dot) / float(p.cols);
-            // Do not materialize 1/rms: it can be subnormal (and flushed)
-            // while the final gradient is normal. Two divisions by sqrt(rms)
-            // also avoid overflowing g/scale for a small scale. For admitted
-            // epsilon and finite rows the factor is about [1e-3, 2^64],
-            // within OpFDiv's accuracy domain. With a finite numerator and
-            // representable result the intermediate lies between those two.
-            precise float rms_root = sqrt(scale) * sqrt(denominator);
             for (uint col = lane; col < p.cols; col += 64u) {
                 uint i = base + col;
-                precise float normalized = (primary[i] / scale) / denominator;
-                precise float value = ((upstream[i] * gamma[col] - normalized * dot) / rms_root) / rms_root;
-                precise float contribution = upstream[i] * normalized;
-                output_values[i] = value;
-                output_values[count + i] = contribution;
+                float n = over_rms(primary[i], e, d);
+                precise float numerator = upstream[i] * gamma[col] - n * dot;
+                output_values[i] = over_rms(numerator, e, d);
+                output_values[count + i] = upstream[i] * n;
             }
         }
     } else if (p.op == 5u) {

@@ -1,0 +1,140 @@
+#version 450
+// ACK amp-update-scale-f32/v1 (2026-09-29): GradScaler's scale update --
+// torch's _amp_update_scale_(scale, growth_tracker, found_inf, growth_factor,
+// backoff_factor, growth_interval) -- in ONE invocation, as the CPU kernel
+// (aten/src/ATen/native/cpu/AmpGradScalerKernels.cpp) writes it:
+//
+//   if (found_inf)      scale = scale * backoff_factor;  tracker = 0
+//   else if (tracker + 1 == growth_interval)
+//                       grown = scale * growth_factor;
+//                       if (isfinite(grown)) scale = grown;  tracker = 0
+//   else                tracker = tracker + 1
+//
+// `found_inf` is a C++ truth test on a float, so -0.0 is false and a NaN is
+// true. The CPU multiplies the float scale by a DOUBLE factor and rounds the
+// double product to float once. The host plan (src/amp_ops.rs) admits only a
+// factor that is a float32 exactly, so that double product of two float32
+// values is exact (48 significant bits) and its one rounding IS the correctly
+// rounded binary32 product, which f32_mul below computes: IEEE 754 binary32,
+// round to nearest even, subnormals kept, in 32-bit integer instructions
+// only, so its bits do not depend on a device's float controls. A NaN scale
+// comes back quieted with its own payload, as the double round trip keeps it;
+// an invalid product (0 * inf) is x86's default NaN 0xFFC00000. f32_mul is
+// the routine of kernels/amp_unscale_f32.comp, character for character
+// (tests in src/amp_ops.rs compare the two).
+//
+// The tracker is an int32 whose increment wraps, as the CPU's does on x86.
+// Each operand is one element of its own buffer, at the push block's offset;
+// a buffer too small for its offset is not written (the host plan refuses
+// such a call by name first).
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0, std430) buffer Scale { uint scale_words[]; };
+layout(set = 0, binding = 1, std430) buffer Tracker { int tracker_words[]; };
+layout(set = 0, binding = 2, std430) readonly buffer Found { uint found_words[]; };
+layout(push_constant) uniform Push {
+    uint scale_offset;    // the scale's element
+    uint tracker_offset;  // the growth tracker's element
+    uint found_offset;    // found_inf's element
+    uint growth_bits;     // the growth factor, float32 bits
+    uint backoff_bits;    // the backoff factor, float32 bits
+    int interval;         // growth_interval
+} p;
+
+// IEEE binary32 s * v, round to nearest even, subnormals kept, with the NaN
+// rules above. Every step is integer arithmetic.
+uint f32_mul(uint s, uint v) {
+    const uint es = (s >> 23) & 0xFFu;
+    const uint ev = (v >> 23) & 0xFFu;
+    uint ms = s & 0x7FFFFFu;
+    uint mv = v & 0x7FFFFFu;
+    const uint sign = (s ^ v) & 0x80000000u;
+    if (es == 0xFFu && ms != 0u) return s | 0x400000u;   // the scale's NaN, quieted
+    if (ev == 0xFFu && mv != 0u) return v | 0x400000u;   // then the element's
+    const bool s_zero = (s & 0x7FFFFFFFu) == 0u;
+    const bool v_zero = (v & 0x7FFFFFFFu) == 0u;
+    if ((es == 0xFFu && v_zero) || (ev == 0xFFu && s_zero)) return 0xFFC00000u;   // 0 * inf
+    if (es == 0xFFu || ev == 0xFFu) return sign | 0x7F800000u;
+    if (s_zero || v_zero) return sign;
+    // both significands in [2^23, 2^24), with biased exponents that go below 1
+    // for a subnormal operand
+    int e1 = int(es);
+    int e2 = int(ev);
+    if (es == 0u) {
+        const int top = findMSB(ms);
+        ms <<= uint(23 - top);
+        e1 = 1 - (23 - top);
+    } else {
+        ms |= 0x800000u;
+    }
+    if (ev == 0u) {
+        const int top = findMSB(mv);
+        mv <<= uint(23 - top);
+        e2 = 1 - (23 - top);
+    } else {
+        mv |= 0x800000u;
+    }
+    uint hi;
+    uint lo;
+    umulExtended(ms, mv, hi, lo);   // the exact product, in [2^46, 2^48): hi holds bits 32..47
+    int e = e1 + e2 - 127;
+    uint shift = 23u;
+    if ((hi & 0x8000u) != 0u) {     // bit 47: the product is in [2^47, 2^48)
+        e += 1;
+        shift = 24u;
+    }
+    if (e <= 0) {                   // a subnormal result: 1 - e more bits go
+        shift += uint(1 - e);
+        e = 0;
+    }
+    if (shift > 48u) return sign;   // below half the smallest subnormal: rounds to zero
+    // the kept bits, the round bit (bit shift - 1) and whether any bit below it is set
+    uint mant;
+    if (shift >= 32u) {
+        mant = hi >> (shift - 32u);
+    } else {
+        mant = (lo >> shift) | (hi << (32u - shift));
+    }
+    const uint r = shift - 1u;
+    uint round_bit;
+    bool sticky;
+    if (r >= 32u) {
+        round_bit = (hi >> (r - 32u)) & 1u;
+        sticky = lo != 0u || (hi & ((1u << (r - 32u)) - 1u)) != 0u;
+    } else {
+        round_bit = (lo >> r) & 1u;
+        sticky = (lo & ((1u << r) - 1u)) != 0u;
+    }
+    if (round_bit != 0u && (sticky || (mant & 1u) != 0u)) mant += 1u;
+    if (e == 0) {
+        // a subnormal, or rounded up to 2^23: the smallest normal, whose bits
+        // are that same word
+        return sign | mant;
+    }
+    if (mant >= 0x1000000u) {       // rounded up to 2^24
+        mant >>= 1;
+        e += 1;
+    }
+    if (e >= 255) return sign | 0x7F800000u;
+    return sign | (uint(e) << 23) | (mant & 0x7FFFFFu);
+}
+
+void main() {
+    if (p.scale_offset >= uint(scale_words.length()) || p.tracker_offset >= uint(tracker_words.length())
+        || p.found_offset >= uint(found_words.length())) {
+        return;
+    }
+    const uint s = scale_words[p.scale_offset];
+    if ((found_words[p.found_offset] & 0x7FFFFFFFu) != 0u) {   // nonzero, a NaN included
+        scale_words[p.scale_offset] = f32_mul(s, p.backoff_bits);
+        tracker_words[p.tracker_offset] = 0;
+        return;
+    }
+    const int successful = tracker_words[p.tracker_offset] + 1;   // wraps
+    if (successful == p.interval) {
+        const uint grown = f32_mul(s, p.growth_bits);
+        if ((grown & 0x7F800000u) != 0x7F800000u) scale_words[p.scale_offset] = grown;   // finite
+        tracker_words[p.tracker_offset] = 0;
+    } else {
+        tracker_words[p.tracker_offset] = successful;
+    }
+}

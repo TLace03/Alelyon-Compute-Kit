@@ -229,6 +229,29 @@ pub const SETS_PER_KERNEL_POOL: u32 = 512;
 /// `ACK_MAX_RETIRED_BYTES`.
 pub const MAX_RETIRED_BYTES: u64 = 1 << 30;
 
+/// Fences the fence pool holds at most (`Context::fence_pool`). A context has
+/// at most one batch in flight, one open batch and one one-shot submission at
+/// a time, so a handful covers the steady state; the rest are destroyed.
+pub const FENCE_POOL_MAX: usize = 8;
+
+/// Bytes of host-visible staging the staging pool holds at most
+/// (`Context::staging_pool`); override with `ACK_STAGING_POOL_MAX_BYTES`. An
+/// AKV training update's transfers are small (the A0 update on the L4 moved
+/// 4.9 MB up and 7.3 MB down in 612 transfers), so this is room for the
+/// working set, not for a checkpoint's readback, whose pair is destroyed after
+/// it as before.
+pub const STAGING_POOL_MAX_BYTES: u64 = 64 << 20;
+
+/// Pairs one size class of the staging pool holds at most: enough for the
+/// recorded uploads of one batch in flight and one open batch.
+pub const STAGING_POOL_MAX_PER_CLASS: usize = 16;
+
+/// The largest staging pair the pool keeps: a transfer above it -- a model's
+/// parameter upload, a checkpoint's readback -- has its pair destroyed after
+/// it as before the pool existed. Training's transfers are far below it (the
+/// A0 update on the L4: 612 transfers moving 12.2 MB in all).
+pub const STAGING_POOL_MAX_PAIR_BYTES: u64 = 4 << 20;
+
 /// The state of one open batch, with no Vulkan handle in it.
 ///
 /// A `BatchPlan` exists only while there is recorded, unsubmitted work: it is
@@ -371,6 +394,75 @@ impl BatchPlan {
             self.read_since_barrier.clear();
         }
         self.written_since_barrier.insert(buffer);
+        needs_barrier
+    }
+
+    /// `record_transfer_write` for a GROUP of copies recorded together behind
+    /// at most one barrier (their destinations do not overlap one another):
+    /// whether that barrier is needed, decided over the whole group BEFORE
+    /// any of it is tracked, then every destination tracked as written after
+    /// it. Deciding copy by copy would let a later copy's barrier clear an
+    /// earlier copy's write from the sets, although that copy is recorded
+    /// after the one barrier too.
+    pub fn record_transfer_writes(&mut self, buffers: &[u64]) -> bool {
+        let needs_barrier = self.items > 0
+            && match self.barrier_rule {
+                BarrierRule::Always => true,
+                BarrierRule::Declared => buffers.iter().any(|b| {
+                    self.written_since_barrier.contains(b) || self.read_since_barrier.contains(b)
+                }),
+            };
+        if needs_barrier {
+            self.written_since_barrier.clear();
+            self.read_since_barrier.clear();
+        }
+        self.written_since_barrier.extend(buffers.iter().copied());
+        needs_barrier
+    }
+
+    /// A GROUP of device-to-device copies recorded together behind at most one
+    /// barrier, reading `reads` and writing `writes` (no copy of the group
+    /// writes what another reads or writes): whether that barrier is needed,
+    /// decided over the whole group before any of it is tracked -- a read of a
+    /// buffer written since the last barrier, or a write of one touched since
+    /// it -- then every read and write tracked after it.
+    pub fn record_transfer_group(&mut self, reads: &[u64], writes: &[u64]) -> bool {
+        let needs_barrier = self.items > 0
+            && match self.barrier_rule {
+                BarrierRule::Always => true,
+                BarrierRule::Declared => {
+                    reads.iter().any(|b| self.written_since_barrier.contains(b))
+                        || writes.iter().any(|b| {
+                            self.written_since_barrier.contains(b)
+                                || self.read_since_barrier.contains(b)
+                        })
+                }
+            };
+        if needs_barrier {
+            self.written_since_barrier.clear();
+            self.read_since_barrier.clear();
+        }
+        self.read_since_barrier.extend(reads.iter().copied());
+        self.written_since_barrier.extend(writes.iter().copied());
+        needs_barrier
+    }
+
+    /// Record a transfer whose copy READS `buffer` (a recorded readback), and
+    /// say whether a barrier must precede it: an item since the last barrier
+    /// wrote `buffer` (read after write). It is not an item of the plan. The
+    /// read is tracked, so a later item that writes `buffer` takes a barrier
+    /// after it (write after read).
+    pub fn record_transfer_read(&mut self, buffer: u64) -> bool {
+        let needs_barrier = self.items > 0
+            && match self.barrier_rule {
+                BarrierRule::Always => true,
+                BarrierRule::Declared => self.written_since_barrier.contains(&buffer),
+            };
+        if needs_barrier {
+            self.written_since_barrier.clear();
+            self.read_since_barrier.clear();
+        }
+        self.read_since_barrier.insert(buffer);
         needs_barrier
     }
 
@@ -671,6 +763,42 @@ mod tests {
         let mut zero = BatchPlan::new(0, 0, MAX_RETIRED_BYTES);
         zero.record();
         assert_eq!(zero.due(), Some(FlushReason::BatchFull));
+    }
+
+    #[test]
+    fn recorded_copies_take_a_barrier_exactly_on_a_conflict_and_hold_back_later_items() {
+        let mut plan = BatchPlan::new(0, MAX_RECORDED_ITEMS, MAX_RETIRED_BYTES);
+        if plan.barrier_rule != BarrierRule::Declared {
+            // ACK_BARRIERS=always: every transfer after the first item takes one
+            assert!(
+                !plan.record_transfer_read(5),
+                "no item yet: the batch opens with one"
+            );
+            plan.record_with(&[Access::write(5)]);
+            assert!(plan.record_transfer_read(5));
+            assert!(plan.record_transfer_writes(&[1, 2]));
+            return;
+        }
+        // before any item the batch's own opening barrier covers everything
+        assert!(!plan.record_transfer_writes(&[1, 2, 3]));
+        assert!(!plan.record_transfer_read(4));
+        // the plan never puts one before a batch's first item; after a
+        // recorded transfer the context's pending-transfer flag does
+        assert!(!plan.record_with(&[Access::read(2), Access::write(5)]));
+        // a readback of what that item wrote must wait for it (read after write)
+        assert!(plan.record_transfer_read(5));
+        // an item that only reads what the readback read takes none
+        assert!(!plan.record_with(&[Access::read(5)]));
+        // an item that WRITES what the readback read must wait (write after read)
+        assert!(plan.record_with(&[Access::write(5)]));
+        // a readback of a buffer nothing wrote since the last barrier takes none
+        assert!(!plan.record_transfer_read(9));
+        // a group conflicts as a whole: 7 is clean, 5 was just written
+        assert!(plan.record_transfer_writes(&[7, 5]));
+        // and after its one barrier BOTH destinations are tracked as written:
+        // an item reading the first one waits, though the second caused the barrier
+        assert!(plan.record_with(&[Access::read(7)]));
+        assert_eq!(plan.items(), 4, "transfers are not items");
     }
 
     #[test]

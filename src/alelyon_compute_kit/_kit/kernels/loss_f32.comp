@@ -7,10 +7,50 @@
 // 4 negative log-likelihood backward (-dy * normalizer at the target, else 0).
 // Ops 3 and 4 read only the target column of each row.
 layout(local_size_x = 64) in;
+// BF16 STORAGE (2026-09-28), two switches for the optional `ack_loss_bf16`:
+// PRIMARY_BF16=1 reads the logits as bf16 (each widened exactly, so every value
+// is the f32 upcast the model's `.float()` would have made), and OUT_BF16=1
+// writes the backward's gradient as bf16, each value rounded to nearest even as
+// cast_f32_bf16.comp rounds it, in pairs (cols is even; the host refuses odd).
+// The host allows PRIMARY_BF16 for ops 0 and 1 and OUT_BF16 for op 1 only; an
+// OUT_BF16 module dispatched with any other op writes nothing. The arithmetic is
+// the f32 module's source; only the loads and the store change.
+#ifndef PRIMARY_BF16
+#define PRIMARY_BF16 0
+#endif
+#ifndef OUT_BF16
+#define OUT_BF16 0
+#endif
+#if PRIMARY_BF16
+layout(set = 0, binding = 0, std430) readonly buffer Primary { uint primary16[]; };
+float primary_at(uint i) {
+    uint w = primary16[i >> 1u];
+    return uintBitsToFloat(((i & 1u) == 0u ? (w & 0xFFFFu) : (w >> 16u)) << 16u);
+}
+#else
 layout(set = 0, binding = 0, std430) readonly buffer Primary { float primary[]; };
+// a macro, not a function, so the f32 module compiles to the bytes it had
+#define primary_at(i) primary[i]
+#endif
 layout(set = 0, binding = 1, std430) readonly buffer Targets { int targets[]; };
 layout(set = 0, binding = 2, std430) readonly buffer Upstream { float upstream[]; };
+#if OUT_BF16
+layout(set = 0, binding = 3, std430) writeonly buffer Output { uint output16[]; };
+uint f32_to_bf16(float x) {
+    uint bits = floatBitsToUint(x);
+    if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu) != 0u) {
+        return (bits >> 16) | 0x0040u;   // quiet NaN, as cast_f32_bf16.comp
+    }
+    uint lsb = (bits >> 16) & 1u;
+    return (bits + 0x7FFFu + lsb) >> 16;
+}
+// elements `index` and `index + 1` (index even) in one word
+void store_pair(uint index, float v0, float v1) {
+    output16[index >> 1u] = f32_to_bf16(v0) | (f32_to_bf16(v1) << 16u);
+}
+#else
 layout(set = 0, binding = 3, std430) writeonly buffer Output { float output_values[]; };
+#endif
 layout(push_constant) uniform Push {
     uint rows;
     uint cols;
@@ -53,14 +93,19 @@ void main() {
     uint row = gl_WorkGroupID.x;
     float normalizer = uintBitsToFloat(p.normalizer_bits);
     float invalid = uintBitsToFloat(0x7fc00000u);
+#if OUT_BF16
+    // the host dispatches this module for the backward only (op 1)
+    if (p.op != 1u) return;
+#endif
     // Each branch containing a return is uniform over the workgroup.
+#if !OUT_BF16
     if (p.op == 2u) {
         if (row != 0u) return;
         float total = 0.0;
         for (uint i = lane; i < p.rows; i += 64u) {
             int target = targets[i];
             if (target < -1 || target >= int(p.cols)) total += invalid;
-            else if (target != -1) total += primary[i];
+            else if (target != -1) total += primary_at(i);
         }
         total = sum_workgroup(total);
         if (lane == 0u)
@@ -68,29 +113,41 @@ void main() {
                 ? total * normalizer : invalid;
         return;
     }
+#endif
     if (row >= p.rows) return;
     uint base = row * p.cols;
     int target = targets[row];
     if (p.op > 4u || p.reduction > 2u || target < -1 || target >= int(p.cols)) {
+#if OUT_BF16
+        for (uint col = lane * 2u; col < p.cols; col += 128u)
+            store_pair(base + col, invalid, invalid);
+#else
         if (p.op == 0u || p.op == 3u) {
             if (lane == 0u) output_values[row] = invalid;
         } else {
             for (uint col = lane; col < p.cols; col += 64u)
                 output_values[base + col] = invalid;
         }
+#endif
         return;
     }
     if (target == -1) {
+#if OUT_BF16
+        for (uint col = lane * 2u; col < p.cols; col += 128u)
+            store_pair(base + col, 0.0, 0.0);
+#else
         if (p.op == 0u || p.op == 3u) {
             if (lane == 0u) output_values[row] = 0.0;
         } else {
             for (uint col = lane; col < p.cols; col += 64u)
                 output_values[base + col] = 0.0;
         }
+#endif
         return;
     }
+#if !OUT_BF16
     if (p.op == 3u) {
-        if (lane == 0u) output_values[row] = -primary[base + uint(target)];
+        if (lane == 0u) output_values[row] = -primary_at(base + uint(target));
         return;
     }
     if (p.op == 4u) {
@@ -99,29 +156,44 @@ void main() {
             output_values[base + col] = col == uint(target) ? -dy * normalizer : 0.0;
         return;
     }
+#endif
     float largest = -uintBitsToFloat(0x7f800000u);
     for (uint col = lane; col < p.cols; col += 64u)
-        largest = max(largest, primary[base + col]);
+        largest = max(largest, primary_at(base + col));
     largest = max_workgroup(largest);
     float total = 0.0;
     for (uint col = lane; col < p.cols; col += 64u)
-        total += exp(primary[base + col] - largest);
+        total += exp(primary_at(base + col) - largest);
     total = sum_workgroup(total);
+#if !OUT_BF16
     if (p.op == 0u) {
         // Subtract the target before adding log(total): large equal logits must
         // retain log(class_count), rather than lose it in large-logit addition.
         if (lane == 0u) {
             // Parentheses alone permit driver reassociation. Keep the target
             // subtraction and final addition as distinct precise operations.
-            precise float loss = (largest - primary[base + uint(target)]) + log(total);
+            precise float loss = (largest - primary_at(base + uint(target))) + log(total);
             output_values[row] = loss;
         }
     } else {
         float dy = upstream[p.reduction == 0u ? row : 0u];
         for (uint col = lane; col < p.cols; col += 64u) {
-            float probability = exp(primary[base + col] - largest) / total;
+            float probability = exp(primary_at(base + col) - largest) / total;
             float indicator = col == uint(target) ? 1.0 : 0.0;
             output_values[base + col] = (probability - indicator) * dy * normalizer;
         }
     }
+#else
+    // the backward, two columns a lane: each value is the f32 module's own
+    // expression, rounded once in the store
+    float dy = upstream[p.reduction == 0u ? row : 0u];
+    for (uint col = lane * 2u; col < p.cols; col += 128u) {
+        float probability0 = exp(primary_at(base + col) - largest) / total;
+        float indicator0 = col == uint(target) ? 1.0 : 0.0;
+        float probability1 = exp(primary_at(base + col + 1u) - largest) / total;
+        float indicator1 = col + 1u == uint(target) ? 1.0 : 0.0;
+        store_pair(base + col, (probability0 - indicator0) * dy * normalizer,
+                   (probability1 - indicator1) * dy * normalizer);
+    }
+#endif
 }

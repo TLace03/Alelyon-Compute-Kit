@@ -21,7 +21,7 @@ import struct
 import tarfile
 import zipfile
 
-VERSION = "0.1.0a4"
+VERSION = "0.1.0a5"
 NAME = "alelyon_ai"
 TAG = "py3-none-win_amd64"
 INFO = f"{NAME}-{VERSION}.dist-info"
@@ -31,7 +31,7 @@ DLL = f"{KIT}/python/_lib/alelyon_compute_kit.dll"
 RECEIPT = f"{KIT}/python/_lib/BUILD.json"
 MAX_FILE = 32 * 1024 * 1024
 MAX_TOTAL = 128 * 1024 * 1024
-MAX_FILES = 256
+MAX_FILES = 1024
 RUST_VERSION = "1.97.1"
 # The exporter normalizes Cargo.lock line endings; notices bind that exact form.
 LOCK_SHA256 = "f7ce6708fcb5ead952c826cb635bf4af74f831cd9f65218300c6cbf325b578cf"

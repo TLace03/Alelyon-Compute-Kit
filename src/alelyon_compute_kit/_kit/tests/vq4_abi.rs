@@ -30,7 +30,9 @@ unsafe fn call(plan: *const u8, len: usize) -> i32 {
 #[test]
 fn optional_extension_does_not_relabel_existing_abi_layout() {
     assert_eq!(ffi::ack_vq_schema(), 1);
-    assert_eq!(ffi::ACK_ABI_VERSION, 10);
+    // 13 since ack_convert (2026-09-27); the vq extension itself has never
+    // moved the ABI, which is what this pins
+    assert_eq!(ffi::ACK_ABI_VERSION, 14);
     assert_eq!(ffi::VQ_PUSH_BYTES, 32);
 }
 

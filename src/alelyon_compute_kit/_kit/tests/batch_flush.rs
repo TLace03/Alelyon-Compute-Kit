@@ -345,6 +345,9 @@ fn descriptors_exhausted_flushes_and_the_retry_after_it_succeeds() {
     // depth itself nor the ramp's short first batches after the upload
     ctx.set_max_recorded_items(sets * 4);
     ctx.set_batch_ramp(false);
+    // the arena itself: with reuse on, a kernel whose bindings never change holds
+    // ONE set a batch and never exhausts it (the test below)
+    ctx.set_descriptor_reuse(false);
     let n = 1024u64;
     let src = ctx.buffer(n * 4).expect("src");
     let dst = ctx.buffer(n * 4).expect("dst");
@@ -383,7 +386,65 @@ fn descriptors_exhausted_flushes_and_the_retry_after_it_succeeds() {
     assert_eq!(from_bytes(&ctx.download(&dst).expect("download")), values);
     ctx.set_max_recorded_items(alelyon_compute_kit::batch::MAX_RECORDED_ITEMS);
     ctx.set_batch_ramp(true);
+    ctx.set_descriptor_reuse(true);
 
+    ctx.destroy_kernel(kernel);
+    ctx.destroy_buffer(src);
+    ctx.destroy_buffer(dst);
+}
+
+#[test]
+fn a_kernel_with_unchanged_bindings_reuses_its_set_until_it_is_rebound() {
+    // Descriptor-set reuse (2026-09-27): a dispatch whose kernel's bindings are
+    // unchanged since a set of the SAME batch generation was written reuses that
+    // set. So `sets + 3` dispatches of one kernel hold one set and never flush
+    // for exhaustion, the copy is still right, and a rebind takes a fresh set.
+    let Some(ctx) = open_or_unmeasured("descriptor reuse") else {
+        return;
+    };
+    let sets = ctx.sets_per_kernel_pool();
+    ctx.set_max_recorded_items(sets * 4 + 16);
+    ctx.set_batch_ramp(false);
+    ctx.set_descriptor_reuse(true);
+    let n = 1024u64;
+    let src = ctx.buffer(n * 4).expect("src");
+    let dst = ctx.buffer(n * 4).expect("dst");
+    let values: Vec<f32> = (0..n).map(|i| i as f32 * 0.25 - 3.0).collect();
+    ctx.upload(&src, &f32_bytes(&values)).expect("upload");
+    let kernel = pointwise_kernel(&ctx);
+    let shape = [n];
+    let (plan, push) = copy_plan(&shape, &src, contiguous(&shape), &dst);
+    let access = access_for(&src, &dst);
+    ctx.bind(&kernel, &[&src, &dst, &dst, &dst]).expect("bind");
+    let before = ctx.flushes_by_reason();
+    for _ in 0..sets + 3 {
+        ctx.dispatch(&kernel, &push, plan.dispatch_groups(), 1, &access)
+            .expect("record");
+    }
+    assert_eq!(
+        ctx.descriptor_watermark(&kernel),
+        1,
+        "one set held for the batch"
+    );
+    only(
+        before,
+        ctx.flushes_by_reason(),
+        FlushReason::DescriptorsExhausted,
+        0,
+    );
+    // a rebind (the same buffers) clears the reuse: the next dispatch writes a new set
+    ctx.bind(&kernel, &[&src, &dst, &dst, &dst])
+        .expect("rebind");
+    ctx.dispatch(&kernel, &push, plan.dispatch_groups(), 1, &access)
+        .expect("record after the rebind");
+    assert_eq!(
+        ctx.descriptor_watermark(&kernel),
+        2,
+        "the rebind took a fresh set"
+    );
+    assert_eq!(from_bytes(&ctx.download(&dst).expect("download")), values);
+    ctx.set_max_recorded_items(alelyon_compute_kit::batch::MAX_RECORDED_ITEMS);
+    ctx.set_batch_ramp(true);
     ctx.destroy_kernel(kernel);
     ctx.destroy_buffer(src);
     ctx.destroy_buffer(dst);

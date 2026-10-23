@@ -1,0 +1,171 @@
+#version 450
+// head-kl-ce-f16/v1 (2026-09-29), the FORWARD: for each row of an fp16 head
+// output `yp` (rows x cols, dense) and an fp32 per-column scale `h`, the
+// log-sum-exp of the logits z = yp * h over EVERY column, and over the columns
+// NOT among the row's top-k (`top`, rows x k int64), in one pass over `yp`.
+//
+// It is the sub-bit student's head loss (research/subbit_expert/moe/student.py,
+// `_FusedKlCeFunction`): its KL against the teacher's top-32 needs both sums.
+// Its eager reference forms the (rows x cols) fp32 logits, takes
+// torch.logsumexp over them, masks the top-k to -inf and takes it again: about
+// fifteen passes over (rows x cols) fp32 a direction. The per-row KL and CE
+// then take the reference's own formula on (rows, k) values, on the host side.
+//
+//   out[r]        = log(sum_c exp(z[r, c]))
+//   out[rows + r] = log(sum_{c not in top[r]} exp(z[r, c]))
+//
+// z[r, c] = f32(yp[r, c]) * h[c] is one correctly rounded product (`precise`),
+// the value the reference's `yp.to(h.dtype) * h` computes. The sums differ
+// from torch.logsumexp's only in order and in exp's own rounding. Each lane
+// keeps a running maximum and a sum rescaled when the maximum rises, and the
+// workgroup combines the lanes' pairs. The two sums keep SEPARATE maxima: the
+// top-k can carry all but ~1e-7 of a row's mass, and a non-top sum taken
+// against the row's overall maximum would underflow to zero there.
+//
+// A -inf logit adds nothing, as exp(-inf) is 0. A NaN logit makes both of its
+// row's sums NaN, as torch.logsumexp's are. A +inf logit makes a sum +inf. A
+// top-k id out of [0, cols) makes its row's two outputs NaN. The id is never
+// used as an address, and the host's own gather of the same ids then raises
+// through the index family's status word.
+//
+// One workgroup a row (the grid folds rows past 65,535 into y). The row is
+// walked in segments of SEGMENT_COLS columns; the row's top-k set inside the
+// segment is a bit mask of 4 KiB of shared memory, rebuilt for each segment
+// from the k ids.
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Yp { uint yp[]; };        // fp16 pairs
+layout(set = 0, binding = 1, std430) readonly buffer Scale { float h[]; };
+layout(set = 0, binding = 2, std430) readonly buffer Top { uint top[]; };      // int64 as (lo, hi)
+layout(set = 0, binding = 3, std430) writeonly buffer Out { float out_values[]; };
+
+// MIRRORS src/head_loss_ops.rs's HeadLsePlan::push_constants, word for word.
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;      // even
+    uint k;         // 1..256
+    uint groups_x;  // workgroups along x
+} p;
+
+const uint SEGMENT_COLS = 32768u;
+const uint SEGMENT_WORDS = 1024u;   // SEGMENT_COLS / 32
+const float NEG_INF = -1.0 / 0.0;
+const float POS_INF = 1.0 / 0.0;
+
+shared uint seg_bits[SEGMENT_WORDS];
+shared float red[256];
+shared uint flags;   // bit 0: a NaN logit in the row; bit 1: a top-k id out of range
+
+// f16 -> f32 bits, exact, in integers (convert.comp's own form)
+uint f16_to_f32(uint h16) {
+    uint sign = (h16 & 0x8000u) << 16u;
+    uint e = (h16 >> 10u) & 0x1Fu;
+    uint m = h16 & 0x3FFu;
+    if (e == 0x1Fu) return sign | 0x7F800000u | (m << 13u);
+    if (e == 0u) {
+        if (m == 0u) return sign;
+        uint t = uint(findMSB(m));
+        return sign | ((t + 103u) << 23u) | ((m << (23u - t)) & 0x7FFFFFu);
+    }
+    return sign | ((e + 112u) << 23u) | (m << 13u);
+}
+
+// one logit into a lane's running (maximum, rescaled sum)
+void accumulate(inout float m, inout float s, float z) {
+    if (z > m) {
+        s = s * exp(m - z) + 1.0;   // exp(-inf) is 0 while m is -inf, and when z is +inf
+        m = z;
+    } else if (z == m) {
+        s += 1.0;                   // equal values, +inf included (exp(inf - inf) is NaN)
+    } else if (z > NEG_INF) {
+        s += exp(z - m);            // -inf adds nothing; NaN compares false and is flagged apart
+    }
+}
+
+// the workgroup's log-sum-exp from every lane's (maximum, sum)
+float combine(float m, float s) {
+    uint lane = gl_LocalInvocationID.x;
+    red[lane] = m;
+    barrier();
+    [[unroll]] for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) red[lane] = max(red[lane], red[lane + stride]);
+        barrier();
+    }
+    float big = red[0];
+    barrier();
+    float scaled;
+    if (m == NEG_INF) scaled = 0.0;
+    else if (big == POS_INF) scaled = m == POS_INF ? s : 0.0;
+    else scaled = s * exp(m - big);
+    red[lane] = scaled;
+    barrier();
+    [[unroll]] for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) red[lane] += red[lane + stride];
+        barrier();
+    }
+    float total = red[0];
+    barrier();
+    if (big == NEG_INF || big == POS_INF) return big;
+    precise float lse = big + log(total);
+    return lse;
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * p.groups_x;
+    if (row >= p.rows) return;   // uniform over the workgroup
+    if (lane == 0u) flags = 0u;
+    barrier();
+    for (uint i = lane; i < p.k; i += 256u) {
+        uint at = 2u * (row * p.k + i);
+        if (top[at + 1u] != 0u || top[at] >= p.cols) atomicOr(flags, 2u);
+    }
+
+    float ma = NEG_INF;
+    float sa = 0.0;
+    float mt = NEG_INF;
+    float st = 0.0;
+    bool nan_seen = false;
+    uint half_cols = p.cols >> 1u;
+    uint base = row * half_cols;
+    for (uint seg = 0u; seg < p.cols; seg += SEGMENT_COLS) {
+        for (uint w = lane; w < SEGMENT_WORDS; w += 256u) seg_bits[w] = 0u;
+        barrier();
+        for (uint i = lane; i < p.k; i += 256u) {
+            uint at = 2u * (row * p.k + i);
+            uint id = top[at];
+            if (top[at + 1u] == 0u && id < p.cols && id >= seg && id - seg < SEGMENT_COLS) {
+                uint off = id - seg;
+                atomicOr(seg_bits[off >> 5u], 1u << (off & 31u));
+            }
+        }
+        barrier();
+        uint seg_end = min(p.cols, seg + SEGMENT_COLS) >> 1u;
+        for (uint j = (seg >> 1u) + lane; j < seg_end; j += 256u) {
+            uint w = yp[base + j];
+            uint c = j << 1u;
+            precise float z0 = uintBitsToFloat(f16_to_f32(w & 0xFFFFu)) * h[c];
+            precise float z1 = uintBitsToFloat(f16_to_f32(w >> 16u)) * h[c + 1u];
+            nan_seen = nan_seen || isnan(z0) || isnan(z1);
+            accumulate(ma, sa, z0);
+            accumulate(ma, sa, z1);
+            uint off = c - seg;   // even, so c and c + 1 share a mask word
+            uint bits = seg_bits[off >> 5u] >> (off & 31u);
+            if ((bits & 1u) == 0u) accumulate(mt, st, z0);
+            if ((bits & 2u) == 0u) accumulate(mt, st, z1);
+        }
+        barrier();   // every lane is done with this segment's mask before the next one clears it
+    }
+    if (nan_seen) atomicOr(flags, 1u);
+    float lse_all = combine(ma, sa);
+    float lse_rest = combine(mt, st);
+    barrier();
+    if (lane == 0u) {
+        float invalid = uintBitsToFloat(0x7FC00000u);
+        bool bad = flags != 0u;
+        out_values[row] = bad ? invalid : lse_all;
+        out_values[p.rows + row] = bad ? invalid : lse_rest;
+    }
+}

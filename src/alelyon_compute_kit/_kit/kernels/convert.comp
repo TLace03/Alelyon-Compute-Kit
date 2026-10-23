@@ -1,0 +1,644 @@
+#version 450
+// convert/v1 (2026-09-27): a dtype conversion over strided views of at most
+// four dimensions: out[c] = T_out(in[c]) for every coordinate c. It is the
+// kit's device path for torch's casts between the storage types the other
+// families do not pair (`_to_copy`, `copy_` across dtypes, `.half()`,
+// `.to(torch.int8)`...), and the widening and narrowing steps the torch
+// adapter composes around the f32 pointwise family for f16 and small-integer
+// operands. MEASURED 2026-09-27: 516 copy-dtype-pair refusals in one toy
+// stage-E step of the sub-bit student on the kit.
+//
+// STORAGE CODES (the index family's numbering, plus bool):
+//   0 f32  1 bf16  2 f16  3 i64  4 i32  5 i16  6 i8  7 u8  8 f64  9 bool
+//
+// THE ANSWER IS c10's, BIT FOR BIT, AND NO FLOAT INSTRUCTION COMPUTES IT.
+// Every conversion below works on the bits in 32-bit integer arithmetic, so
+// it does not depend on the device's float rounding, its denormal mode (a
+// Tesla T4 flushes f32 subnormals and cannot be asked not to) or on
+// shaderFloat64/shaderInt64, which the kit does not require. What c10 does,
+// and what this kernel therefore does:
+//   float -> float    through f32, as c10's Half and BFloat16 are built from
+//                     float: f64 -> f16 rounds twice (f64 -> f32 -> f16), as
+//                     torch's does. Round to nearest even at each step.
+//                     A NaN stays a NaN of the same sign. Its payload is NOT
+//                     one function of the input in torch itself (c10's scalar
+//                     f32 -> bf16 writes 0x7FC0 and its AVX2 path 0xFFFF;
+//                     c10's scalar f32 -> f16 writes sign | 0x7E00 and F16C
+//                     keeps the payload), so the kit picks: bf16 is
+//                     cast_f32_bf16.comp's (bits >> 16) | 0x40, which the
+//                     pointwise narrowing and the GEMM epilogue also use; f16
+//                     is sign | 0x7E00; f64 <-> f32 keeps the top payload bits
+//                     with the quiet bit set (x86's cvtsd2ss/cvtss2sd).
+//   int -> float      rounded to nearest even from the exact 64-bit value
+//                     (to f16/bf16 through f32, as c10 does).
+//   int -> int        two's complement truncation, or sign/zero extension.
+//   x -> bool         nonzero (a NaN is nonzero; -0.0 is not). bool -> x is 0/1.
+//   float -> int      NOT ADDRESSED: c10's static_cast is undefined behaviour
+//                     out of range, so there is no reference answer to match.
+//                     The host refuses it by name; a block that asks anyway
+//                     is poisoned (below).
+//
+// SUB-WORD OUTPUTS. Storage is addressed as 32-bit words, so two invocations
+// writing different bytes of one word would race. The planner picks one of
+// three ways for an output of 1 or 2 bytes:
+//   - DENSE (row-major, stride 1 innermost, at ANY element offset since
+//     2026-10-01; row-major in the output's own memory order, where the
+//     planner puts the dimensions since 2026-10-03, so a transposed output
+//     whose input has the same layout is one dense run): written a whole word
+//     per unit, 4 / bytes slots. The first and the last word, which the output
+//     may fill only partly, keep their other bytes: the one invocation that
+//     owns each reads and writes it. Until 2026-10-01 an output that did not
+//     start on a word boundary took the atomics below for every element.
+//   - WORD-EXCLUSIVE (F_EXCLUSIVE, 2026-10-01): any other output in which no
+//     two elements share a word -- every stride over an extent above 1 is a
+//     multiple of 4 / bytes, so every element sits at the same slot of a word
+//     of its own -- is written one element per unit with a plain
+//     read-modify-write of its word.
+//   - Otherwise (F_ATOMIC, schema 2, 2026-09-27: a view dense in no order of
+//     its dimensions, such as a slice of each row; until 2026-10-03 also a
+//     transposed view) one element per unit with an atomicAnd that clears the
+//     element's bytes and an atomicOr that sets them. Two invocations sharing a
+//     word touch disjoint bytes of it, so the two atomics of one never disturb
+//     the other's, in any order; core Vulkan has 32-bit integer atomics on
+//     storage buffers.
+// A 4- or 8-byte output may be any non-overlapping view, one element per unit.
+// A same-type copy writes a 2-byte element of the last two kinds on its own,
+// with neither the read-modify-write nor the atomics (SAME-TYPE COPIES below).
+//
+// WORK LAYOUT (2026-10-01). A workgroup of 256 invocations owns 1,024
+// consecutive units and takes them in four passes of 256, lane j at base + j
+// + 256 i, so one load instruction of a subgroup reads consecutive units: the
+// pointwise family's layout (kernels/pointwise_f32.comp). Until then each
+// invocation of a 64-lane workgroup took one unit, and a strided read cost up
+// to three times the pointwise family's (MEASURED on the RX 9070 XT: an int32
+// copy of a transposed 64 MiB view 3.19 ms here against 1.04 ms for the f32
+// copy of the same bytes there). An element's coordinates unravel only the
+// dimensions the view has: the planner pads the shape at the front (since
+// 2026-10-03 after putting the dimensions in the output's memory order and
+// merging those that compose in both views; src/convert_ops.rs), so a one- or
+// two-dimension view skips the divisions by its leading extents of 1.
+//
+// SAME-TYPE COPIES (2026-10-05). A conversion between a code and itself is the
+// identity on every bit pattern for the integer codes, f32 and f64, and those
+// are the codes the torch adapter's same-dtype bits copies plan (i16, i32, i64
+// or u8). Such a copy moves each element's bits as they are stored, through no
+// conversion routine. A dense 1- or 2-byte output reads a whole word's
+// elements and stores the word. A 2-byte element of an output that is not
+// dense is stored on its own with a 16-bit store, so its word takes neither
+// the read-modify-write nor the atomics above: Vulkan's memory locations are
+// bytes, and two stores to the two halves of one word do not conflict. Every
+// result is the routines' result; only the work changes. bf16, f16 and bool
+// keep the routines, which rewrite a NaN's payload (bf16, f16) or a nonzero
+// byte (bool).
+//
+// MEASURED on the RX 9070 XT (2026-10-05, driver 26.8.1): the kit's dispatch
+// timestamps, medians of 7 interleaved rounds of 10 dispatches, every arm's
+// output byte-checked at 4 and 64 MiB. The routines, not the memory traffic,
+// were what kept a bf16 bits copy slower here than on the pointwise route it
+// left in #1396: 16-bit stores alone changed nothing below 16 MiB, and issuing
+// every pass's loads before the stores was slower. With this path, a bf16 copy
+// into an odd element offset takes 10.6 / 17.5 / 26.2 / 53.1 us at 4 / 8 / 16
+// / 32 MiB (20.5 / 35.2 / 54.0 / 103.9 before; 16.2 / 29.6 / 44.2 / 86.7 on the
+// pointwise route). One into a stride-2 destination takes 16.9 / 28.4 / 43.8 /
+// 191.6 us (before 25.3 / 44.7 / 71.3 / 287.8; pointwise 17.8 / 30.0 / 46.2 /
+// 184.3). At 64 MiB the stride-2 copy is x1.10 slower than before (634.9
+// against 579.3 us, level with the pointwise route): once its bytes live in
+// DRAM, the word read-modify-write beats 16-bit stores.
+//
+// TRANSPOSED READS (F_TILED, 2026-10-03; this source compiled with -DTILED=1 as
+// convert_tiled.spv). A two-dimension view whose input runs along the output's
+// ROWS (input stride 1 on the row axis, a larger stride on the column axis)
+// into a dense row-major output used to read one element per unit with
+// consecutive units a whole input row apart, so every element read pulled a
+// cache line of its own. MEASURED on the RX 9070 XT (2026-10-03, the kit's
+// dispatch timestamps through ack_torch.device_time_by_op, medians of three):
+// an int8 -> fp16 copy of a 1002 x 151,936 transposed view (input strides 1
+// and 1002) into a dense tensor took 8.27 ms that way and 2.66 ms tiled. The
+// tiled module takes a 64 x 64 tile a workgroup: it reads the tile with
+// consecutive lanes on consecutive input elements, converts each element once
+// through the same integer routines as every other path (so its bits are
+// every other path's), keeps the results in shared memory, and writes the
+// tile's output rows whole words at a time with consecutive lanes on
+// consecutive words. It is a module of its own so that its 16.25 KiB of
+// shared memory does not lower the occupancy of every other conversion. The
+// planner takes it for a 1- to 4-byte input and output only, and for a 1- or
+// 2-byte output only when every output row starts on a word (an output offset
+// and a row length that are multiples of 4 / bytes), so no word is shared by
+// two tiles. Each module poisons a block whose flags are the other module's.
+//
+// POISON, DO NOT RETURN: a block that fails the diagnostic guards below (raw
+// ABI misuse; the C entry validates everything first) writes the all-ones
+// pattern where it would have written, so a drifted bound is loud.
+#extension GL_EXT_control_flow_attributes : enable
+#ifndef TILED
+// SAME-TYPE COPIES (below) read and write a 2-byte element on its own. The kit
+// requires storageBuffer16BitAccess and shaderInt16 at open (src/lib.rs), so
+// this adds no device requirement; the tiled module does not use it.
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#endif
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Src { uint src[]; };
+layout(std430, set = 0, binding = 1) buffer Out { uint outw[]; };
+#ifndef TILED
+// the same two bindings, 16 bits an element (SAME-TYPE COPIES)
+layout(std430, set = 0, binding = 0) readonly buffer Src16 { uint16_t srch[]; };
+layout(std430, set = 0, binding = 1) buffer Out16 { uint16_t outh[]; };
+#endif
+
+// 18 words (72 bytes), below the 128 bytes every Vulkan device offers. These
+// MIRROR src/convert_ops.rs's ConvertPlan::push_words, word for word.
+layout(push_constant) uniform Plan {
+    uint codes;         // input code in bits 0-3, output code in bits 4-7
+    uint flags;         // F_ATOMIC (bit 0) or F_EXCLUSIVE (bit 1), else 0; F_TILED (bit 2) alone in convert_tiled.spv
+    uint size0, size1, size2, size3;
+    uint in_off, in_st0, in_st1, in_st2, in_st3;
+    uint out_off, out_st0, out_st1, out_st2, out_st3;
+    uint units;         // invocations with work: output words (sub-word) or elements
+    uint n;             // elements: size0 * size1 * size2 * size3
+} p;
+
+const uint DT_F32 = 0u;
+const uint DT_BF16 = 1u;
+const uint DT_F16 = 2u;
+const uint DT_I64 = 3u;
+const uint DT_I32 = 4u;
+const uint DT_I16 = 5u;
+const uint DT_I8 = 6u;
+const uint DT_U8 = 7u;
+const uint DT_F64 = 8u;
+const uint DT_BOOL = 9u;
+const uint LAST_DT = 9u;
+
+const uint F_ATOMIC = 1u;      // a sub-word output whose words elements share: two atomics an element
+const uint F_EXCLUSIVE = 2u;   // a sub-word output with a word of its own per element: a plain read-modify-write
+const uint F_TILED = 4u;       // a transposed two-dimension read: convert_tiled.spv only (TRANSPOSED READS)
+const uint LANES = 256u;       // local_size_x
+const uint PASSES = 4u;        // units an invocation takes, LANES apart (WORK LAYOUT)
+
+// the bound the host plan enforces, mirrored (convert_ops.rs)
+const uint MAX_WORD = 2147483647u;   // every word index is below 2^31
+
+uint elem_bytes(uint dt) {
+    if (dt == DT_I64 || dt == DT_F64) return 8u;
+    if (dt == DT_F32 || dt == DT_I32) return 4u;
+    if (dt == DT_BF16 || dt == DT_F16 || dt == DT_I16) return 2u;
+    return 1u;
+}
+
+bool is_float(uint dt) { return dt == DT_F32 || dt == DT_BF16 || dt == DT_F16 || dt == DT_F64; }
+
+// ---- 64-bit values as (lo, hi) --------------------------------------------------
+
+uvec2 neg64(uvec2 v) {
+    uint lo = ~v.x + 1u;
+    return uvec2(lo, ~v.y + (lo == 0u ? 1u : 0u));
+}
+
+// v >> s for s in [0, 63]
+uvec2 shr64(uvec2 v, uint s) {
+    if (s == 0u) return v;
+    if (s >= 32u) return uvec2(v.y >> (s - 32u), 0u);
+    return uvec2((v.x >> s) | (v.y << (32u - s)), v.y >> s);
+}
+
+// v << s for s in [0, 63]
+uvec2 shl64(uvec2 v, uint s) {
+    if (s == 0u) return v;
+    if (s >= 32u) return uvec2(0u, v.x << (s - 32u));
+    return uvec2(v.x << s, (v.y << s) | (v.x >> (32u - s)));
+}
+
+// the low s bits of v, for s in [1, 63]
+uvec2 low64(uvec2 v, uint s) {
+    if (s >= 32u) return uvec2(v.x, s == 32u ? 0u : v.y & ((1u << (s - 32u)) - 1u));
+    return uvec2(v.x & ((1u << s) - 1u), 0u);
+}
+
+// -1, 0 or 1 as a compares with b (unsigned)
+int cmp64(uvec2 a, uvec2 b) {
+    if (a.y != b.y) return a.y < b.y ? -1 : 1;
+    if (a.x != b.x) return a.x < b.x ? -1 : 1;
+    return 0;
+}
+
+// Round the unsigned magnitude m (nonzero) to `bits` significant bits, to
+// nearest even. Returns the rounded significand q (bits wide, leading one set,
+// or 2^bits after a carry) and the position of m's leading one in `msb`.
+uvec2 round_sig(uvec2 m, uint bits, out uint msb) {
+    msb = m.y != 0u ? 32u + uint(findMSB(m.y)) : uint(findMSB(m.x));
+    if (msb < bits) return shl64(m, bits - 1u - msb);
+    uint s = msb - (bits - 1u);           // 1..63
+    uvec2 q = shr64(m, s);
+    uvec2 rem = low64(m, s);
+    uvec2 half_ulp = shl64(uvec2(1u, 0u), s - 1u);
+    int c = cmp64(rem, half_ulp);
+    if (c > 0 || (c == 0 && (q.x & 1u) != 0u)) {
+        q.x += 1u;
+        if (q.x == 0u) q.y += 1u;
+    }
+    return q;
+}
+
+// ---- conversions, on bits -----------------------------------------------------
+
+float bf16_to_f32(uint h) { return uintBitsToFloat(h << 16u); }
+
+// cast_f32_bf16.comp's rounding, bit for bit (the pointwise narrowing and the
+// GEMM bf16-out epilogue copy the same function)
+uint f32_to_bf16(uint bits) {
+    if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu) != 0u) {
+        return (bits >> 16u) | 0x0040u;   // quiet NaN, sign and top payload kept
+    }
+    uint lsb = (bits >> 16u) & 1u;
+    return (bits + 0x7FFFu + lsb) >> 16u;
+}
+
+// f16 -> f32 bits, exact, in integers (the index family's form, without its
+// float multiply for a subnormal)
+uint f16_to_f32(uint h) {
+    uint sign = (h & 0x8000u) << 16u;
+    uint e = (h >> 10u) & 0x1Fu;
+    uint m = h & 0x3FFu;
+    if (e == 0x1Fu) return sign | 0x7F800000u | (m << 13u);
+    if (e == 0u) {
+        if (m == 0u) return sign;
+        // m * 2^-24 with m's leading one at bit t: 2^(t-24) * (m / 2^t)
+        uint t = uint(findMSB(m));
+        return sign | ((t + 103u) << 23u) | (((m << (23u - t)) & 0x7FFFFFu));
+    }
+    return sign | ((e + 112u) << 23u) | (m << 13u);
+}
+
+// f32 bits -> f16, round to nearest even; NaN -> sign | 0x7E00, as c10 writes it
+uint f32_to_f16(uint w) {
+    uint sign = (w >> 16u) & 0x8000u;
+    uint e = (w >> 23u) & 0xFFu;
+    uint m = w & 0x7FFFFFu;
+    if (e == 0xFFu) return sign | (m != 0u ? 0x7E00u : 0x7C00u);
+    int he = int(e) - 112;
+    if (he >= 31) return sign | 0x7C00u;
+    if (he <= 0) {
+        if (he < -10) return sign;
+        uint mf = m | 0x800000u;
+        uint shift = uint(14 - he);          // 14..24
+        uint q = mf >> shift;
+        uint rem = mf & ((1u << shift) - 1u);
+        uint half_ulp = 1u << (shift - 1u);
+        if (rem > half_ulp || (rem == half_ulp && (q & 1u) != 0u)) q += 1u;
+        return sign | q;                     // q == 0x400 is the smallest normal: still exact
+    }
+    uint h = (uint(he) << 10u) | (m >> 13u);
+    uint rem = m & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u) != 0u)) h += 1u;   // a carry reaches inf correctly
+    return sign | h;
+}
+
+// f64 (lo, hi) -> f32 bits, round to nearest even (x86's cvtsd2ss)
+uint f64_to_f32(uvec2 d) {
+    uint sign = d.y & 0x80000000u;
+    uint e = (d.y >> 20u) & 0x7FFu;
+    uvec2 m = uvec2(d.x, d.y & 0xFFFFFu);
+    if (e == 0x7FFu) {
+        if (m.x == 0u && m.y == 0u) return sign | 0x7F800000u;
+        return sign | 0x7FC00000u | shr64(m, 29u).x;      // quiet, top payload bits kept
+    }
+    if (e == 0u) return sign;                // zero, or an f64 subnormal: far below 2^-150
+    int fe = int(e) - 896;                   // the f32 biased exponent if normal
+    if (fe >= 255) return sign | 0x7F800000u;
+    uvec2 sig = uvec2(m.x, m.y | 0x100000u); // 53 bits, value = sig * 2^(e - 1075)
+    if (fe >= 1) {
+        uint h = (uint(fe) << 23u) | shr64(sig, 29u).x & 0x7FFFFFu;
+        uvec2 rem = low64(sig, 29u);
+        int c = cmp64(rem, uvec2(0x10000000u, 0u));
+        if (c > 0 || (c == 0 && (h & 1u) != 0u)) h += 1u;   // a carry reaches inf correctly
+        return sign | h;
+    }
+    // an f32 subnormal (or zero): the result is sig * 2^(e - 1075) in units of
+    // 2^-149, i.e. sig >> s with s = 926 - e (>= 30); round to nearest even
+    uint s = uint(926 - int(e));
+    if (s > 54u) return sign;                // below half the smallest subnormal
+    uvec2 q = shr64(sig, s);
+    uvec2 rem = low64(sig, s);
+    uvec2 half_ulp = shl64(uvec2(1u, 0u), s - 1u);
+    int c = cmp64(rem, half_ulp);
+    uint r = q.x;
+    if (c > 0 || (c == 0 && (r & 1u) != 0u)) r += 1u;       // 0x800000 is the smallest normal: exact
+    return sign | r;
+}
+
+// f32 bits -> f64 (lo, hi), exact (x86's cvtss2sd: a NaN gets the quiet bit)
+uvec2 f32_to_f64(uint w) {
+    uint sign = w & 0x80000000u;
+    uint e = (w >> 23u) & 0xFFu;
+    uint m = w & 0x7FFFFFu;
+    if (e == 0xFFu) {
+        if (m == 0u) return uvec2(0u, sign | 0x7FF00000u);
+        uvec2 pm = shl64(uvec2(m | 0x400000u, 0u), 29u);
+        return uvec2(pm.x, sign | 0x7FF00000u | pm.y);
+    }
+    if (e == 0u) {
+        if (m == 0u) return uvec2(0u, sign);
+        uint t = uint(findMSB(m));           // value = 2^(t - 149) * (m / 2^t)
+        uvec2 pm = shl64(uvec2(m & ((1u << t) - 1u), 0u), 52u - t);
+        return uvec2(pm.x, sign | ((t + 874u) << 20u) | pm.y);
+    }
+    uvec2 pm = shl64(uvec2(m, 0u), 29u);
+    return uvec2(pm.x, sign | ((e + 896u) << 20u) | pm.y);
+}
+
+// signed 64-bit (lo, hi) -> f32 bits, round to nearest even
+uint i64_to_f32(uvec2 v) {
+    if (v.x == 0u && v.y == 0u) return 0u;
+    uint sign = v.y & 0x80000000u;
+    uvec2 m = sign != 0u ? neg64(v) : v;     // |INT64_MIN| = 2^63 fits unsigned
+    uint msb;
+    uvec2 q = round_sig(m, 24u, msb);
+    if (q.x == 0x1000000u) {                 // the rounding carried into a new bit
+        q.x = 0x800000u;
+        msb += 1u;
+    }
+    return sign | ((msb + 127u) << 23u) | (q.x & 0x7FFFFFu);
+}
+
+// signed 64-bit (lo, hi) -> f64 (lo, hi), round to nearest even
+uvec2 i64_to_f64(uvec2 v) {
+    if (v.x == 0u && v.y == 0u) return uvec2(0u);
+    uint sign = v.y & 0x80000000u;
+    uvec2 m = sign != 0u ? neg64(v) : v;
+    uint msb;
+    uvec2 q = round_sig(m, 53u, msb);
+    if (q.y == 0x200000u) {                  // 2^53 after a carry
+        q = uvec2(0u, 0x100000u);
+        msb += 1u;
+    }
+    return uvec2(q.x, sign | ((msb + 1023u) << 20u) | (q.y & 0xFFFFFu));
+}
+
+// ---- load and store ------------------------------------------------------------
+
+uvec2 src_elem(uint e, uint es) {
+    if (es == 4u) return uvec2(src[e], 0u);
+    if (es == 8u) return uvec2(src[2u * e], src[2u * e + 1u]);
+    if (es == 2u) return uvec2((src[e >> 1u] >> ((e & 1u) * 16u)) & 0xFFFFu, 0u);
+    return uvec2((src[e >> 2u] >> ((e & 3u) * 8u)) & 0xFFu, 0u);
+}
+
+// A loaded value in one of three canonical forms: kind 0 f32 bits in .x,
+// kind 1 f64 (lo, hi), kind 2 a signed 64-bit integer (lo, hi).
+struct Value { uint kind; uvec2 v; };
+
+Value load_value(uint dt, uvec2 raw) {
+    Value r;
+    if (dt == DT_F32) { r.kind = 0u; r.v = uvec2(raw.x, 0u); }
+    else if (dt == DT_BF16) { r.kind = 0u; r.v = uvec2(raw.x << 16u, 0u); }
+    else if (dt == DT_F16) { r.kind = 0u; r.v = uvec2(f16_to_f32(raw.x), 0u); }
+    else if (dt == DT_F64) { r.kind = 1u; r.v = raw; }
+    else if (dt == DT_I64) { r.kind = 2u; r.v = raw; }
+    else if (dt == DT_I32) { r.kind = 2u; r.v = uvec2(raw.x, (raw.x & 0x80000000u) != 0u ? 0xFFFFFFFFu : 0u); }
+    else if (dt == DT_I16) {
+        uint x = (raw.x & 0x8000u) != 0u ? raw.x | 0xFFFF0000u : raw.x;
+        r.kind = 2u; r.v = uvec2(x, (x & 0x80000000u) != 0u ? 0xFFFFFFFFu : 0u);
+    } else if (dt == DT_I8) {
+        uint x = (raw.x & 0x80u) != 0u ? raw.x | 0xFFFFFF00u : raw.x;
+        r.kind = 2u; r.v = uvec2(x, (x & 0x80000000u) != 0u ? 0xFFFFFFFFu : 0u);
+    } else if (dt == DT_BOOL) { r.kind = 2u; r.v = uvec2(raw.x != 0u ? 1u : 0u, 0u); }
+    else { r.kind = 2u; r.v = uvec2(raw.x, 0u); }   // u8
+    return r;
+}
+
+// The output code's bits for a value (float -> int never reaches here).
+uvec2 store_bits(uint dt, Value x) {
+    if (dt == DT_BOOL) {
+        if (x.kind == 0u) return uvec2((x.v.x & 0x7FFFFFFFu) != 0u ? 1u : 0u, 0u);
+        if (x.kind == 1u) return uvec2(((x.v.y & 0x7FFFFFFFu) | x.v.x) != 0u ? 1u : 0u, 0u);
+        return uvec2((x.v.x | x.v.y) != 0u ? 1u : 0u, 0u);
+    }
+    if (dt == DT_F64) {
+        if (x.kind == 1u) return x.v;
+        if (x.kind == 0u) return f32_to_f64(x.v.x);
+        return i64_to_f64(x.v);
+    }
+    if (is_float(dt)) {
+        uint f = x.kind == 0u ? x.v.x : x.kind == 1u ? f64_to_f32(x.v) : i64_to_f32(x.v);
+        if (dt == DT_F32) return uvec2(f, 0u);
+        if (dt == DT_BF16) return uvec2(f32_to_bf16(f), 0u);
+        return uvec2(f32_to_f16(f), 0u);
+    }
+    // integer out, integer in: two's complement truncation
+    if (dt == DT_I64) return x.v;
+    if (dt == DT_I32) return uvec2(x.v.x, 0u);
+    if (dt == DT_I16) return uvec2(x.v.x & 0xFFFFu, 0u);
+    return uvec2(x.v.x & 0xFFu, 0u);          // i8 and u8
+}
+
+// ---- coordinates --------------------------------------------------------------
+
+uvec4 coords_of(uint l) {
+    // the planner pads the shape at the front: a one- or two-dimension view has leading extents of 1, and these
+    // branches are uniform, every invocation of the dispatch takes the same one (WORK LAYOUT)
+    if (p.size0 == 1u && p.size1 == 1u) {
+        if (p.size2 == 1u) return uvec4(0u, 0u, 0u, l);
+        return uvec4(0u, 0u, l / p.size3, l % p.size3);
+    }
+    uvec4 c;
+    c.w = l % p.size3; l /= p.size3;
+    c.z = l % p.size2; l /= p.size2;
+    c.y = l % p.size1; l /= p.size1;
+    c.x = l;
+    return c;
+}
+
+uint in_addr(uvec4 c) { return p.in_off + c.x * p.in_st0 + c.y * p.in_st1 + c.z * p.in_st2 + c.w * p.in_st3; }
+uint out_addr(uvec4 c) { return p.out_off + c.x * p.out_st0 + c.y * p.out_st1 + c.z * p.out_st2 + c.w * p.out_st3; }
+
+uvec2 converted_at(uvec4 c, uint in_code, uint in_es, uint out_code) {
+    return store_bits(out_code, load_value(in_code, src_elem(in_addr(c), in_es)));
+}
+
+uvec2 converted(uint l, uint in_code, uint in_es, uint out_code) {
+    return converted_at(coords_of(l), in_code, in_es, out_code);
+}
+
+#ifdef TILED
+// ---- TRANSPOSED READS (convert_tiled.spv) ---------------------------------------
+
+const uint TILE = 64u;          // a workgroup's tile is TILE x TILE elements of the view
+const uint TILE_PITCH = 65u;    // one padding word a tile column: the store pass reads across banks
+shared uint tile[TILE * TILE_PITCH];   // tile[c * TILE_PITCH + r]: element (r0 + r, c0 + c), converted
+
+void main() {
+    uint in_code = p.codes & 0xFu;
+    uint out_code = (p.codes >> 4u) & 0xFu;
+    uint in_es = elem_bytes(in_code);
+    uint out_es = elem_bytes(out_code);
+    uint per = out_es < 4u ? 4u / out_es : 1u;   // output elements a word
+    uint rows = p.size2;
+    uint cols = p.size3;
+    // the planner's conditions, mirrored (convert_ops.rs): F_TILED alone, a two-dimension view, 1- to 4-byte
+    // elements, the input at stride 1 along the rows, a dense row-major output whose rows start on a word
+    bool bad = in_code > LAST_DT || out_code > LAST_DT || (p.codes >> 8u) != 0u || p.flags != F_TILED
+            || in_es > 4u || out_es > 4u
+            || p.size0 != 1u || p.size1 != 1u || rows == 0u || cols == 0u || cols > MAX_WORD / rows
+            || p.n != rows * cols || p.units != p.n
+            || p.in_st2 != 1u || p.out_st3 != 1u || p.out_st2 != cols
+            || (out_es < 4u && (p.out_off % per != 0u || cols % per != 0u))
+            || (is_float(in_code) && !is_float(out_code) && out_code != DT_BOOL);
+    uint r0 = gl_WorkGroupID.y * TILE;
+    uint c0 = gl_WorkGroupID.x * TILE;
+    uint lane = gl_LocalInvocationID.x;
+    // LOAD: consecutive lanes take consecutive rows of one tile column, which are consecutive input elements
+    if (!bad) {
+        // NOT unrolled: each pass inlines the whole integer conversion, and sixteen copies of it
+        // quadrupled the module (340,720 bytes against 78,484)
+        for (uint k = 0u; k < (TILE * TILE) / LANES; ++k) {
+            uint idx = lane + k * LANES;
+            uint r = idx % TILE;
+            uint c = idx / TILE;
+            if (r0 + r < rows && c0 + c < cols) {
+                uint e = p.in_off + (r0 + r) + (c0 + c) * p.in_st3;
+                tile[c * TILE_PITCH + r] = store_bits(out_code, load_value(in_code, src_elem(e, in_es))).x;
+            }
+        }
+    }
+    barrier();
+    // STORE: consecutive lanes take consecutive words of one output row. A row holds whole words only (the
+    // planner's alignment), so every word this tile writes is its alone.
+    uint words_a_row = TILE / per;
+    uint mask = out_es < 4u ? (1u << (out_es * 8u)) - 1u : 0xFFFFFFFFu;
+    for (uint k = 0u; k < (TILE * words_a_row) / LANES; ++k) {
+        uint idx = lane + k * LANES;
+        uint r = idx / words_a_row;
+        uint c = (idx % words_a_row) * per;
+        if (r0 + r >= rows || c0 + c >= cols) continue;
+        uint word = (p.out_off + (r0 + r) * cols + c0 + c) / per;
+        if (bad) {
+            if (word < uint(outw.length())) outw[word] = 0xFFFFFFFFu;
+            continue;
+        }
+        uint w = 0u;
+        [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+            if (j < per) w |= (tile[(c + j) * TILE_PITCH + r] & mask) << (j * out_es * 8u);
+        }
+        outw[word] = w;
+    }
+}
+
+#else
+
+void main() {
+    // WORK LAYOUT: this invocation's units are base, base + 256, base + 512 and base + 768
+    uint group = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint base = group * (LANES * PASSES) + gl_LocalInvocationID.x;
+    if (base >= p.units) return;
+    uint in_code = p.codes & 0xFu;
+    uint out_code = (p.codes >> 4u) & 0xFu;
+    uint in_es = elem_bytes(in_code);
+    uint out_es = elem_bytes(out_code);
+    bool atomic = (p.flags & F_ATOMIC) != 0u;
+    bool exclusive = (p.flags & F_EXCLUSIVE) != 0u;
+    // a dense sub-word output's slots per word, and those of its first word before its first element
+    uint per = out_es < 4u ? 4u / out_es : 1u;
+    uint lead = p.out_off % per;
+    // SAME-TYPE COPIES: a code whose own conversion is the identity on every bit pattern moves its bits as they are
+    // stored, through no conversion routine. bf16, f16 and bool are not among them: their routines rewrite a NaN's
+    // payload or a nonzero byte, so they keep that path and its answers.
+    bool same = in_code == out_code && in_code != DT_BF16 && in_code != DT_F16 && in_code != DT_BOOL;
+    // Diagnostic guards for raw-ABI misuse. DIVIDE, DO NOT MULTIPLY: the element
+    // count is checked against the word limit without forming a product that wraps.
+    bool bad = in_code > LAST_DT || out_code > LAST_DT || (p.codes >> 8u) != 0u
+            || (p.flags & ~(F_ATOMIC | F_EXCLUSIVE)) != 0u || (atomic && exclusive)
+            || ((atomic || exclusive) && (out_es >= 4u || p.units != p.n))
+            // a word of its own per element: every stride over an extent above 1 a multiple of the slots
+            || (exclusive && ((p.size0 > 1u && p.out_st0 % per != 0u) || (p.size1 > 1u && p.out_st1 % per != 0u)
+                              || (p.size2 > 1u && p.out_st2 % per != 0u) || (p.size3 > 1u && p.out_st3 % per != 0u)))
+            || p.size0 == 0u || p.size1 == 0u || p.size2 == 0u || p.size3 == 0u
+            || p.size1 > MAX_WORD / p.size0 || p.size2 > MAX_WORD / (p.size0 * p.size1)
+            || p.size3 > MAX_WORD / (p.size0 * p.size1 * p.size2)
+            || p.n != p.size0 * p.size1 * p.size2 * p.size3
+            || (is_float(in_code) && !is_float(out_code) && out_code != DT_BOOL)
+            || (out_es >= 4u && p.units != p.n)
+            || (out_es < 4u && !atomic && !exclusive
+                && (p.out_st3 != 1u || p.out_st2 != p.size3 || p.out_st1 != p.size2 * p.size3
+                    || p.out_st0 != p.size1 * p.size2 * p.size3 || p.units != (lead + p.n + per - 1u) / per));
+    for (uint pass = 0u; pass < PASSES; ++pass) {
+        uint gid = base + pass * LANES;
+        if (gid >= p.units) break;
+        if (bad) {
+            if (gid < uint(outw.length())) outw[gid] = 0xFFFFFFFFu;
+            continue;
+        }
+        if (out_es >= 4u) {
+            uvec4 c = coords_of(gid);
+            uvec2 v = same ? src_elem(in_addr(c), in_es) : converted_at(c, in_code, in_es, out_code);
+            uint e = out_addr(c);
+            if (out_es == 4u) {
+                outw[e] = v.x;
+            } else {
+                outw[2u * e] = v.x;
+                outw[2u * e + 1u] = v.y;
+            }
+            continue;
+        }
+        if (atomic || exclusive) {
+            // one element of a sub-word output that is not dense
+            uvec4 c = coords_of(gid);
+            uint e = out_addr(c);
+            if (same && out_es == 2u) {
+                // SAME-TYPE COPIES: the element's 16 bits, stored on their own; no other byte of the word is read or
+                // written, so the word needs neither a read-modify-write nor atomics
+                outh[e] = srch[in_addr(c)];
+                continue;
+            }
+            uint bits = same ? src_elem(in_addr(c), in_es).x : converted_at(c, in_code, in_es, out_code).x;
+            uint shift = (e % per) * out_es * 8u;
+            uint mask = ((1u << (out_es * 8u)) - 1u) << shift;
+            uint word = e / per;
+            if (atomic) {
+                // other elements share this word: clear the element's bytes, then set them
+                atomicAnd(outw[word], ~mask);
+                atomicOr(outw[word], (bits << shift) & mask);
+            } else {
+                // no other element of the output is in this word
+                outw[word] = (outw[word] & ~mask) | ((bits << shift) & mask);
+            }
+            continue;
+        }
+        // a dense sub-word output: this invocation owns output word `word`, whose slot j holds linear element
+        // t0 + j - lead when that lies in [0, n); the first and the last word may hold fewer, and keep their other
+        // bytes
+        uint word = p.out_off / per + gid;
+        uint t0 = gid * per;
+        bool partial = t0 < lead || t0 + per > lead + p.n;
+        if (same && !partial) {
+            // SAME-TYPE COPIES: a whole word, linear elements t0 - lead onwards, each read as it is stored
+            uint l0 = t0 - lead;
+            uint whole;
+            if (out_es == 2u) {
+                whole = uint(srch[in_addr(coords_of(l0))]) | (uint(srch[in_addr(coords_of(l0 + 1u))]) << 16u);
+            } else {
+                whole = 0u;
+                [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+                    whole |= src_elem(in_addr(coords_of(l0 + j)), 1u).x << (8u * j);
+                }
+            }
+            outw[word] = whole;
+            continue;
+        }
+        uint w = partial ? outw[word] : 0u;
+        [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+            uint t = t0 + j;
+            if (j >= per || t < lead || t >= lead + p.n) continue;
+            uint l = t - lead;
+            uint bits = !same ? converted(l, in_code, in_es, out_code).x
+                      : out_es == 2u ? uint(srch[in_addr(coords_of(l))]) : src_elem(in_addr(coords_of(l)), in_es).x;
+            uint shift = j * out_es * 8u;
+            uint mask = ((1u << (out_es * 8u)) - 1u) << shift;
+            w = (w & ~mask) | ((bits << shift) & mask);
+        }
+        outw[word] = w;
+    }
+}
+#endif

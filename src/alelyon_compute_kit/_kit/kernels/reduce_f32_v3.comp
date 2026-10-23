@@ -1,0 +1,187 @@
+#version 450
+// ACK reduce-f32/v3 (2026-09-26): the fixed-order reduction of a strided FP32
+// view whose REDUCED index space is one contiguous unit-stride span, with
+// several short rows per workgroup (or, for a long row or a small problem,
+// up to all 256 lanes on one row). v1 (reduce_f32.comp) gives every output
+// its own 256-lane workgroup and decomposes every element's index over the
+// reduced dims; for the AKV pass's normalisation statistics -- amax and mean
+// over a last dim of 16, 48, 64 or 512 -- that is 240 idle lanes of 256 on a
+// 16-wide row, a div/mod chain per element, and an eight-round shared-memory
+// tree per row. Measured 2026-09-26 on an RX 9070 XT: 63 us per call against
+// ROCm's 11 us.
+//
+// Here a row is one (kept index, split) pair and owns `lanes` consecutive
+// lanes (a power of two, 1..=256); a workgroup holds 256 / lanes rows. The
+// row's base address is decomposed once, over the KEPT dims only; the reduced
+// index r then addresses base + r, because the host plan (src/reduce_ops.rs)
+// selects this kernel only when the reduced dims form one dense row-major
+// span of unit stride, and it validates every address against the bound
+// input. The guards here are diagnostics against raw misuse, not the contract.
+//
+// THE ORDER OF COMBINATION IS A FUNCTION OF THE PLAN ALONE: lane j of a row
+// accumulates r = start + j, start + j + lanes, ... in increasing order; the
+// lanes are then combined by a fixed tree, pairing lane j with j + s for
+// s = lanes/2, lanes/4, ..., 1. Two dispatches of one plan are bit-identical.
+// It is a different order from v1's and v2's, inside the family's declared
+// tolerance and not bitwise equal to them.
+//
+// Split law: a row covers reduced indices [split * chunk, min((split + 1) *
+// chunk, reduced_count)). With splits == 1 a row is the whole span and the
+// finish is applied here; with splits > 1 the output is f32 PARTIALS laid out
+// [kept, splits], which a second pass combines.
+//
+// op:     0 sum, 1 amax (NaN-propagating), 2 sum of squares,
+//         3 max of |x| (NaN-propagating; linalg_vector_norm with ord=inf), taken
+//           as an INTEGER max of the sign-cleared bits: non-negative floats order
+//           as their bits do, and a float max may flush a subnormal (measured on
+//           the RX 9070 XT 2026-09-27: a row of negative subnormals gave 0)
+// finish: 0 none, 1 multiply by scale, 2 square root (applied after combining)
+// grid:   x * y workgroups (y only when the row groups exceed 65,535),
+//         linearised as y * num_x + x
+// STORAGE: DT_IN and DT_OUT as in v1 and v2 (0 f32, 1 bf16); every
+// accumulation runs in f32.
+#ifndef DT_IN
+#define DT_IN 0
+#endif
+#ifndef DT_OUT
+#define DT_OUT 0
+#endif
+#if DT_IN || DT_OUT
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#endif
+layout(local_size_x = 256) in;
+#if DT_IN
+layout(set = 0, binding = 0, std430) readonly buffer Input { uint16_t input_values[]; };
+#else
+layout(set = 0, binding = 0, std430) readonly buffer Input { float input_values[]; };
+#endif
+#if DT_OUT
+layout(set = 0, binding = 1, std430) writeonly buffer Output { uint16_t output_values[]; };
+#else
+layout(set = 0, binding = 1, std430) writeonly buffer Output { float output_values[]; };
+#endif
+#if DT_IN
+float widen(uint16_t bits) { return uintBitsToFloat(uint(bits) << 16); }
+#define LOAD_IN(i) widen(input_values[i])
+#else
+#define LOAD_IN(i) input_values[i]
+#endif
+#if DT_OUT
+uint16_t narrow(float x) {
+    const uint bits = floatBitsToUint(x);
+    if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu) != 0u) {
+        return uint16_t((bits >> 16) | 0x0040u);   // quiet NaN
+    }
+    const uint lsb = (bits >> 16) & 1u;
+    return uint16_t((bits + 0x7FFFu + lsb) >> 16);
+}
+#define STORE_OUT(i, v) output_values[i] = narrow(v)
+#else
+#define STORE_OUT(i, v) output_values[i] = (v)
+#endif
+layout(push_constant) uniform Push {
+    uint op;
+    uint finish;
+    uint ndim;
+    uint reduced_mask;
+    uint shape[6];
+    uint stride[6];
+    uint in_offset;
+    uint splits;
+    uint chunk;
+    uint scale_bits;
+    uint lanes;          // lanes per row: a power of two in 1..=256
+    uint kept_count;     // product of the kept extents
+    uint reduced_count;  // product of the reduced extents (the span length)
+    uint reserved;       // zero
+} p;
+shared float partial[256];
+shared uint nan_seen[256];
+const uint NAN_BITS = 0x7fc00000u;
+const uint NEG_INF_BITS = 0xff800000u;
+// Combine two partials of one reduction: a sum, amax's float max, or op 3's
+// integer max on magnitudes' bits (see the op table above).
+float combine(uint op, float a, float b) {
+    if (op == 3u) return uintBitsToFloat(max(floatBitsToUint(a), floatBitsToUint(b)));
+    return op == 1u ? max(a, b) : a + b;
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint group = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    // Uniform diagnostics: an invalid plan cannot masquerade as a computed value.
+    bool invalid = p.op > 3u || p.finish > 2u || p.ndim == 0u || p.ndim > 6u ||
+                   p.splits == 0u || p.chunk == 0u || p.reduced_mask == 0u ||
+                   (p.reduced_mask >> p.ndim) != 0u || p.lanes == 0u || p.lanes > 256u ||
+                   (p.lanes & (p.lanes - 1u)) != 0u || p.kept_count == 0u ||
+                   p.reduced_count == 0u || p.reserved != 0u;
+    if (invalid) {
+        if (lane == 0u && group == 0u && output_values.length() > 0) STORE_OUT(0, uintBitsToFloat(NAN_BITS));
+        return;
+    }
+    uint lanes = p.lanes;
+    uint rows_per_group = 256u / lanes;
+    uint j = lane & (lanes - 1u);
+    uint row = group * rows_per_group + lane / lanes;
+    uint rows = p.kept_count * p.splits;
+    bool live = row < rows && row < uint(output_values.length());
+    uint kept = row / p.splits;
+    uint split = row - kept * p.splits;
+
+    bool max_op = p.op == 1u || p.op == 3u;
+    // op 3 starts from +0: its values are magnitudes, and -inf's bits would win an integer max
+    float acc = p.op == 1u ? uintBitsToFloat(NEG_INF_BITS) : 0.0;
+    uint saw_nan = 0u;
+    if (live) {
+        // The row's base: the kept index decomposed over the kept dims only
+        // (row-major, original order); the reduced span starts there.
+        uint base = p.in_offset;
+        uint rem = kept;
+        for (int d = int(p.ndim) - 1; d >= 0; --d) {
+            if ((p.reduced_mask & (1u << uint(d))) == 0u) {
+                uint extent = p.shape[d];
+                uint idx = rem % extent;
+                rem /= extent;
+                base += idx * p.stride[d];
+            }
+        }
+        uint start = split * p.chunk;
+        uint stop = min(start + p.chunk, p.reduced_count);
+        for (uint r = start + j; r < stop; r += lanes) {
+            float v = LOAD_IN(base + r);
+            if (p.op == 0u) {
+                acc += v;
+            } else if (p.op == 1u) {
+                if (v != v) saw_nan = 1u;
+                acc = max(acc, v);
+            } else if (p.op == 3u) {
+                // |v| by clearing the sign bit, and the max on the bits: no float
+                // instruction sees a subnormal it could flush (the exact-bit rule)
+                if (v != v) saw_nan = 1u;
+                acc = uintBitsToFloat(max(floatBitsToUint(acc), floatBitsToUint(v) & 0x7FFFFFFFu));
+            } else {
+                acc += v * v;
+            }
+        }
+    }
+    partial[lane] = acc;
+    nan_seen[lane] = saw_nan;
+    barrier();
+    // The fixed tree over the row's lanes. Every row of the workgroup has the
+    // same `lanes`, so the trip count and every barrier are uniform.
+    for (uint s = lanes >> 1u; s > 0u; s >>= 1u) {
+        if (j < s) {
+            partial[lane] = combine(p.op, partial[lane], partial[lane + s]);
+            nan_seen[lane] |= nan_seen[lane + s];
+        }
+        barrier();
+    }
+    if (live && j == 0u) {
+        float result = partial[lane];
+        if (max_op && nan_seen[lane] != 0u) result = uintBitsToFloat(NAN_BITS);
+        if (p.finish == 1u) result *= uintBitsToFloat(p.scale_bits);
+        else if (p.finish == 2u) result = sqrt(result);
+        STORE_OUT(row, result);
+    }
+}
