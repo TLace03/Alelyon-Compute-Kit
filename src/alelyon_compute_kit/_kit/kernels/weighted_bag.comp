@@ -1,0 +1,154 @@
+#version 450
+// weighted-bag/v1: the weighted sum of gathered table rows, and its two gradients, in FP32.
+//
+//   out[r, c] = sum_{s < k} w[r, s] * table[idx[r, s], c]
+//
+// One module, seven operations (push `op`):
+//   0 FORWARD   one invocation per output element (r, c): the k terms added in slot order
+//   1 GRAD_W    one workgroup per pair p = (r, s): grad_w[p] = sum_c up[r, c] * table[idx[p], c], each invocation
+//               summing columns t, t + 64, ... and a fixed-order tree in shared memory
+//   2 ZERO      scratch counts[v] = 0 for v <= vocab
+//   3 COUNT     counts[idx[p]] += 1 (integer atomics)
+//   4 SCAN      one workgroup: offsets = exclusive prefix sum of counts (vocab + 1 entries), cursor = offsets
+//   5 PLACE     list[cursor[idx[p]]++] = p (integer atomics: the order inside a bucket is arbitrary here)
+//   6 SORT      one invocation per table row v: its bucket sorted ascending, so the next pass's order is fixed
+//   7 GRAD_T    one invocation per table element (v, c): grad_t[v, c] = sum over its bucket, in position order,
+//               of w[p] * up[p / k, c]; a row no pair names gets 0
+// No floating-point atomics: every float output has one writer and a fixed order of additions, so a run on the
+// same device and inputs writes the same bits. The host (src/weighted_bag_ops.rs) validates every bound and index
+// before a dispatch; an index out of range here reads as row 0 rather than out of bounds.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Table { float table[]; };
+layout(set = 0, binding = 1, std430) readonly buffer Idx { uint idx[]; };
+layout(set = 0, binding = 2, std430) readonly buffer W { float w[]; };
+layout(set = 0, binding = 3, std430) readonly buffer Up { float up[]; };
+layout(set = 0, binding = 4, std430) writeonly buffer Out { float outv[]; };
+layout(set = 0, binding = 5, std430) buffer Scratch { uint scratch[]; };   // counts | offsets | cursor | list
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint k;
+    uint vocab;
+    uint d;
+    uint op;
+    uint groups_x;   // workgroups along x: the flat workgroup id is y * groups_x + x
+    uint pad0;
+    uint pad1;
+} p;
+
+shared float red[64];
+
+uint flat_group() { return gl_WorkGroupID.y * p.groups_x + gl_WorkGroupID.x; }
+uint flat_id() { return flat_group() * 64u + gl_LocalInvocationID.x; }
+
+// scratch layout: counts [vocab + 1], offsets [vocab + 1], cursor [vocab + 1], list [rows * k]
+uint counts_at() { return 0u; }
+uint offsets_at() { return p.vocab + 1u; }
+uint cursor_at() { return 2u * (p.vocab + 1u); }
+uint list_at() { return 3u * (p.vocab + 1u); }
+
+uint row_of(uint pair) {
+    uint v = idx[pair];
+    return v < p.vocab ? v : 0u;
+}
+
+void main() {
+    uint n = p.rows * p.k;
+    if (p.op == 0u) {
+        uint i = flat_id();
+        if (i >= p.rows * p.d) return;
+        uint r = i / p.d;
+        uint c = i % p.d;
+        float acc = 0.0;
+        for (uint s = 0u; s < p.k; ++s) {
+            uint pr = r * p.k + s;
+            acc += w[pr] * table[row_of(pr) * p.d + c];
+        }
+        outv[i] = acc;
+    } else if (p.op == 1u) {
+        uint pr = flat_group();
+        uint t = gl_LocalInvocationID.x;
+        float acc = 0.0;
+        if (pr < n) {
+            uint r = pr / p.k;
+            uint v = row_of(pr);
+            for (uint c = t; c < p.d; c += 64u) {
+                acc += up[r * p.d + c] * table[v * p.d + c];
+            }
+        }
+        red[t] = acc;
+        barrier();
+        for (uint s = 32u; s > 0u; s >>= 1u) {
+            if (t < s) red[t] += red[t + s];
+            barrier();
+        }
+        if (t == 0u && pr < n) outv[pr] = red[0];
+    } else if (p.op == 2u) {
+        uint i = flat_id();
+        if (i <= p.vocab) scratch[counts_at() + i] = 0u;
+    } else if (p.op == 3u) {
+        uint pr = flat_id();
+        if (pr < n) atomicAdd(scratch[counts_at() + row_of(pr)], 1u);
+    } else if (p.op == 4u) {
+        // one workgroup: each invocation scans a contiguous chunk, a fixed tree combines the chunk totals
+        uint t = gl_LocalInvocationID.x;
+        uint total = p.vocab + 1u;
+        uint chunk = (total + 63u) / 64u;
+        uint lo = min(t * chunk, total);
+        uint hi = min(lo + chunk, total);
+        uint sum = 0u;
+        for (uint v = lo; v < hi; ++v) sum += scratch[counts_at() + v];
+        red[t] = uintBitsToFloat(sum);
+        barrier();
+        if (t == 0u) {
+            uint run = 0u;
+            for (uint j = 0u; j < 64u; ++j) {
+                uint s = floatBitsToUint(red[j]);
+                red[j] = uintBitsToFloat(run);
+                run += s;
+            }
+        }
+        barrier();
+        uint run = floatBitsToUint(red[t]);
+        for (uint v = lo; v < hi; ++v) {
+            scratch[offsets_at() + v] = run;
+            scratch[cursor_at() + v] = run;
+            run += scratch[counts_at() + v];
+        }
+    } else if (p.op == 5u) {
+        uint pr = flat_id();
+        if (pr < n) {
+            uint slot = atomicAdd(scratch[cursor_at() + row_of(pr)], 1u);
+            scratch[list_at() + slot] = pr;
+        }
+    } else if (p.op == 6u) {
+        uint v = flat_id();
+        if (v >= p.vocab) return;
+        uint b = scratch[offsets_at() + v];
+        uint e = scratch[offsets_at() + v + 1u];
+        for (uint i = b + 1u; i < e; ++i) {
+            uint x = scratch[list_at() + i];
+            uint j = i;
+            while (j > b && scratch[list_at() + j - 1u] > x) {
+                scratch[list_at() + j] = scratch[list_at() + j - 1u];
+                --j;
+            }
+            scratch[list_at() + j] = x;
+        }
+    } else if (p.op == 7u) {
+        uint i = flat_id();
+        if (i >= p.vocab * p.d) return;
+        uint v = i / p.d;
+        uint c = i % p.d;
+        uint b = scratch[offsets_at() + v];
+        uint e = scratch[offsets_at() + v + 1u];
+        float acc = 0.0;
+        for (uint q = b; q < e; ++q) {
+            uint pr = scratch[list_at() + q];
+            acc += w[pr] * up[(pr / p.k) * p.d + c];
+        }
+        outv[i] = acc;
+    }
+}

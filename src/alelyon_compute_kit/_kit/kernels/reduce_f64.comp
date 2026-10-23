@@ -1,0 +1,297 @@
+#version 450
+// ACK reduce-f64 (2026-09-29): the reduce family's v1 plan over FLOAT64
+// storage, for op 0 (sum) with no finish -- torch's sum.dim_IntList of a
+// float64 tensor, which the family refused by dtype until now (MEASURED
+// 2026-09-28: the toy stage-E step's last 18 host fallbacks, the load-balancing
+// loss's float64 sums). The block, the index decomposition, the splits and the
+// order of combination are reduce_f32.comp's v1, word for word, so the same
+// plan combines the same elements in the same fixed order; only the element
+// and the arithmetic are wider. Every value is a float64 as two 32-bit words
+// (low, high) and every add is IEEE 754 binary64, round to nearest even,
+// subnormals kept, in integer instructions only: no device needs
+// shaderFloat64. The first pass of a two-pass plan writes float64 PARTIALS.
+//
+// The order is the plan's, NOT the order torch's CPU kernels add in (their
+// cascade depends on the build's vector width), so a sum can differ from the
+// CPU's in its last bits: DECLARED, as the family's float32 sum is. The
+// accumulator starts at +0, so a sum of only -0 values is +0. A NaN operand
+// comes out quieted: the first one of each add (x86's rule), so which NaN
+// payload a sum of several NaNs keeps is the order's. An op or finish other than
+// sum-with-none poisons the output (all-ones words) rather than writing a value.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer Input { uint input_words[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Output { uint output_words[]; };
+layout(push_constant) uniform Push {
+    uint op;
+    uint finish;
+    uint ndim;
+    uint reduced_mask;
+    uint shape[6];
+    uint stride[6];
+    uint in_offset;
+    uint splits;
+    uint chunk;
+    uint scale_bits;
+} p;
+
+shared uvec2 partial[256];
+
+// ---- binary64 in 32-bit words (intwise.comp's, verbatim) --------------------------
+
+uvec2 add64(uvec2 a, uvec2 b) {
+    uint carry;
+    uint lo = uaddCarry(a.x, b.x, carry);
+    return uvec2(lo, a.y + b.y + carry);
+}
+
+uvec2 neg64(uvec2 v) {
+    uint lo = ~v.x + 1u;
+    return uvec2(lo, ~v.y + (lo == 0u ? 1u : 0u));
+}
+
+uvec2 sub64(uvec2 a, uvec2 b) {
+    uint borrow;
+    uint lo = usubBorrow(a.x, b.x, borrow);
+    return uvec2(lo, a.y - b.y - borrow);
+}
+
+// v << s for s in [0, 63]
+uvec2 shl64(uvec2 v, uint s) {
+    if (s == 0u) return v;
+    if (s >= 32u) return uvec2(0u, v.x << (s - 32u));
+    return uvec2(v.x << s, (v.y << s) | (v.x >> (32u - s)));
+}
+
+// v >> s for s in [0, 63], logical
+uvec2 shr64(uvec2 v, uint s) {
+    if (s == 0u) return v;
+    if (s >= 32u) return uvec2(v.y >> (s - 32u), 0u);
+    return uvec2((v.x >> s) | (v.y << (32u - s)), v.y >> s);
+}
+
+// the low s bits of v, for s in [1, 63]
+uvec2 low64(uvec2 v, uint s) {
+    if (s >= 32u) return uvec2(v.x, s == 32u ? 0u : v.y & ((1u << (s - 32u)) - 1u));
+    return uvec2(v.x & ((1u << s) - 1u), 0u);
+}
+
+bool negative64(uvec2 v) { return (v.y & 0x80000000u) != 0u; }
+
+bool ult64(uvec2 a, uvec2 b) {   // unsigned
+    if (a.y != b.y) return a.y < b.y;
+    return a.x < b.x;
+}
+
+bool is_zero64(uvec2 v) { return (v.x | v.y) == 0u; }
+
+// the leading zero bits of v; 64 for zero
+uint clz64(uvec2 v) {
+    if (v.y != 0u) return 31u - uint(findMSB(v.y));
+    if (v.x != 0u) return 63u - uint(findMSB(v.x));
+    return 64u;
+}
+
+// v >> s with every bit shifted out ORed into bit 0 ("jammed"), for any s
+uvec2 shr_jam64(uvec2 v, uint s) {
+    if (s == 0u) return v;
+    if (s >= 63u) return uvec2(is_zero64(v) ? 0u : 1u, 0u);
+    uvec2 r = shr64(v, s);
+    if (!is_zero64(low64(v, s))) r.x |= 1u;
+    return r;
+}
+
+const uvec2 F64_DEFAULT_NAN = uvec2(0u, 0xFFF80000u);   // x86's "QNaN floating-point indefinite"
+
+uint f64_exp(uvec2 d) { return (d.y >> 20u) & 0x7FFu; }
+uvec2 f64_frac(uvec2 d) { return uvec2(d.x, d.y & 0xFFFFFu); }
+bool f64_neg(uvec2 d) { return (d.y & 0x80000000u) != 0u; }
+bool f64_nan(uvec2 d) { return f64_exp(d) == 0x7FFu && !is_zero64(f64_frac(d)); }
+
+// (sign << 63) + (e << 52) + sig, ADDED: a significand whose bit 52 is set
+// carries into the exponent (the hidden bit, or a rounding that reached 2^53)
+uvec2 f64_pack(bool sign, uint e, uvec2 sig) {
+    uvec2 r = add64(uvec2(0u, e << 20u), sig);
+    return uvec2(r.x, r.y | (sign ? 0x80000000u : 0u));
+}
+
+// x86 SSE's rule: the first NaN operand, quieted
+uvec2 f64_propagate(uvec2 a, uvec2 b) {
+    uvec2 n = f64_nan(a) ? a : b;
+    return uvec2(n.x, n.y | 0x00080000u);
+}
+
+// Round sig (its leading one at bit 62 for a normal result; the value is
+// sig * 2^(e - 1084)) to 53 bits, nearest even, and pack it. e < 0 is a
+// subnormal or zero result, shifted right with the lost bits jammed; from
+// e = 0x7FD the result may overflow to an infinity.
+uvec2 f64_round_pack(bool sign, int e, uvec2 sig) {
+    uint round_bits = sig.x & 0x3FFu;
+    if (e < 0) {
+        sig = shr_jam64(sig, uint(-e));
+        e = 0;
+        round_bits = sig.x & 0x3FFu;
+    } else if (e > 0x7FD || (e == 0x7FD && !ult64(add64(sig, uvec2(0x200u, 0u)), uvec2(0u, 0x80000000u)))) {
+        return f64_pack(sign, 0x7FFu, uvec2(0u));
+    }
+    sig = shr64(add64(sig, uvec2(0x200u, 0u)), 10u);
+    if (round_bits == 0x200u) sig.x &= ~1u;      // a tie rounds to even
+    if (is_zero64(sig)) e = 0;
+    return f64_pack(sign, uint(e), sig);
+}
+
+// sig of any width: its leading one brought to bit 62, then rounded; a result
+// with no bits to round is packed as it is
+uvec2 f64_norm_round_pack(bool sign, int e, uvec2 sig) {
+    int shift = int(clz64(sig)) - 1;
+    e -= shift;
+    if (shift >= 10 && uint(e) < 0x7FDu) {
+        return f64_pack(sign, is_zero64(sig) ? 0u : uint(e), shl64(sig, uint(shift - 10)));
+    }
+    return f64_round_pack(sign, e, shl64(sig, uint(shift)));
+}
+
+// |a| + |b| with the result's sign given (a and b of one sign, or b's flipped)
+uvec2 f64_add_mags(uvec2 a, uvec2 b, bool sign) {
+    int ea = int(f64_exp(a));
+    int eb = int(f64_exp(b));
+    uvec2 sa = f64_frac(a);
+    uvec2 sb = f64_frac(b);
+    int diff = ea - eb;
+    if (diff == 0) {
+        if (ea == 0) return add64(a, sb);                  // two subnormals: exact; a carry makes a normal
+        if (ea == 0x7FF) return is_zero64(sa) && is_zero64(sb) ? a : f64_propagate(a, b);
+        return f64_round_pack(sign, ea, shl64(add64(uvec2(0u, 0x00200000u), add64(sa, sb)), 9u));
+    }
+    sa = shl64(sa, 9u);
+    sb = shl64(sb, 9u);
+    int ez;
+    if (diff < 0) {
+        if (eb == 0x7FF) return is_zero64(sb) ? f64_pack(sign, 0x7FFu, uvec2(0u)) : f64_propagate(a, b);
+        ez = eb;
+        sa = ea != 0 ? add64(sa, uvec2(0u, 0x20000000u)) : shl64(sa, 1u);
+        sa = shr_jam64(sa, uint(-diff));
+    } else {
+        if (ea == 0x7FF) return is_zero64(sa) ? a : f64_propagate(a, b);
+        ez = ea;
+        sb = eb != 0 ? add64(sb, uvec2(0u, 0x20000000u)) : shl64(sb, 1u);
+        sb = shr_jam64(sb, uint(diff));
+    }
+    uvec2 sz = add64(uvec2(0u, 0x20000000u), add64(sa, sb));
+    if (ult64(sz, uvec2(0u, 0x40000000u))) {
+        ez -= 1;
+        sz = shl64(sz, 1u);
+    }
+    return f64_round_pack(sign, ez, sz);
+}
+
+// |a| - |b| with a's sign given, flipped where |b| > |a|
+uvec2 f64_sub_mags(uvec2 a, uvec2 b, bool sign) {
+    int ea = int(f64_exp(a));
+    int eb = int(f64_exp(b));
+    uvec2 sa = f64_frac(a);
+    uvec2 sb = f64_frac(b);
+    int diff = ea - eb;
+    if (diff == 0) {
+        if (ea == 0x7FF) return is_zero64(sa) && is_zero64(sb) ? F64_DEFAULT_NAN : f64_propagate(a, b);
+        uvec2 d = sub64(sa, sb);                          // the hidden bits cancel
+        if (is_zero64(d)) return uvec2(0u);                // x - x is +0 under round to nearest
+        int e = ea != 0 ? ea - 1 : 0;
+        if (negative64(d)) {
+            sign = !sign;
+            d = neg64(d);
+        }
+        int shift = int(clz64(d)) - 11;
+        int ez = e - shift;
+        if (ez < 0) {
+            shift = e;
+            ez = 0;
+        }
+        return f64_pack(sign, uint(ez), shl64(d, uint(shift)));   // exact: nothing to round
+    }
+    sa = shl64(sa, 10u);
+    sb = shl64(sb, 10u);
+    int ez;
+    uvec2 sz;
+    if (diff < 0) {
+        sign = !sign;
+        if (eb == 0x7FF) return is_zero64(sb) ? f64_pack(sign, 0x7FFu, uvec2(0u)) : f64_propagate(a, b);
+        sa = add64(sa, ea != 0 ? uvec2(0u, 0x40000000u) : sa);
+        sa = shr_jam64(sa, uint(-diff));
+        sb.y |= 0x40000000u;
+        ez = eb;
+        sz = sub64(sb, sa);
+    } else {
+        if (ea == 0x7FF) return is_zero64(sa) ? a : f64_propagate(a, b);
+        sb = add64(sb, eb != 0 ? uvec2(0u, 0x40000000u) : sb);
+        sb = shr_jam64(sb, uint(diff));
+        sa.y |= 0x40000000u;
+        ez = ea;
+        sz = sub64(sa, sb);
+    }
+    return f64_norm_round_pack(sign, ez - 1, sz);
+}
+
+uvec2 f64_add(uvec2 a, uvec2 b) {
+    return f64_neg(a) == f64_neg(b) ? f64_add_mags(a, b, f64_neg(a)) : f64_sub_mags(a, b, f64_neg(a));
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint group = gl_WorkGroupID.x;
+    uint outputs = uint(output_words.length()) / 2u;
+    // Uniform diagnostics: an invalid plan cannot masquerade as a computed value.
+    bool invalid = p.op != 0u || p.finish != 0u || p.ndim == 0u || p.ndim > 6u ||
+                   p.splits == 0u || p.chunk == 0u || p.reduced_mask == 0u ||
+                   (p.reduced_mask >> p.ndim) != 0u;
+    uint kept = group / p.splits;
+    uint split = group - kept * p.splits;
+    if (!invalid && group >= outputs) invalid = true;
+    if (invalid) {
+        if (lane == 0u && group < outputs) {
+            output_words[2u * group] = 0xFFFFFFFFu;
+            output_words[2u * group + 1u] = 0xFFFFFFFFu;
+        }
+        return;
+    }
+    // Decompose the kept index (row-major over the kept dims in original order)
+    // and count the reduced index space: reduce_f32.comp's v1, unchanged.
+    uint kept_base = p.in_offset;
+    uint reduced_count = 1u;
+    uint rem = kept;
+    for (int d = int(p.ndim) - 1; d >= 0; --d) {
+        uint extent = p.shape[d];
+        if ((p.reduced_mask & (1u << uint(d))) != 0u) {
+            reduced_count *= extent;
+        } else {
+            uint idx = rem % extent;
+            rem /= extent;
+            kept_base += idx * p.stride[d];
+        }
+    }
+    uint start = split * p.chunk;
+    uint stop = min(start + p.chunk, reduced_count);
+    uvec2 acc = uvec2(0u);   // +0.0
+    for (uint r = start + lane; r < stop; r += 256u) {
+        uint address = kept_base;
+        uint q = r;
+        for (int d = int(p.ndim) - 1; d >= 0; --d) {
+            if ((p.reduced_mask & (1u << uint(d))) != 0u) {
+                uint extent = p.shape[d];
+                uint idx = q % extent;
+                q /= extent;
+                address += idx * p.stride[d];
+            }
+        }
+        acc = f64_add(acc, uvec2(input_words[2u * address], input_words[2u * address + 1u]));
+    }
+    partial[lane] = acc;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lane < s) partial[lane] = f64_add(partial[lane], partial[lane + s]);
+        barrier();
+    }
+    if (lane == 0u) {
+        output_words[2u * group] = partial[0].x;
+        output_words[2u * group + 1u] = partial[0].y;
+    }
+}

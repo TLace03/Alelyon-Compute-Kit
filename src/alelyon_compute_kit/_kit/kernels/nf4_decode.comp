@@ -1,0 +1,160 @@
+#version 450
+// nf4-decode/v1 (2026-09-30): bitsandbytes' NF4 with double quantisation
+// (QLoRA's 4-bit NormalFloat, `research/subbit_expert/moe/nf4.py`), decoded
+// from its STORED form, one invocation per packed word of 8 values, writing
+// FP32 (STORAGE=0), bf16 (STORAGE=1) or fp16 (STORAGE=2).
+//
+// The stored form, as bitsandbytes and the reference quantizer lay it out:
+// - `packed`: two 4-bit indices a byte, the first value in the HIGH nibble;
+// - `absmax_q`: one byte a block of 64 values, an index into the 256-entry
+//   signed dynamic map;
+// - `absmax2`: one FP32 value a nested block of 256 blocks;
+// - `offsets`: one FP32 value a member (a weight quantized alone), the mean
+//   its absmax values were taken about;
+// - `tables`: the 16 code values, then the 256 map values, as FP32.
+// For value s of the source, in block b = s / 64 of member m:
+//   scale  = fl(map[absmax_q[b]] * absmax2[b / 256])
+//   absmax = fl(scale + offsets[m])
+//   out    = stored(fl(code[index(s)] * absmax))
+// every step `precise` (no fused multiply-add), `stored` one rounding to the
+// output storage: the identity for FP32; round to nearest even for bf16 (the
+// pointwise family's `narrow`); for fp16 convert/v1's integer routine, round to
+// nearest even with c10's NaN (sign | 0x7E00). Those are the reference
+// decode's two roundings plus one (NF4Tensor.absmax, then the product, then
+// `.to(dtype)`), and bitsandbytes' dequantize_blockwise, `+ offset` and
+// dequantize_4bit, so on one device every value that is not a NaN is theirs
+// bit for bit, for products in FP32's normal range or zero (Vulkan may flush a
+// subnormal FP32 result). A NaN is a NaN in both, its sign and payload free.
+//
+// Members and selection. `starts` holds each member's first value (int64,
+// ascending, from 0; every member starts on a whole nested block, so no
+// nested block holds two members); the source begins `src_base` values into
+// the buffers. With `selected` 0 the output is the source itself, member by
+// member. Otherwise the members are all `member_values` long and output
+// member j is member ids[j] (int64): a selection of experts without a gather
+// first. A member index or source value outside the buffers (`members`,
+// `src_limit`, bounds the host takes from the buffers themselves) writes NaN
+// to its 8 values instead of reading.
+#if STORAGE != 0
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#endif
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer Packed { uint packed_words[]; };
+layout(set = 0, binding = 1, std430) readonly buffer AbsmaxQ { uint absmax_q_words[]; };
+layout(set = 0, binding = 2, std430) readonly buffer Absmax2 { float absmax2_values[]; };
+layout(set = 0, binding = 3, std430) readonly buffer Tables { float table_values[]; };
+layout(set = 0, binding = 4, std430) readonly buffer Starts { uint start_words[]; };
+layout(set = 0, binding = 5, std430) readonly buffer Offsets { float offset_values[]; };
+layout(set = 0, binding = 6, std430) readonly buffer Ids { uint id_words[]; };
+#if STORAGE != 0
+layout(set = 0, binding = 7, std430) writeonly buffer Output { uint16_t output_values[]; };
+#else
+layout(set = 0, binding = 7, std430) writeonly buffer Output { float output_values[]; };
+#endif
+layout(push_constant) uniform Push {
+    uint n;              // values out
+    uint words;          // ceil(n / 8): one invocation each
+    uint members;        // entries of starts and offsets
+    uint selected;       // 0: the whole source; else entries of ids
+    uint member_values;  // each selected member's values (a multiple of 64)
+    uint src_base;       // the source's first value in the buffers (a multiple of 16,384)
+    uint src_limit;      // values the buffers hold past src_base, all three
+} p;
+
+const uint BLOCK = 64u;
+const uint NESTED = 256u;
+const uint CODE = 0u;
+const uint MAP = 16u;
+
+#if STORAGE == 1
+// copied from kernels/pointwise_f32.comp's `narrow` (itself from cast_f32_bf16.comp)
+uint16_t narrow(float x) {
+    const uint bits = floatBitsToUint(x);
+    if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu) != 0u) {
+        return uint16_t((bits >> 16) | 0x0040u);   // quiet NaN
+    }
+    const uint lsb = (bits >> 16) & 1u;
+    return uint16_t((bits + 0x7FFFu + lsb) >> 16);
+}
+#elif STORAGE == 2
+// convert/v1's f32 -> f16 routine, verbatim (kernels/convert.comp): round to
+// nearest even, NaN -> sign | 0x7E00
+uint f32_to_f16(uint w) {
+    uint sign = (w >> 16u) & 0x8000u;
+    uint e = (w >> 23u) & 0xFFu;
+    uint m = w & 0x7FFFFFu;
+    if (e == 0xFFu) return sign | (m != 0u ? 0x7E00u : 0x7C00u);
+    int he = int(e) - 112;
+    if (he >= 31) return sign | 0x7C00u;
+    if (he <= 0) {
+        if (he < -10) return sign;
+        uint mf = m | 0x800000u;
+        uint shift = uint(14 - he);
+        uint q = mf >> shift;
+        uint rem = mf & ((1u << shift) - 1u);
+        uint half_ulp = 1u << (shift - 1u);
+        if (rem > half_ulp || (rem == half_ulp && (q & 1u) != 0u)) q += 1u;
+        return sign | q;
+    }
+    uint h = (uint(he) << 10u) | (m >> 13u);
+    uint rem = m & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u) != 0u)) h += 1u;
+    return sign | h;
+}
+uint16_t narrow(float x) { return uint16_t(f32_to_f16(floatBitsToUint(x))); }
+#endif
+
+void store(uint i, float v) {
+#if STORAGE == 0
+    output_values[i] = v;
+#else
+    output_values[i] = narrow(v);
+#endif
+}
+
+// the member holding source value s: the last start at or below it (starts ascending from 0)
+uint member_of(uint s) {
+    uint lo = 0u;
+    uint hi = p.members;
+    while (hi - lo > 1u) {
+        uint mid = (lo + hi) / 2u;
+        if (start_words[2u * mid] <= s) lo = mid; else hi = mid;
+    }
+    return lo;
+}
+
+void main() {
+    uint w = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * 256u);
+    if (w >= p.words) return;
+    uint i0 = w * 8u;
+    uint m;
+    uint s0;   // the word's first value, from src_base
+    bool bad = false;
+    if (p.selected == 0u) {
+        m = member_of(i0);
+        s0 = i0;
+    } else {
+        uint j = i0 / p.member_values;
+        m = id_words[2u * j];
+        bad = id_words[2u * j + 1u] != 0u || m >= p.members;   // a negative or too-large int64 id
+        s0 = (bad ? 0u : start_words[2u * m]) + (i0 - j * p.member_values);
+    }
+    uint count = min(8u, p.n - i0);
+    if (bad || s0 >= p.src_limit || count > p.src_limit - s0) {
+        for (uint k = 0u; k < count; ++k) store(i0 + k, uintBitsToFloat(0x7FC00000u));
+        return;
+    }
+    uint s = p.src_base + s0;
+    uint word = packed_words[s / 8u];
+    uint b = s / BLOCK;
+    uint q = (absmax_q_words[b / 4u] >> (8u * (b % 4u))) & 0xFFu;
+    precise float scale = table_values[MAP + q] * absmax2_values[b / NESTED];
+    precise float absmax = scale + offset_values[m];
+    for (uint k = 0u; k < count; ++k) {
+        uint byte_value = (word >> (8u * (k >> 1u))) & 0xFFu;
+        uint index = (k & 1u) == 0u ? (byte_value >> 4u) : (byte_value & 0xFu);
+        precise float value = table_values[CODE + index] * absmax;
+        store(i0 + k, value);
+    }
+}

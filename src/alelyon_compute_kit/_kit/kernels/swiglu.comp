@@ -1,0 +1,94 @@
+#version 450
+// swiglu/v1 (2026-09-29): the SiLU-gated activation of one packed projection,
+// out = u * silu(g) with u, g = packed.chunk(2, -1), and its backward, one
+// invocation per output element, over FP32 (BF16=0) or bf16 (BF16=1) storage.
+//
+// The packed operand holds `rows` rows of 2 * `cols`: u in the first `cols`,
+// g in the second. Its law is the decomposition torch runs for that dtype,
+// through the kit's own pointwise operations, with every intermediate TENSOR
+// rounded to the storage type as that decomposition's is:
+//   s     = stored(g / (1 + exp(-g)))              silu, pointwise operation 14
+//   op 0, forward:  out = stored(u * s)            mul, pointwise operation 2
+//   op 1, backward, primary = the upstream gradient of `out` (rows x cols), the
+//   output the gradient of `packed` (rows x 2 cols):
+//     d_u = stored(grad * s)                       MulBackward's grad * other
+//     t   = stored(grad * u)                       MulBackward's grad * self
+//     sig = 1 / (1 + exp(-g))
+//     d_g = stored(t * sig * (1 + g * (1 - sig)))  silu_backward, operation 37
+// `stored` is the identity for FP32 and round-to-nearest-even to bf16 (and back)
+// for bf16, the pointwise family's own `narrow`. Every step is `precise`, with
+// no fused multiply-add, in the pointwise family's order. `exp` and the
+// division are GLSL's, as the family's are, so on one device every value that
+// is not a NaN is that decomposition's bit for bit, signed zeros included. A
+// NaN is a NaN in both; its sign and payload are not part of the law, because
+// a multiply of two NaNs returns one of them, and which one follows the
+// operand order each compilation gives it. The two gradient halves land in one
+// packed tensor, which is what autograd's chunk backward would have
+// concatenated.
+#if BF16
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#endif
+layout(local_size_x = 256) in;
+#if BF16
+layout(set = 0, binding = 0, std430) readonly buffer Packed { uint16_t packed_values[]; };
+layout(set = 0, binding = 1, std430) readonly buffer Upstream { uint16_t upstream_values[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer Output { uint16_t output_values[]; };
+#else
+layout(set = 0, binding = 0, std430) readonly buffer Packed { float packed_values[]; };
+layout(set = 0, binding = 1, std430) readonly buffer Upstream { float upstream_values[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer Output { float output_values[]; };
+#endif
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;      // the width of each half
+    uint op;        // 0 forward, 1 backward
+    uint elements;  // rows * cols, below 2^31 by the host plan
+} p;
+
+#if BF16
+float widen(uint16_t bits) { return uintBitsToFloat(uint(bits) << 16); }
+// copied from kernels/pointwise_f32.comp's `narrow` (itself from cast_f32_bf16.comp)
+uint16_t narrow(float x) {
+    const uint bits = floatBitsToUint(x);
+    if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu) != 0u) {
+        return uint16_t((bits >> 16) | 0x0040u);   // quiet NaN
+    }
+    const uint lsb = (bits >> 16) & 1u;
+    return uint16_t((bits + 0x7FFFu + lsb) >> 16);
+}
+float load_packed(uint i) { return widen(packed_values[i]); }
+float load_upstream(uint i) { return widen(upstream_values[i]); }
+void store(uint i, float v) { output_values[i] = narrow(v); }
+float stored(float v) { return widen(narrow(v)); }
+#else
+float load_packed(uint i) { return packed_values[i]; }
+float load_upstream(uint i) { return upstream_values[i]; }
+void store(uint i, float v) { output_values[i] = v; }
+float stored(float v) { return v; }
+#endif
+
+void main() {
+    uint id = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * 256u);
+    if (id >= p.elements) return;
+    uint r = id / p.cols;
+    uint c = id - r * p.cols;
+    uint iu = r * (2u * p.cols) + c;
+    uint ig = iu + p.cols;
+    precise float u = load_packed(iu);
+    precise float g = load_packed(ig);
+    precise float silu_g = g / (1.0 + exp(-g));
+    precise float s = stored(silu_g);
+    if (p.op == 0u) {
+        precise float product = u * s;
+        store(id, product);
+    } else {
+        precise float grad = load_upstream(id);
+        precise float d_u = grad * s;
+        precise float t = stored(grad * u);
+        precise float sig = 1.0 / (1.0 + exp(-g));
+        precise float d_g = t * sig * (1.0 + g * (1.0 - sig));
+        store(iu, d_u);
+        store(ig, d_g);
+    }
+}

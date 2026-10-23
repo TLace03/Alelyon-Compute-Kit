@@ -1,5 +1,5 @@
 #version 450
-// pointwise-f32/v1, operation schema 2: out[i] = f(x[i], y[i], z[i]) over
+// pointwise-f32/v1, operation schema 8: out[i] = f(x[i], y[i], z[i]) over
 // one shape of up to four dimensions. Four FP32 storage buffers (x, y, z,
 // out) share the shape; each has its own element offset and per-dimension
 // element strides, and a broadcast dimension is stride 0. Host planning
@@ -50,19 +50,81 @@
 //                                  (start a, step b; float(i) is exact below 2^24)
 //   23  triu(x)            x       the last two dimensions are rows and columns:
 //                                  column - row >= b keeps x, else 0 (b an int32)
+// Schema 4 (2026-09-22) appends 24-36, same block, buffers and entry:
+//   24  exp(x)             x       exp_torch below: k*ln2 taken out exactly, a
+//                                  polynomial on the rest; +inf above
+//                                  88.72283172607422, 0 at or below
+//                                  -103.97208404541016, a NaN propagated
+//   25  round(x)           x       roundEven: halves to even, as torch.round; a NaN
+//                                  keeps its own bits
+//   26  x > y              x, y    1 or 0; y a tensor or the scalar b. IEEE:
+//   27  x < y              x, y    every comparison with a NaN is false
+//   28  x >= y             x, y    except !=, which is true (decided on the bits
+//                                  since 2026-10-16, as 32-36, 13 and 8's sign
+//                                  test: see "decisions on the BITS" below)
+//   29  x <= y             x, y
+//   30  x == y             x, y
+//   31  x != y             x, y
+//   32  x and y            x, y    each operand is true when nonzero (a NaN
+//   33  x or y             x, y    is nonzero, as torch's bool conversion)
+//   34  x xor y            x, y
+//   35  not x              x
+//   36  x ? y : z          x, y, z the condition x true when nonzero
+// Schema 5 (2026-09-28) appends 37-39, same block, buffers and entry: the
+// SiLU-gated linear unit's arithmetic, each ONE dispatch where torch's
+// composition runs several, with no intermediate rounded to the storage type:
+//   37  silu_backward      x, y    x the gradient, y the input: s = 1/(1+exp(-y)),
+//                                  then x * s * (1 + y*(1 - s)), the CPU kernel's
+//                                  order (torch's silu_backward)
+//   38  x * silu(y)        x, y    x * (y / (1 + exp(-y))): u * silu(g)
+//   39  swiglu_grad_gate   x, y, z x the gradient, y the up half u, z the gate g:
+//                                  s = 1/(1+exp(-z)), (x*y) * (s*(1 + z*(1 - s)))
+// Their exp is GLSL's, as silu's (14) and sigmoid's (15), so a forward and
+// its backward share one sigmoid.
+// Schema 6 (2026-09-28) appends 40-42, same block, buffers and entry, each in
+// correctly rounded adds and multiplies with no hardware transcendental (see
+// "schema 6" below for the formulations and their measured error):
+//   40  tanh(x)            x       x itself below 2^-12, a polynomial below 0.625,
+//                                  1 - 2/(exp(2|x|) + 1) with a Newton reciprocal
+//                                  below 9.010913848876953, +-1 from there; a NaN
+//                                  propagated
+//   41  log(x)             x       the range reduction on the bits, a polynomial on
+//                                  the rest; -inf at +-0, NaN below 0, +inf at +inf
+//   42  xlogy(x, y)        x, y    torch's: NaN where y is NaN, 0 where x is +-0,
+//                                  else x * log(y); y a tensor or the scalar b
+// Schema 7 (2026-09-29) keeps operations 0-42, the block and the entry, and
+// adds storage code 3, binary16, for each buffer (BINARY16 STORAGE below).
+// Schema 8 (2026-10-16) appends 43-46, same block, buffers and entry: four
+// SELECTIONS, each result one of its inputs' own words or +0, decided on the
+// BITS (select_key below), so a device that flushes subnormals in a
+// floating-point comparison still answers as torch's CPU does
+// (docs/audits/2026-09-30-akv-moe-megakernel-vulkan-plan.md, Amendment 27):
+//   43  minimum(x, y)      x, y    a NaN in either gives 0xffffffff, zeros of
+//   44  maximum(x, y)      x, y    opposite sign give y; else the smaller
+//                                  (larger) operand's bits: torch's CPU
+//                                  vectorised body (its scalar loop gives
+//                                  0x7fc00000 and x in those two cases)
+//   45  relu(x)            x       x where x is NaN or not below zero (-0 kept),
+//                                  else +0
+//   46  threshold_backward x, y    x the gradient, y the input, a the
+//                                  threshold: +0 where y <= a, else x (a NaN y
+//                                  or a compares false)
+// A comparison or logical result is 1.0 or 0.0 before the store, so an f32,
+// bf16 or binary16 output holds 1/0 and a u8 output holds the bool.
 // Every arithmetic step is precise (no contraction into a fused multiply-add).
 // An unknown operation writes NaN so it cannot masquerade as a computed
 // tensor. Flag bit 1 (a scalar z) stays reserved: nothing here consumes it
 // and the host refuses a block that sets it.
 //
-// Each invocation handles four consecutive linear indices, so a 4.2M-element
-// tensor needs about 4,100 workgroups on one dispatch axis. An in-place
+// Each workgroup handles 1,024 consecutive linear indices (four per
+// invocation, 256 apart), so a 4.2M-element tensor needs about 4,100
+// workgroups on one dispatch axis. An in-place
 // operation binds the same buffer to an input and to out with bit-identical
 // views: each lane then reads only the addresses it writes, and the host plan
 // refuses every other aliasing.
 // STORAGE (2026-09-10). DT_X, DT_Y, DT_Z and DT_OUT are 0 for f32 and 1
-// for bf16 and decide only how a value is READ and WRITTEN: every
-// operation below runs in f32 whatever they are.
+// for bf16 (2 bool and 3 binary16, below) and decide only how a value is
+// READ and WRITTEN: every operation below runs in f32 whatever they are.
 //
 // One switch PER BUFFER, not one for the inputs together. The first
 // version shared a switch across the three inputs on the assumption that
@@ -84,41 +146,113 @@
 #ifndef DT_OUT
 #define DT_OUT 0
 #endif
-#if DT_X || DT_Y || DT_Z || DT_OUT
+// BOOL STORAGE (2026-09-22). A switch value of 2 is torch's bool: one byte
+// per element through GL_EXT_shader_8bit_storage, read as 1.0 when nonzero
+// and 0.0 otherwise, and written as 1 when the f32 result is nonzero (a NaN
+// included, as torch's bool conversion) and 0 otherwise. Each invocation
+// writes whole bytes at distinct addresses, so four lanes sharing a 32-bit
+// word do not race. The context enables storageBuffer8BitAccess and
+// shaderInt8 when the device has them; without both, the entry refuses a
+// bool module by name before building it (`Context::bool_storage`).
+// BINARY16 STORAGE (schema 7, 2026-09-29). A switch value of 3 is IEEE
+// binary16, read through widen_h and written through narrow_h. Those are
+// kernels/convert.comp's integer f16_to_f32 and f32_to_f16, character for
+// character: an exact widening, and round to nearest even with subnormals
+// kept, an overflow to infinity and a NaN written sign | 0x7E00 as c10 writes
+// it. The adapter's composed path for an fp16 operation is exactly that
+// widening, the same f32 operation and that narrowing, through three or four
+// dispatches and f32 temporaries. Here it is one dispatch, and each result is
+// the composed path's bit for bit by construction. The operations are
+// untouched, and no module without a 3 changes by a byte.
+#if DT_X == 1 || DT_Y == 1 || DT_Z == 1 || DT_OUT == 1 || DT_X == 3 || DT_Y == 3 || DT_Z == 3 || DT_OUT == 3
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 #endif
+#if DT_X == 2 || DT_Y == 2 || DT_Z == 2 || DT_OUT == 2
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#endif
+// VECTOR MODULES (2026-09-27). VECTOR_MODULE=1 compiles the same family as a
+// separate module in which each invocation takes FOUR CONSECUTIVE elements.
+// Each unit-stride operand is one 16-byte (f32) or 8-byte (bf16) load, each
+// operand broadcast along the last dimension is one read, and the output is
+// one store. The host selects it (pointwise_ops::PointwisePlan::vector_eligible)
+// for calls with a 16-bit operand or a last-dimension broadcast. Those paid,
+// MEASURED on an RX 9070 XT in one A3r-X2 pass: bf16 mul -7%, broadcast div
+// -13%. The same path inside the scalar module slowed the four-byte ops that
+// never took it by 10-30%, so it lives in its own module. The workgroup still
+// owns 1,024 consecutive indices, and every element goes through the same
+// apply_op, so a vector module's results are the scalar module's bits. Bool
+// storage has no vector module.
+#ifndef VECTOR_MODULE
+#define VECTOR_MODULE 0
+#endif
+#if VECTOR_MODULE && (DT_X == 2 || DT_Y == 2 || DT_Z == 2 || DT_OUT == 2)
+#error a vector module has no bool storage
+#endif
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
-#if DT_X
+#if DT_X == 2
+layout(set = 0, binding = 0, std430) readonly buffer XValues { uint8_t x_values[]; };
+#elif DT_X
 layout(set = 0, binding = 0, std430) readonly buffer XValues { uint16_t x_values[]; };
 #else
 layout(set = 0, binding = 0, std430) readonly buffer XValues { float x_values[]; };
 #endif
-#if DT_Y
+#if DT_Y == 2
+layout(set = 0, binding = 1, std430) readonly buffer YValues { uint8_t y_values[]; };
+#elif DT_Y
 layout(set = 0, binding = 1, std430) readonly buffer YValues { uint16_t y_values[]; };
 #else
 layout(set = 0, binding = 1, std430) readonly buffer YValues { float y_values[]; };
 #endif
-#if DT_Z
+#if DT_Z == 2
+layout(set = 0, binding = 2, std430) readonly buffer ZValues { uint8_t z_values[]; };
+#elif DT_Z
 layout(set = 0, binding = 2, std430) readonly buffer ZValues { uint16_t z_values[]; };
 #else
 layout(set = 0, binding = 2, std430) readonly buffer ZValues { float z_values[]; };
 #endif
-#if DT_OUT
+#if DT_OUT == 2
+layout(set = 0, binding = 3, std430) writeonly buffer OutValues { uint8_t out_values[]; };
+#elif DT_OUT
 layout(set = 0, binding = 3, std430) writeonly buffer OutValues { uint16_t out_values[]; };
 #else
 layout(set = 0, binding = 3, std430) writeonly buffer OutValues { float out_values[]; };
+#endif
+#if VECTOR_MODULE
+// the same bindings, four elements at a time: an f32 buffer as vec4, a bf16
+// or binary16 one as uvec2 (8 bytes)
+#if DT_X == 1 || DT_X == 3
+layout(set = 0, binding = 0, std430) readonly buffer XVectors { uvec2 x_vectors[]; };
+#else
+layout(set = 0, binding = 0, std430) readonly buffer XVectors { vec4 x_vectors[]; };
+#endif
+#if DT_Y == 1 || DT_Y == 3
+layout(set = 0, binding = 1, std430) readonly buffer YVectors { uvec2 y_vectors[]; };
+#else
+layout(set = 0, binding = 1, std430) readonly buffer YVectors { vec4 y_vectors[]; };
+#endif
+#if DT_Z == 1 || DT_Z == 3
+layout(set = 0, binding = 2, std430) readonly buffer ZVectors { uvec2 z_vectors[]; };
+#else
+layout(set = 0, binding = 2, std430) readonly buffer ZVectors { vec4 z_vectors[]; };
+#endif
+#if DT_OUT == 1 || DT_OUT == 3
+layout(set = 0, binding = 3, std430) writeonly buffer OutVectors { uvec2 out_vectors[]; };
+#else
+layout(set = 0, binding = 3, std430) writeonly buffer OutVectors { vec4 out_vectors[]; };
+#endif
 #endif
 
 // bf16 -> f32 is exact: the 16 bits ARE the top half of the f32 word.
 // f32 -> bf16 is round-to-nearest-even with the NaN payload kept quiet,
 // copied from kernels/cast_f32_bf16.comp so a value stored here equals
 // what that cast would have written for the same input.
-#if DT_X || DT_Y || DT_Z
+#if DT_X == 1 || DT_Y == 1 || DT_Z == 1
 float widen(uint16_t bits) { return uintBitsToFloat(uint(bits) << 16); }
 #endif
-#if DT_OUT
+#if DT_OUT == 1
 uint16_t narrow(float x) {
     const uint bits = floatBitsToUint(x);
     if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu) != 0u) {
@@ -128,26 +262,139 @@ uint16_t narrow(float x) {
     return uint16_t((bits + 0x7FFFu + lsb) >> 16);
 }
 #endif
+// binary16 <-> f32 (schema 7): f16_to_f32 and f32_to_f16 are kernels/convert.comp's,
+// character for character, so a value read here is the convert family's widening
+// and a value stored here is its narrowing
+#if DT_X == 3 || DT_Y == 3 || DT_Z == 3
+// f16 -> f32 bits, exact, in integers (the index family's form, without its
+// float multiply for a subnormal)
+uint f16_to_f32(uint h) {
+    uint sign = (h & 0x8000u) << 16u;
+    uint e = (h >> 10u) & 0x1Fu;
+    uint m = h & 0x3FFu;
+    if (e == 0x1Fu) return sign | 0x7F800000u | (m << 13u);
+    if (e == 0u) {
+        if (m == 0u) return sign;
+        // m * 2^-24 with m's leading one at bit t: 2^(t-24) * (m / 2^t)
+        uint t = uint(findMSB(m));
+        return sign | ((t + 103u) << 23u) | (((m << (23u - t)) & 0x7FFFFFu));
+    }
+    return sign | ((e + 112u) << 23u) | (m << 13u);
+}
+float widen_h(uint16_t bits) { return uintBitsToFloat(f16_to_f32(uint(bits))); }
+#endif
+#if DT_OUT == 3
+// f32 bits -> f16, round to nearest even; NaN -> sign | 0x7E00, as c10 writes it
+uint f32_to_f16(uint w) {
+    uint sign = (w >> 16u) & 0x8000u;
+    uint e = (w >> 23u) & 0xFFu;
+    uint m = w & 0x7FFFFFu;
+    if (e == 0xFFu) return sign | (m != 0u ? 0x7E00u : 0x7C00u);
+    int he = int(e) - 112;
+    if (he >= 31) return sign | 0x7C00u;
+    if (he <= 0) {
+        if (he < -10) return sign;
+        uint mf = m | 0x800000u;
+        uint shift = uint(14 - he);          // 14..24
+        uint q = mf >> shift;
+        uint rem = mf & ((1u << shift) - 1u);
+        uint half_ulp = 1u << (shift - 1u);
+        if (rem > half_ulp || (rem == half_ulp && (q & 1u) != 0u)) q += 1u;
+        return sign | q;                     // q == 0x400 is the smallest normal: still exact
+    }
+    uint h = (uint(he) << 10u) | (m >> 13u);
+    uint rem = m & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u) != 0u)) h += 1u;   // a carry reaches inf correctly
+    return sign | h;
+}
+uint16_t narrow_h(float x) { return uint16_t(f32_to_f16(floatBitsToUint(x))); }
+#endif
+#if DT_X == 2 || DT_Y == 2 || DT_Z == 2
+float truth(uint8_t byte) { return uint(byte) != 0u ? 1.0 : 0.0; }
+#endif
 
-#if DT_X
+#if DT_X == 2
+#define LOAD_X(i) truth(x_values[i])
+#elif DT_X == 3
+#define LOAD_X(i) widen_h(x_values[i])
+#elif DT_X
 #define LOAD_X(i) widen(x_values[i])
 #else
 #define LOAD_X(i) x_values[i]
 #endif
-#if DT_Y
+#if DT_Y == 2
+#define LOAD_Y(i) truth(y_values[i])
+#elif DT_Y == 3
+#define LOAD_Y(i) widen_h(y_values[i])
+#elif DT_Y
 #define LOAD_Y(i) widen(y_values[i])
 #else
 #define LOAD_Y(i) y_values[i]
 #endif
-#if DT_Z
+#if DT_Z == 2
+#define LOAD_Z(i) truth(z_values[i])
+#elif DT_Z == 3
+#define LOAD_Z(i) widen_h(z_values[i])
+#elif DT_Z
 #define LOAD_Z(i) widen(z_values[i])
 #else
 #define LOAD_Z(i) z_values[i]
 #endif
-#if DT_OUT
+#if DT_OUT == 2
+// `v != 0.0` is true for a NaN, so a NaN stores true, as torch converts it
+#define STORE_OUT(i, v) out_values[i] = uint8_t((v) != 0.0 ? 1u : 0u)
+#elif DT_OUT == 3
+#define STORE_OUT(i, v) out_values[i] = narrow_h(v)
+#elif DT_OUT
 #define STORE_OUT(i, v) out_values[i] = narrow(v)
 #else
 #define STORE_OUT(i, v) out_values[i] = (v)
+#endif
+#if VECTOR_MODULE
+// Four consecutive elements from element i, a multiple of 4: one vector load
+// or store. The bf16 halves are widen's and narrow's, so a vector holds
+// exactly the values the scalar module reads and writes.
+#if DT_X == 1 || DT_Y == 1 || DT_Z == 1
+vec4 widen4(uvec2 w) {
+    return vec4(uintBitsToFloat(w.x << 16), uintBitsToFloat(w.x & 0xFFFF0000u),
+                uintBitsToFloat(w.y << 16), uintBitsToFloat(w.y & 0xFFFF0000u));
+}
+#endif
+// the binary16 halves are widen_h's and narrow_h's, element 0 in the low half
+#if DT_X == 3 || DT_Y == 3 || DT_Z == 3
+vec4 widen4_h(uvec2 w) {
+    return vec4(widen_h(uint16_t(w.x & 0xFFFFu)), widen_h(uint16_t(w.x >> 16)),
+                widen_h(uint16_t(w.y & 0xFFFFu)), widen_h(uint16_t(w.y >> 16)));
+}
+#endif
+#if DT_X == 3
+#define LOADV_X(i) widen4_h(x_vectors[(i) >> 2])
+#elif DT_X == 1
+#define LOADV_X(i) widen4(x_vectors[(i) >> 2])
+#else
+#define LOADV_X(i) x_vectors[(i) >> 2]
+#endif
+#if DT_Y == 3
+#define LOADV_Y(i) widen4_h(y_vectors[(i) >> 2])
+#elif DT_Y == 1
+#define LOADV_Y(i) widen4(y_vectors[(i) >> 2])
+#else
+#define LOADV_Y(i) y_vectors[(i) >> 2]
+#endif
+#if DT_Z == 3
+#define LOADV_Z(i) widen4_h(z_vectors[(i) >> 2])
+#elif DT_Z == 1
+#define LOADV_Z(i) widen4(z_vectors[(i) >> 2])
+#else
+#define LOADV_Z(i) z_vectors[(i) >> 2]
+#endif
+#if DT_OUT == 3
+#define STOREV_OUT(i, v) out_vectors[(i) >> 2] = uvec2(uint(narrow_h((v).x)) | (uint(narrow_h((v).y)) << 16), uint(narrow_h((v).z)) | (uint(narrow_h((v).w)) << 16))
+#elif DT_OUT == 1
+#define STOREV_OUT(i, v) out_vectors[(i) >> 2] = uvec2(uint(narrow((v).x)) | (uint(narrow((v).y)) << 16), uint(narrow((v).z)) | (uint(narrow((v).w)) << 16))
+#else
+#define STOREV_OUT(i, v) out_vectors[(i) >> 2] = (v)
+#endif
 #endif
 
 // Thirty little-endian u32 words, 120 bytes; the offsets are explicit so the
@@ -177,7 +424,20 @@ const uint OP_ADDCMUL = 17u;
 const uint OP_ADDCDIV = 18u;
 const uint OP_LERP = 19u;
 const uint OP_IOTA = 22u;
-const uint OP_LAST = 23u;
+const uint OP_GT = 26u;
+const uint OP_XOR = 34u;
+const uint OP_NOT = 35u;
+const uint OP_WHERE = 36u;
+const uint OP_SILU_BACKWARD = 37u;
+const uint OP_SILU_MUL = 38u;
+const uint OP_SWIGLU_GRAD_GATE = 39u;
+const uint OP_TANH = 40u;
+const uint OP_LOG = 41u;
+const uint OP_XLOGY = 42u;
+const uint OP_MINIMUM = 43u;
+const uint OP_MAXIMUM = 44u;
+const uint OP_THRESHOLD_BACKWARD = 46u;
+const uint OP_LAST = 46u;
 
 // glslang folds no bit cast into a global constant, so the quiet NaN and
 // the infinity are functions; every literal below is the exact decimal of
@@ -195,11 +455,14 @@ bool op_reads_x(uint op) {
 
 bool op_reads_y(uint op) {
     return op <= 3u || op == OP_POW || op == OP_SIGMOID_BACKWARD || op == OP_ADDCMUL
-        || op == OP_ADDCDIV || op == OP_LERP;
+        || op == OP_ADDCDIV || op == OP_LERP || (op >= OP_GT && op <= OP_XOR)
+        || op == OP_WHERE || op == OP_SILU_BACKWARD || op == OP_SILU_MUL
+        || op == OP_SWIGLU_GRAD_GATE || op == OP_XLOGY || op == OP_MINIMUM || op == OP_MAXIMUM
+        || op == OP_THRESHOLD_BACKWARD;
 }
 
 bool op_reads_z(uint op) {
-    return op == OP_ADDCMUL || op == OP_ADDCDIV;
+    return op == OP_ADDCMUL || op == OP_ADDCDIV || op == OP_WHERE || op == OP_SWIGLU_GRAD_GATE;
 }
 
 // True when the highest address a view of p.shape touches is inside the bound
@@ -218,9 +481,75 @@ bool valid_extent(uint offset, uint strides[4], uint available) {
     return maximum < available;
 }
 
+#if VECTOR_MODULE
+// An operand a vector module can take: not read, or broadcast along the last
+// dimension (stride 0 there: one read serves the four), or unit-stride there
+// with its offset and every other stride a multiple of 4, so each group of
+// four consecutive elements starts on a whole vector.
+bool vector_operand(bool reads, uint strides[4], uint offset) {
+    if (!reads) return true;
+    uint last = p.ndim - 1u;
+    if (strides[last] == 0u) return true;
+    if (strides[last] != 1u || (offset & 3u) != 0u) return false;
+    for (uint d = 0u; d < last; ++d) {
+        if ((strides[d] & 3u) != 0u) return false;
+    }
+    return true;
+}
+#endif
+
+// ---- decisions on the BITS (schema 8, 2026-10-16) -----------------------------------
+// Vulkan lets any floating-point instruction flush a subnormal operand unless
+// DenormPreserve is requested, and a comparison is such an instruction: on the
+// RX 9070 XT `+1.4e-45 <= 0` gave TRUE, where torch's CPU gives false (AKV MoE
+// plan Amendment 28, docs/audits/2026-09-30-akv-moe-megakernel-vulkan-plan.md).
+// So every comparison, nonzero test and selection in this family decides on its
+// operands' BITS, as schema 8's selections (43-46) were built to (Amendment 29,
+// the owner's audit of 2026-10-16). For an operand that is not a subnormal each
+// helper gives the truth value or word the float form gave, so those results
+// are unchanged; at a subnormal it gives the CPU's answer on any device.
+
+// A NaN is an exponent of all ones with a nonzero fraction, whatever its sign.
+bool nan_bits(uint u) { return (u & 0x7FFFFFFFu) > 0x7F800000u; }
+
+// For a word that is not NaN: an unsigned key whose order is the IEEE order of
+// the values, with -0 and +0 one key. A positive word sets the top bit; a
+// negative one is inverted, so a larger magnitude gives a smaller key.
+uint select_key(uint u) {
+    if ((u & 0x7FFFFFFFu) == 0u) return 0x80000000u;
+    return (u & 0x80000000u) != 0u ? ~u : (u | 0x80000000u);
+}
+
+// IEEE x < y and x == y: false when either is NaN
+bool less_bits(float x, float y) {
+    uint xu = floatBitsToUint(x);
+    uint yu = floatBitsToUint(y);
+    return !nan_bits(xu) && !nan_bits(yu) && select_key(xu) < select_key(yu);
+}
+
+bool equal_bits(float x, float y) {
+    uint xu = floatBitsToUint(x);
+    uint yu = floatBitsToUint(y);
+    return !nan_bits(xu) && !nan_bits(yu) && select_key(xu) == select_key(yu);
+}
+
+// x != 0 as torch's bool conversion: true for a NaN and a subnormal, false
+// for +-0
+bool nonzero_bits(float x) { return (floatBitsToUint(x) & 0x7FFFFFFFu) != 0u; }
+
+// x where c holds, else y: the chosen word moved as bits, through no
+// floating-point instruction
+float pick_bits(bool c, float x, float y) {
+    return uintBitsToFloat(c ? floatBitsToUint(x) : floatBitsToUint(y));
+}
+
 // sqrt with the CPU's NaN for a negative argument; GLSL leaves it undefined.
+// Negative is the sign bit of a nonzero word that is not NaN, so a negative
+// subnormal is NaN as on the CPU (a flushing `x < 0.0` called it -0).
 float sqrt_ieee(float x) {
-    return x < 0.0 ? nan_value() : sqrt(x);
+    uint u = floatBitsToUint(x);
+    bool negative = (u & 0x80000000u) != 0u && (u & 0x7FFFFFFFu) != 0u && !nan_bits(u);
+    return negative ? nan_value() : sqrt(x);
 }
 
 // std::pow(x, y): GLSL pow is undefined for x < 0 and for x == 0 with y <= 0,
@@ -280,8 +609,193 @@ float pow_exponent(float x, float y) {
 // yields high everywhere, as torch.clamp does.
 float clamp_torch(float x, float low, float high) {
     if (isnan(x)) return x;
-    float r = x < low ? low : x;
-    return r > high ? high : r;
+    // a NaN bound gives NaN, as torch's CPU kernel does; the comparisons below
+    // would pass x through, and GLSL's min/max are undefined for a NaN operand
+    // (NVIDIA returns the other one) -- 2026-09-27, found on a Tesla T4
+    if (isnan(low) || isnan(high)) return nan_value();
+    // the comparisons and the selections on the bits (2026-10-16, above)
+    float r = pick_bits(less_bits(x, low), low, x);
+    return pick_bits(less_bits(high, r), high, r);
+}
+
+// exp(x), with the power of two taken out exactly. k = floor(x*log2(e) + 1/2)
+// and r = (x - k*EXP_C1) - k*EXP_C2, where EXP_C1 + EXP_C2 = ln 2 is Cephes'
+// split: EXP_C1 carries 9 significant bits and |k| <= 150 carries 8, so
+// k*EXP_C1 is exact and r is reduced to about [-0.35, 0.35]. exp(r) is Cephes'
+// single-precision polynomial (peak relative error 1.7e-7 as published). The
+// result is ldexp'd in two halves so neither step leaves the normal range
+// before the last. Hardware exp is not used: Vulkan guarantees it only
+// 3 + 2|x| ulp, which is 180 ulp at the top of the range, and a polynomial in
+// precise arithmetic gives the same bits on every conformant device.
+// Edges (computed 2026-09-22 against float64 exp, rounded to float32):
+// 88.72283172607422 (0x42b17217) is the largest float32 whose exp is finite,
+// so anything above it is +inf; exp rounds to 0 at or below
+// -103.97208404541016 (0xc2cff1b5). A result below 2^-126 is subnormal, and a
+// device that flushes subnormals (the L4 reports shaderDenormPreserveFloat32
+// = false) returns 0 there, inside the family's 1e-7 absolute term.
+const float EXP_HI = 88.72283172607422;               // 0x42b17217
+const float EXP_LO = -103.97208404541016;             // 0xc2cff1b5
+const float LOG2E = 1.4426950216293335;               // 0x3fb8aa3b
+const float EXP_C1 = 0.693359375;                     // 0x3f318000, 9 bits
+const float EXP_C2 = -0.00021219444170128554;         // 0xb95e8083
+// Cephes expf's P0..P5 (1.9875691500e-4, 1.3981999507e-3, 8.3334519073e-3,
+// 4.1665795894e-2, 1.6666665459e-1, 5.0000001201e-1), each written as the
+// exact decimal of the float32 it rounds to; the last is 0.5 exactly.
+const float EXP_P0 = 0.00019875691214110702;          // 0x39506967
+const float EXP_P1 = 0.001398199936375022;            // 0x3ab743ce
+const float EXP_P2 = 0.008333452045917511;            // 0x3c088908
+const float EXP_P3 = 0.04166579619050026;             // 0x3d2aa9c1
+const float EXP_P4 = 0.1666666567325592;              // 0x3e2aaaaa
+const float EXP_P5 = 0.5;                             // 0x3f000000
+
+float exp_torch(float x) {
+    if (isnan(x)) return x;
+    if (x > EXP_HI) return inf_value();
+    if (x <= EXP_LO) return 0.0;
+    precise float t = LOG2E * x + 0.5;
+    float k = floor(t);
+    precise float r = (x - k * EXP_C1) - k * EXP_C2;
+    precise float z = r * r;
+    precise float p = (((((EXP_P0 * r + EXP_P1) * r + EXP_P2) * r + EXP_P3) * r + EXP_P4) * r
+                       + EXP_P5) * z + r + 1.0;
+    int ki = int(k);
+    int k1 = ki >> 1;   // floor(k/2), arithmetic: no signed-division rounding question
+    return ldexp(ldexp(p, k1), ki - k1);
+}
+
+// ---- schema 6 (2026-09-28): tanh, log and xlogy, in add and mul alone --------------
+// No hardware tanh or log: Vulkan leaves their precision to the implementation.
+// Each is a fixed sequence of correctly rounded f32 adds and multiplies,
+// `precise` so nothing is contracted, and exact bit operations, so its bits are
+// the same on every conformant device. The division a textbook tanh uses is
+// replaced by a Newton reciprocal for that reason: Vulkan's `/` is only 2.5 ulp
+// and device-dependent. Where a subnormal is an operand, the answer comes from
+// the bits (tanh's identity region, log's range reduction), so a device that
+// flushes subnormals still gets it right.
+//
+// ERROR, MEASURED 2026-09-28 by a host emulation of exactly these steps (numpy
+// float32, every rounding explicit), against float64 tanh and log: tanh within
+// 1.84 ulp of the exact value over EVERY float32 of its polynomial and exp
+// regions, [2^-12, TANH_SAT); log within 0.83 ulp over EVERY positive finite
+// float32 (2,139,095,038 values). tanh's identity and saturation regions were
+// swept over [2^-20, 2^-12) and [TANH_SAT, 20), correctly rounded throughout,
+// and are exact beyond them by construction (below 2^-12, x^2/3 is under half
+// an ulp of x; from TANH_SAT, tanh rounds to 1). Against torch 2.14's CPU (its
+// Sleef u10 vector kernels) over 17.8M values: 2 ulp for tanh, 1 for log. The
+// device test holds the device to these bounds and to the emulation's bits
+// (tests/pointwise_abi.rs).
+
+// 1/d for a normal, positive d, with no division: a seed from the bits (relative
+// error at most 5.1%) and three Newton steps r := r * (2 - d*r), each squaring
+// the error, until rounding alone limits it.
+float recip_newton(float d) {
+    precise float r = uintBitsToFloat(0x7EF311C3u - floatBitsToUint(d));
+    r = r * (2.0 - d * r);
+    r = r * (2.0 - d * r);
+    r = r * (2.0 - d * r);
+    return r;
+}
+
+// tanh(x). Below 2^-12, tanh(x) rounds to x: x's own bits (so +-0 and
+// subnormals are exact everywhere). Below 0.625, Cephes tanhf's odd polynomial.
+// Below TANH_SAT, 1 - 2/(exp(2|x|) + 1) with exp_torch and the Newton
+// reciprocal, the sign from x's bit. From TANH_SAT (the smallest float32 whose
+// tanh rounds to 1, computed 2026-09-28 against float64) and for the
+// infinities, +-1. A NaN keeps its own bits, as exp's does.
+const float TANH_SMALL = 0.000244140625;                // 0x39800000, 2^-12
+const float TANH_POLY = 0.625;                          // 0x3f200000
+const float TANH_SAT = 9.010913848876953;               // 0x41102cb4
+// Cephes tanhf's P0..P4 (-5.70498872745e-3, 2.06390887954e-2,
+// -5.37397155531e-2, 1.33314422036e-1, -3.33332819422e-1), each written as the
+// decimal of the float32 it rounds to.
+const float TANH_P0 = -0.0057049887254834175;           // 0xbbbaf0ea
+const float TANH_P1 = 0.0206390880048275;               // 0x3ca9134e
+const float TANH_P2 = -0.05373971536755562;             // 0xbd5c1e2d
+const float TANH_P3 = 0.13331441581249237;              // 0x3e088393
+const float TANH_P4 = -0.3333328068256378;              // 0xbeaaaa99
+
+float tanh_torch(float x) {
+    if (isnan(x)) return x;
+    uint bits = floatBitsToUint(x);
+    float ax = uintBitsToFloat(bits & 0x7FFFFFFFu);
+    if (ax < TANH_SMALL) return x;
+    if (ax >= TANH_SAT) return uintBitsToFloat((bits & 0x80000000u) | 0x3F800000u);
+    precise float t;
+    if (ax < TANH_POLY) {
+        precise float s = x * x;
+        t = ((((TANH_P0 * s + TANH_P1) * s + TANH_P2) * s + TANH_P3) * s + TANH_P4) * s * x + x;
+    } else {
+        precise float e = exp_torch(ax + ax);
+        precise float q = recip_newton(e + 1.0) * 2.0;
+        precise float m = 1.0 - q;
+        t = uintBitsToFloat((bits & 0x80000000u) | floatBitsToUint(m));
+    }
+    return t;
+}
+
+// log(x). The range reduction is on the bits: x = m * 2^e with m in [0.5, 1)
+// (a subnormal normalised by its leading one); m below sqrt(1/2) is doubled and
+// e lowered, so z = m - 1 lies in [-0.293, 0.415) and is exact. Cephes logf's
+// polynomial gives log(1 + z), and e*ln 2 is added in two parts: LOG_C1 has 9
+// bits, so e*LOG_C1 is exact for |e| <= 150, and LOG_C2 is the rest.
+// log(+-0) is -inf, a negative x (or -inf) NaN, +inf itself, a NaN its own bits.
+const float LOG_SQRTHF = 0.7071067690849304;            // 0x3f3504f3, sqrt(1/2)
+const float LOG_C1 = 0.693359375;                       // 0x3f318000, 9 bits
+const float LOG_C2 = -0.00021219444170128554;           // 0xb95e8083
+// Cephes logf's P0..P8 (7.0376836292e-2, -1.1514610310e-1, 1.1676998740e-1,
+// -1.2420140846e-1, 1.4249322787e-1, -1.6668057665e-1, 2.0000714765e-1,
+// -2.4999993993e-1, 3.3333331174e-1), each the float32 it rounds to.
+const float LOG_P0 = 0.07037683576345444;               // 0x3d9021bb
+const float LOG_P1 = -0.11514610052108765;              // 0xbdebd1b8
+const float LOG_P2 = 0.11676998436450958;               // 0x3def251a
+const float LOG_P3 = -0.12420140951871872;              // 0xbdfe5d4f
+const float LOG_P4 = 0.14249323308467865;               // 0x3e11e9bf
+const float LOG_P5 = -0.16668057441711426;              // 0xbe2aae50
+const float LOG_P6 = 0.2000071406364441;                // 0x3e4cceac
+const float LOG_P7 = -0.24999994039535522;              // 0xbe7ffffc
+const float LOG_P8 = 0.3333333134651184;                // 0x3eaaaaaa
+
+float log_torch(float x) {
+    if (isnan(x)) return x;
+    uint bits = floatBitsToUint(x);
+    if ((bits & 0x7FFFFFFFu) == 0u) return uintBitsToFloat(0xFF800000u);   // -inf
+    if ((bits & 0x80000000u) != 0u) return nan_value();
+    if (bits == 0x7F800000u) return x;
+    int e = int(bits >> 23u);
+    uint man = bits & 0x7FFFFFu;
+    if (e == 0) {
+        int shift = 23 - findMSB(man);
+        man = (man << uint(shift)) & 0x7FFFFFu;
+        e = -125 - shift;
+    } else {
+        e -= 126;
+    }
+    float m = uintBitsToFloat(0x3F000000u | man);   // [0.5, 1)
+    precise float z;
+    if (m < LOG_SQRTHF) {
+        e -= 1;
+        z = (m + m) - 1.0;
+    } else {
+        z = m - 1.0;
+    }
+    precise float zz = z * z;
+    precise float y = ((((((((LOG_P0 * z + LOG_P1) * z + LOG_P2) * z + LOG_P3) * z + LOG_P4) * z + LOG_P5) * z
+                        + LOG_P6) * z + LOG_P7) * z + LOG_P8) * z * zz;
+    float fe = float(e);
+    if (e != 0) y = y + LOG_C2 * fe;
+    y = y + -0.5 * zz;
+    precise float r = z + y;
+    if (e != 0) r = r + LOG_C1 * fe;
+    return r;
+}
+
+// torch's xlogy: NaN where y is NaN, else 0 where x is +-0 (whatever y is),
+// else x * log(y). The zero test is on the bits, so a subnormal x is not zero.
+float xlogy_torch(float x, float y) {
+    if (isnan(y)) return nan_value();
+    if ((floatBitsToUint(x) & 0x7FFFFFFFu) == 0u) return 0.0;
+    precise float r = x * log_torch(y);
+    return r;
 }
 
 // torch's lerp: the branch keeps the result exact at weight 0 and weight 1.
@@ -376,6 +890,110 @@ void sincos_reduced(float x, out float s, out float c) {
     s = x == 0.0 ? x : s;
 }
 
+// minimum (43) and maximum (44) as torch's CPU vectorised body answers them
+float select_min_max(float x, float y, bool larger) {
+    uint xu = floatBitsToUint(x);
+    uint yu = floatBitsToUint(y);
+    if (nan_bits(xu) || nan_bits(yu)) return uintBitsToFloat(0xFFFFFFFFu);
+    uint kx = select_key(xu);
+    uint ky = select_key(yu);
+    // equal keys (one value, or zeros of opposite sign) give y
+    return uintBitsToFloat((larger ? kx > ky : kx < ky) ? xu : yu);
+}
+
+// relu (45): x where x is NaN or not below zero, else +0
+float select_relu(float x) {
+    uint xu = floatBitsToUint(x);
+    bool below = (xu & 0x80000000u) != 0u && (xu & 0x7FFFFFFFu) != 0u && !nan_bits(xu);
+    return uintBitsToFloat(below ? 0u : xu);
+}
+
+// threshold_backward (46): +0 where y <= a, else x
+float select_threshold_backward(float x, float y, float a) {
+    uint yu = floatBitsToUint(y);
+    uint au = floatBitsToUint(a);
+    bool at_or_below = !nan_bits(yu) && !nan_bits(au) && select_key(yu) <= select_key(au);
+    return uintBitsToFloat(at_or_below ? 0u : floatBitsToUint(x));
+}
+
+// The operation on one element's operand values: one definition for every
+// path that computes an element (2026-09-27), so a vector module's elements
+// are the scalar module's bits by construction.
+float apply_op(float x_value, float y_value, float z_value, uint index, uint row, uint column,
+               float a, float b, int diagonal) {
+    float sine = 0.0;
+    float cosine = 0.0;
+    if (p.op == 20u || p.op == 21u) sincos_reduced(x_value, sine, cosine);
+    precise float result;
+    switch (p.op) {
+        case 0u: result = x_value + a * y_value; break;
+        case 1u: result = x_value - a * y_value; break;
+        case 2u: result = x_value * y_value; break;
+        case 3u: result = x_value / y_value; break;
+        case 4u: result = a; break;
+        case 5u: result = x_value; break;
+        case 6u: result = 1.0 / x_value; break;
+        // abs and neg are SIGN-BIT operations (2026-09-27): Vulkan lets any
+        // floating-point instruction flush a subnormal unless DenormPreserve is
+        // requested, and a Tesla T4 can request neither mode; its fneg flushed
+        // -1e-40 to -0.0. Bit operations are exact on every device, and they
+        // are torch's answer (NaN payloads included).
+        case 7u: result = uintBitsToFloat(floatBitsToUint(x_value) & 0x7FFFFFFFu); break;
+        case 8u: result = sqrt_ieee(x_value); break;
+        case 9u: result = 1.0 / sqrt_ieee(x_value); break;
+        case 10u: result = uintBitsToFloat(floatBitsToUint(x_value) ^ 0x80000000u); break;
+        case 11u: result = pow_exponent(x_value, y_value); break;
+        case 12u: result = pow_ieee(a, x_value); break;
+        case 13u: result = clamp_torch(x_value, a, b); break;
+        case 14u: result = x_value / (1.0 + exp(-x_value)); break;
+        case 15u: result = 1.0 / (1.0 + exp(-x_value)); break;
+        case 16u: result = x_value * (1.0 - y_value) * y_value; break;
+        case 17u: result = x_value + a * y_value * z_value; break;
+        case 18u: result = x_value + a * y_value / z_value; break;
+        case 19u: result = lerp_torch(x_value, y_value, a); break;
+        case 20u: result = cosine; break;
+        case 21u: result = sine; break;
+        case 22u: result = a + float(index) * b; break;
+        case 23u: result = (int(column) - int(row) >= diagonal) ? x_value : 0.0; break;
+        case 24u: result = exp_torch(x_value); break;
+        // a NaN keeps its own bits, as torch.round does: NVIDIA's roundEven
+        // returns its canonical 0x7fffffff (measured on the L4, 2026-09-22)
+        case 25u: result = isnan(x_value) ? x_value : roundEven(x_value); break;
+        // 26-36 decide on the bits (2026-10-16): a flushing float comparison
+        // got a subnormal operand wrong on the RX 9070 XT
+        case 26u: result = less_bits(y_value, x_value) ? 1.0 : 0.0; break;
+        case 27u: result = less_bits(x_value, y_value) ? 1.0 : 0.0; break;
+        case 28u: result = (less_bits(y_value, x_value) || equal_bits(x_value, y_value)) ? 1.0 : 0.0; break;
+        case 29u: result = (less_bits(x_value, y_value) || equal_bits(x_value, y_value)) ? 1.0 : 0.0; break;
+        case 30u: result = equal_bits(x_value, y_value) ? 1.0 : 0.0; break;
+        case 31u: result = equal_bits(x_value, y_value) ? 0.0 : 1.0; break;
+        case 32u: result = (nonzero_bits(x_value) && nonzero_bits(y_value)) ? 1.0 : 0.0; break;
+        case 33u: result = (nonzero_bits(x_value) || nonzero_bits(y_value)) ? 1.0 : 0.0; break;
+        case 34u: result = (nonzero_bits(x_value) != nonzero_bits(y_value)) ? 1.0 : 0.0; break;
+        case 35u: result = nonzero_bits(x_value) ? 0.0 : 1.0; break;
+        case 36u: result = pick_bits(nonzero_bits(x_value), y_value, z_value); break;
+        case 37u: {
+            precise float s = 1.0 / (1.0 + exp(-y_value));
+            result = x_value * s * (1.0 + y_value * (1.0 - s));
+        } break;
+        case 38u: result = x_value * (y_value / (1.0 + exp(-y_value))); break;
+        case 39u: {
+            precise float s = 1.0 / (1.0 + exp(-z_value));
+            result = (x_value * y_value) * (s * (1.0 + z_value * (1.0 - s)));
+        } break;
+        case 40u: result = tanh_torch(x_value); break;
+        case 41u: result = log_torch(x_value); break;
+        case 42u: result = xlogy_torch(x_value, y_value); break;
+        case 43u: result = select_min_max(x_value, y_value, false); break;
+        case 44u: result = select_min_max(x_value, y_value, true); break;
+        case 45u: result = select_relu(x_value); break;
+        case 46u: result = select_threshold_backward(x_value, y_value, a); break;
+        // An invalid op cannot masquerade as a valid computed tensor.
+        default: result = nan_value(); break;
+    }
+    return result;
+}
+
 void main() {
     // This validation and every early return are uniform for the dispatch: a
     // plan the host did not validate writes nothing, not a partial result.
@@ -398,9 +1016,64 @@ void main() {
     float a = uintBitsToFloat(p.scalar_a);
     float b = uintBitsToFloat(p.scalar_b);
     int diagonal = int(p.scalar_b);
-    uint base = gl_GlobalInvocationID.x * 4u;
+#if VECTOR_MODULE
+    // The host sends a call here only if vector_eligible() held. These checks
+    // re-derive that geometry and, if it fails, write nothing, as for any plan
+    // the host did not validate. A zero-dimension call has no last dimension.
+    uint last = p.ndim - 1u;
+    if (p.ndim == 0u || (p.shape[last] & 3u) != 0u) return;
+    if (!vector_operand(reads_x, p.x_stride, p.x_offset) || !vector_operand(reads_y, p.y_stride, p.y_offset)
+        || !vector_operand(reads_z, p.z_stride, p.z_offset) || p.out_stride[last] != 1u
+        || !vector_operand(true, p.out_stride, p.out_offset)) return;
+    // lane j of workgroup w: the four elements from 1,024 w + 4 j, which share
+    // a row because the last extent is a multiple of 4
+    uint e0 = (gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x) * 4u;
+    if (e0 >= p.n) return;
+    // the scalar module's unravel, for e0
+    uint remainder = e0;
+    uint x_address = p.x_offset;
+    uint y_address = p.y_offset;
+    uint z_address = p.z_offset;
+    uint out_address = p.out_offset;
+    uint row = 0u;
+    uint column = 0u;
+    if (p.ndim == 1u) {
+        column = e0;
+        x_address += e0 * p.x_stride[0];
+        y_address += e0 * p.y_stride[0];
+        z_address += e0 * p.z_stride[0];
+        out_address += e0 * p.out_stride[0];
+    } else for (uint d = p.ndim; d > 0u; --d) {
+        uint coordinate = remainder % p.shape[d - 1u];
+        remainder /= p.shape[d - 1u];
+        if (d == p.ndim) column = coordinate;
+        else if (d + 1u == p.ndim) row = coordinate;
+        x_address += coordinate * p.x_stride[d - 1u];
+        y_address += coordinate * p.y_stride[d - 1u];
+        z_address += coordinate * p.z_stride[d - 1u];
+        out_address += coordinate * p.out_stride[d - 1u];
+    }
+    vec4 xv = vec4(0.0);
+    vec4 yv = vec4(b);
+    vec4 zv = vec4(0.0);
+    if (reads_x) xv = p.x_stride[last] == 0u ? vec4(LOAD_X(x_address)) : LOADV_X(x_address);
+    if (reads_y) yv = p.y_stride[last] == 0u ? vec4(LOAD_Y(y_address)) : LOADV_Y(y_address);
+    if (reads_z) zv = p.z_stride[last] == 0u ? vec4(LOAD_Z(z_address)) : LOADV_Z(z_address);
+    precise vec4 result = vec4(apply_op(xv.x, yv.x, zv.x, e0, row, column, a, b, diagonal),
+                               apply_op(xv.y, yv.y, zv.y, e0 + 1u, row, column + 1u, a, b, diagonal),
+                               apply_op(xv.z, yv.z, zv.z, e0 + 2u, row, column + 2u, a, b, diagonal),
+                               apply_op(xv.w, yv.w, zv.w, e0 + 3u, row, column + 3u, a, b, diagonal));
+    STOREV_OUT(out_address, result);
+#else
+    // A workgroup owns 1,024 consecutive indices and takes them in four
+    // passes of 256, lane j at base + j + 256 i: one load instruction of a
+    // subgroup then reads consecutive elements (2026-09-27). Before, each
+    // invocation took four CONSECUTIVE indices, so neighbouring lanes sat four
+    // elements apart and every load instruction spanned four times the bytes
+    // it used.
+    uint base = gl_WorkGroupID.x * 1024u + gl_LocalInvocationID.x;
     for (uint i = 0u; i < 4u; ++i) {
-        uint index = base + i;
+        uint index = base + i * 256u;
         if (index >= p.n) break;
         // Row-major unravelling by shape: the last dimension varies fastest.
         // Extent validation above proves every address stays below LIMIT.
@@ -411,7 +1084,15 @@ void main() {
         uint out_address = p.out_offset;
         uint row = 0u;
         uint column = 0u;
-        for (uint d = p.ndim; d > 0u; --d) {
+        // one dimension (a dense or evenly strided call, as the host's
+        // coalescing hands most of them over, 2026-09-27): no unravel at all
+        if (p.ndim == 1u) {
+            column = index;
+            x_address += index * p.x_stride[0];
+            y_address += index * p.y_stride[0];
+            z_address += index * p.z_stride[0];
+            out_address += index * p.out_stride[0];
+        } else for (uint d = p.ndim; d > 0u; --d) {
             uint coordinate = remainder % p.shape[d - 1u];
             remainder /= p.shape[d - 1u];
             if (d == p.ndim) column = coordinate;
@@ -427,38 +1108,8 @@ void main() {
         if (reads_y) y_value = LOAD_Y(y_address);
         float z_value = 0.0;
         if (reads_z) z_value = LOAD_Z(z_address);
-        float sine = 0.0;
-        float cosine = 0.0;
-        if (p.op == 20u || p.op == 21u) sincos_reduced(x_value, sine, cosine);
-        precise float result;
-        switch (p.op) {
-            case 0u: result = x_value + a * y_value; break;
-            case 1u: result = x_value - a * y_value; break;
-            case 2u: result = x_value * y_value; break;
-            case 3u: result = x_value / y_value; break;
-            case 4u: result = a; break;
-            case 5u: result = x_value; break;
-            case 6u: result = 1.0 / x_value; break;
-            case 7u: result = abs(x_value); break;
-            case 8u: result = sqrt_ieee(x_value); break;
-            case 9u: result = 1.0 / sqrt_ieee(x_value); break;
-            case 10u: result = -x_value; break;
-            case 11u: result = pow_exponent(x_value, y_value); break;
-            case 12u: result = pow_ieee(a, x_value); break;
-            case 13u: result = clamp_torch(x_value, a, b); break;
-            case 14u: result = x_value / (1.0 + exp(-x_value)); break;
-            case 15u: result = 1.0 / (1.0 + exp(-x_value)); break;
-            case 16u: result = x_value * (1.0 - y_value) * y_value; break;
-            case 17u: result = x_value + a * y_value * z_value; break;
-            case 18u: result = x_value + a * y_value / z_value; break;
-            case 19u: result = lerp_torch(x_value, y_value, a); break;
-            case 20u: result = cosine; break;
-            case 21u: result = sine; break;
-            case 22u: result = a + float(index) * b; break;
-            case 23u: result = (int(column) - int(row) >= diagonal) ? x_value : 0.0; break;
-            // An invalid op cannot masquerade as a valid computed tensor.
-            default: result = nan_value(); break;
-        }
+        precise float result = apply_op(x_value, y_value, z_value, index, row, column, a, b, diagonal);
         STORE_OUT(out_address, result);
     }
+#endif
 }

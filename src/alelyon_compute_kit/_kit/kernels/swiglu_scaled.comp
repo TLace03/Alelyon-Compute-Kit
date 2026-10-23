@@ -1,0 +1,171 @@
+#version 450
+// swiglu-scaled/v1 (2026-09-30): the sub-bit student's experts' activation,
+// out = silu(gate) * (up * g) (research/subbit_expert/moe/formats.py
+// `_swiglu_f`), and its backward, one invocation per element, over FP32
+// (STORAGE=0), bf16 (STORAGE=1) or fp16 (STORAGE=2) storage. gate and up are
+// `rows` rows of `cols` (the experts' (experts, width, FF) rows, contiguous);
+// g holds one row of `cols` for every `width` consecutive rows (the experts'
+// (experts, 1, FF) scales, broadcast along the width).
+//
+// The law is the decomposition torch runs for that dtype, through the kit's
+// own operations, with every intermediate TENSOR rounded to the storage type
+// where that decomposition rounds it (on the kit an fp16 operation widens its
+// operands exactly, runs the f32 pointwise operation and narrows once):
+//   s   = stored(gate / (1 + exp(-gate)))            silu, pointwise operation 14
+//   b   = stored(up * g)                             mul, pointwise operation 2
+//   op 0, forward:  out = stored(s * b)              mul
+//   op 1, backward: `grad` is out's upstream gradient; three outputs of rows x
+//   cols are written, each to its own buffer (a consumer then reads each from
+//   its buffer's front, as the kit's products need):
+//     grad_s = stored(grad * b)                      MulBackward's grad * other
+//     grad_b = stored(grad * s)                      MulBackward's grad * self
+//     sig    = 1 / (1 + exp(-gate))
+//     binding 4, gate's gradient: stored(grad_s * sig * (1 + gate * (1 - sig)))
+//                                                    silu_backward, operation 37
+//     binding 5, up's gradient:   stored(grad_b * g) MulBackward of up * g
+//     binding 6, t:               stored(grad_b * up) its grad * self, before
+//   g's gradient, which autograd forms as t.sum_to_size(g.shape): the caller
+//   runs that sum itself, the kit's own reduction in its own order, so it is
+//   the decomposition's too.
+// `stored` is the identity for FP32; round to nearest even to bf16 and back
+// for bf16 (the pointwise family's `narrow`); for fp16, convert/v1's integer
+// routines, exact widening and round to nearest even with c10's NaN (sign |
+// 0x7E00), which the kit's composed fp16 operations use. Every step is
+// `precise`, with no fused multiply-add, in the pointwise family's order, and
+// `exp` and the division are GLSL's, as the family's are. So on one device
+// every value that is not a NaN is that decomposition's bit for bit, signed
+// zeros included; a NaN is a NaN in both, its sign and payload not part of the
+// law (a multiply of two NaNs returns one of them, by the operand order each
+// compilation gives it).
+#if STORAGE != 0
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#endif
+layout(local_size_x = 256) in;
+#if STORAGE != 0
+layout(set = 0, binding = 0, std430) readonly buffer Gate { uint16_t gate_values[]; };
+layout(set = 0, binding = 1, std430) readonly buffer Up { uint16_t up_values[]; };
+layout(set = 0, binding = 2, std430) readonly buffer Scale { uint16_t scale_values[]; };
+layout(set = 0, binding = 3, std430) readonly buffer Upstream { uint16_t upstream_values[]; };
+layout(set = 0, binding = 4, std430) writeonly buffer Output { uint16_t output_values[]; };
+layout(set = 0, binding = 5, std430) writeonly buffer UpGrad { uint16_t up_grad_values[]; };
+layout(set = 0, binding = 6, std430) writeonly buffer ScaleTerm { uint16_t scale_term_values[]; };
+#else
+layout(set = 0, binding = 0, std430) readonly buffer Gate { float gate_values[]; };
+layout(set = 0, binding = 1, std430) readonly buffer Up { float up_values[]; };
+layout(set = 0, binding = 2, std430) readonly buffer Scale { float scale_values[]; };
+layout(set = 0, binding = 3, std430) readonly buffer Upstream { float upstream_values[]; };
+layout(set = 0, binding = 4, std430) writeonly buffer Output { float output_values[]; };
+layout(set = 0, binding = 5, std430) writeonly buffer UpGrad { float up_grad_values[]; };
+layout(set = 0, binding = 6, std430) writeonly buffer ScaleTerm { float scale_term_values[]; };
+#endif
+layout(push_constant) uniform Push {
+    uint rows;      // gate's and up's rows
+    uint cols;      // their width, and the scale rows'
+    uint width;     // rows sharing one scale row
+    uint op;        // 0 forward, 1 backward
+    uint elements;  // rows * cols, at most 2^30 by the host plan
+} p;
+
+#if STORAGE == 1
+float widen(uint16_t bits) { return uintBitsToFloat(uint(bits) << 16); }
+// copied from kernels/pointwise_f32.comp's `narrow` (itself from cast_f32_bf16.comp)
+uint16_t narrow(float x) {
+    const uint bits = floatBitsToUint(x);
+    if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu) != 0u) {
+        return uint16_t((bits >> 16) | 0x0040u);   // quiet NaN
+    }
+    const uint lsb = (bits >> 16) & 1u;
+    return uint16_t((bits + 0x7FFFu + lsb) >> 16);
+}
+#elif STORAGE == 2
+// convert/v1's integer routines, verbatim (kernels/convert.comp): f16 -> f32
+// exact, f32 -> f16 round to nearest even with NaN -> sign | 0x7E00
+uint f16_to_f32(uint h) {
+    uint sign = (h & 0x8000u) << 16u;
+    uint e = (h >> 10u) & 0x1Fu;
+    uint m = h & 0x3FFu;
+    if (e == 0x1Fu) return sign | 0x7F800000u | (m << 13u);
+    if (e == 0u) {
+        if (m == 0u) return sign;
+        uint t = uint(findMSB(m));
+        return sign | ((t + 103u) << 23u) | (((m << (23u - t)) & 0x7FFFFFu));
+    }
+    return sign | ((e + 112u) << 23u) | (m << 13u);
+}
+
+uint f32_to_f16(uint w) {
+    uint sign = (w >> 16u) & 0x8000u;
+    uint e = (w >> 23u) & 0xFFu;
+    uint m = w & 0x7FFFFFu;
+    if (e == 0xFFu) return sign | (m != 0u ? 0x7E00u : 0x7C00u);
+    int he = int(e) - 112;
+    if (he >= 31) return sign | 0x7C00u;
+    if (he <= 0) {
+        if (he < -10) return sign;
+        uint mf = m | 0x800000u;
+        uint shift = uint(14 - he);
+        uint q = mf >> shift;
+        uint rem = mf & ((1u << shift) - 1u);
+        uint half_ulp = 1u << (shift - 1u);
+        if (rem > half_ulp || (rem == half_ulp && (q & 1u) != 0u)) q += 1u;
+        return sign | q;
+    }
+    uint h = (uint(he) << 10u) | (m >> 13u);
+    uint rem = m & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u) != 0u)) h += 1u;
+    return sign | h;
+}
+
+float widen(uint16_t bits) { return uintBitsToFloat(f16_to_f32(uint(bits))); }
+uint16_t narrow(float x) { return uint16_t(f32_to_f16(floatBitsToUint(x))); }
+#endif
+
+#if STORAGE != 0
+float load_gate(uint i) { return widen(gate_values[i]); }
+float load_up(uint i) { return widen(up_values[i]); }
+float load_scale(uint i) { return widen(scale_values[i]); }
+float load_upstream(uint i) { return widen(upstream_values[i]); }
+void store(uint i, float v) { output_values[i] = narrow(v); }
+void store_up_grad(uint i, float v) { up_grad_values[i] = narrow(v); }
+void store_scale_term(uint i, float v) { scale_term_values[i] = narrow(v); }
+float stored(float v) { return widen(narrow(v)); }
+#else
+float load_gate(uint i) { return gate_values[i]; }
+float load_up(uint i) { return up_values[i]; }
+float load_scale(uint i) { return scale_values[i]; }
+float load_upstream(uint i) { return upstream_values[i]; }
+void store(uint i, float v) { output_values[i] = v; }
+void store_up_grad(uint i, float v) { up_grad_values[i] = v; }
+void store_scale_term(uint i, float v) { scale_term_values[i] = v; }
+float stored(float v) { return v; }
+#endif
+
+void main() {
+    uint id = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * 256u);
+    if (id >= p.elements) return;
+    uint r = id / p.cols;
+    uint c = id - r * p.cols;
+    uint is = (r / p.width) * p.cols + c;
+    precise float gate = load_gate(id);
+    precise float up = load_up(id);
+    precise float g = load_scale(is);
+    precise float silu_gate = gate / (1.0 + exp(-gate));
+    precise float s = stored(silu_gate);
+    precise float b = stored(up * g);
+    if (p.op == 0u) {
+        precise float product = s * b;
+        store(id, product);
+    } else {
+        precise float grad = load_upstream(id);
+        precise float grad_s = stored(grad * b);
+        precise float grad_b = stored(grad * s);
+        precise float sig = 1.0 / (1.0 + exp(-gate));
+        precise float d_gate = grad_s * sig * (1.0 + gate * (1.0 - sig));
+        precise float d_up = grad_b * g;
+        precise float t = grad_b * up;
+        store(id, d_gate);
+        store_up_grad(id, d_up);
+        store_scale_term(id, t);
+    }
+}

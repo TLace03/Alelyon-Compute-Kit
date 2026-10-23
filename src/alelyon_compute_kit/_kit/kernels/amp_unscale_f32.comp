@@ -1,0 +1,132 @@
+#version 450
+// ACK amp-unscale-f32/v1 (2026-09-29): GradScaler's non-finite check and
+// unscale of ONE float32 gradient -- torch's
+// _amp_foreach_non_finite_check_and_unscale_ for one tensor of its list -- in
+// one dispatch. Every element that is an infinity or a NaN stores 1.0f into
+// `found` (an atomic exchange of that one word; `found` is never cleared,
+// because the CPU never clears it), and every element is multiplied by the
+// scale in place, unless the scale is exactly 1.0f, which keeps every bit
+// (the CPU's own `inv_scale == 1.f` branch).
+//
+// The product is IEEE 754 binary32, round to nearest even, subnormals kept,
+// in 32-bit integer instructions only, so its bits do not depend on a
+// device's float controls (a device may flush float32 subnormals). The NaN
+// rules are those of torch's CPU vectorised body (MEASURED on torch 2.14,
+// 480,000 random bit patterns and 21 x 15 special pairs): the scale's NaN
+// first, then the element's, each quieted, and an invalid product (0 * inf) is
+// x86's default NaN 0xFFC00000. torch's SCALAR tail (the last elements of a
+// tensor whose length is not a multiple of the vector width) keeps the
+// element's NaN over a NaN scale instead; a NaN scale never comes from
+// GradScaler, whose scale is finite and positive.
+//
+// The dense view [offset, offset + count) is addressed with a grid-stride
+// loop. The buffers bound must hold what the push addresses; otherwise the
+// shader writes nothing (the host plan refuses such a call by name first).
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) buffer Data { uint data_words[]; };
+layout(set = 0, binding = 1, std430) readonly buffer Scale { uint scale_words[]; };
+layout(set = 0, binding = 2, std430) buffer Found { uint found_words[]; };
+layout(push_constant) uniform Push {
+    uint offset;        // the gradient's first element
+    uint count;         // its elements, dense
+    uint scale_offset;  // inv_scale's element
+    uint found_offset;  // found_inf's element
+} p;
+
+const uint ONE = 0x3F800000u;
+
+// IEEE binary32 s * v, round to nearest even, subnormals kept, with the NaN
+// rules above. Every step is integer arithmetic.
+uint f32_mul(uint s, uint v) {
+    const uint es = (s >> 23) & 0xFFu;
+    const uint ev = (v >> 23) & 0xFFu;
+    uint ms = s & 0x7FFFFFu;
+    uint mv = v & 0x7FFFFFu;
+    const uint sign = (s ^ v) & 0x80000000u;
+    if (es == 0xFFu && ms != 0u) return s | 0x400000u;   // the scale's NaN, quieted
+    if (ev == 0xFFu && mv != 0u) return v | 0x400000u;   // then the element's
+    const bool s_zero = (s & 0x7FFFFFFFu) == 0u;
+    const bool v_zero = (v & 0x7FFFFFFFu) == 0u;
+    if ((es == 0xFFu && v_zero) || (ev == 0xFFu && s_zero)) return 0xFFC00000u;   // 0 * inf
+    if (es == 0xFFu || ev == 0xFFu) return sign | 0x7F800000u;
+    if (s_zero || v_zero) return sign;
+    // both significands in [2^23, 2^24), with biased exponents that go below 1
+    // for a subnormal operand
+    int e1 = int(es);
+    int e2 = int(ev);
+    if (es == 0u) {
+        const int top = findMSB(ms);
+        ms <<= uint(23 - top);
+        e1 = 1 - (23 - top);
+    } else {
+        ms |= 0x800000u;
+    }
+    if (ev == 0u) {
+        const int top = findMSB(mv);
+        mv <<= uint(23 - top);
+        e2 = 1 - (23 - top);
+    } else {
+        mv |= 0x800000u;
+    }
+    uint hi;
+    uint lo;
+    umulExtended(ms, mv, hi, lo);   // the exact product, in [2^46, 2^48): hi holds bits 32..47
+    int e = e1 + e2 - 127;
+    uint shift = 23u;
+    if ((hi & 0x8000u) != 0u) {     // bit 47: the product is in [2^47, 2^48)
+        e += 1;
+        shift = 24u;
+    }
+    if (e <= 0) {                   // a subnormal result: 1 - e more bits go
+        shift += uint(1 - e);
+        e = 0;
+    }
+    if (shift > 48u) return sign;   // below half the smallest subnormal: rounds to zero
+    // the kept bits, the round bit (bit shift - 1) and whether any bit below it is set
+    uint mant;
+    if (shift >= 32u) {
+        mant = hi >> (shift - 32u);
+    } else {
+        mant = (lo >> shift) | (hi << (32u - shift));
+    }
+    const uint r = shift - 1u;
+    uint round_bit;
+    bool sticky;
+    if (r >= 32u) {
+        round_bit = (hi >> (r - 32u)) & 1u;
+        sticky = lo != 0u || (hi & ((1u << (r - 32u)) - 1u)) != 0u;
+    } else {
+        round_bit = (lo >> r) & 1u;
+        sticky = (lo & ((1u << r) - 1u)) != 0u;
+    }
+    if (round_bit != 0u && (sticky || (mant & 1u) != 0u)) mant += 1u;
+    if (e == 0) {
+        // a subnormal, or rounded up to 2^23: the smallest normal, whose bits
+        // are that same word
+        return sign | mant;
+    }
+    if (mant >= 0x1000000u) {       // rounded up to 2^24
+        mant >>= 1;
+        e += 1;
+    }
+    if (e >= 255) return sign | 0x7F800000u;
+    return sign | (uint(e) << 23) | (mant & 0x7FFFFFu);
+}
+
+void main() {
+    const uint end = p.offset + p.count;
+    if (end < p.offset || end > uint(data_words.length()) || p.scale_offset >= uint(scale_words.length())
+        || p.found_offset >= uint(found_words.length())) {
+        return;
+    }
+    const uint s = scale_words[p.scale_offset];
+    const bool keep = s == ONE;
+    bool bad = false;
+    const uint step = gl_NumWorkGroups.x * 256u;
+    for (uint i = gl_GlobalInvocationID.x; i < p.count; i += step) {
+        const uint v = data_words[p.offset + i];
+        if ((v & 0x7F800000u) == 0x7F800000u) bad = true;
+        if (!keep) data_words[p.offset + i] = f32_mul(s, v);
+    }
+    if (bad) atomicExchange(found_words[p.found_offset], ONE);
+}

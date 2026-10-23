@@ -1,0 +1,823 @@
+#version 450
+// index/v1 (2026-09-26): gather, scatter and scatter-add over strided views of
+// at most four dimensions, for elements of 1, 2, 4 or 8 bytes and int32 or
+// int64 indices. It is the kit's device path for torch's gather, index_select,
+// scatter, index_copy_, scatter_add and index_add: the operators a mixture of
+// experts routes and combines with, which the adapter used to compute on the
+// host from copies (measured 2026-09-26: 700 such calls in one toy stage-E
+// step of the sub-bit student).
+//
+// ONE ITERATION SPACE, `size[4]`, with an indexed dimension `dim`. At each
+// coordinate c the kernel reads the index at c (`idx` view; a stride of 0
+// broadcasts a 1-D index along the other dimensions, which is index_select's,
+// index_copy_'s and index_add's form) and checks it against `bound`, the
+// extent of the INDEXED tensor's dimension `dim`. Then:
+//   op 0 GATHER       out[c] = src[c with c[dim] := t]
+//   op 1 SCATTER      out[c with c[dim] := t] = src[c]   (or the scalar value)
+//   op 2 SCATTER-ADD  out[c with c[dim] := t] += src[c] (times alpha, f32 only)
+//
+// DETERMINISM WITHOUT ATOMICS (the owner's portability rule: float atomics are
+// not in core Vulkan). A scatter writes only the elements whose coordinates
+// off `dim` equal the source's, so two writes can collide only inside one
+// FIBER: the coordinates with every dimension but `dim` fixed. Each invocation
+// owns a fiber and walks `dim` in increasing order, which is the order torch's
+// CPU kernels add in. So an f32 or integer scatter-add's result is the CPU's
+// bit for bit, and a scatter with repeated indices leaves the last one, as the
+// CPU does. A bf16 or fp16 add rounds to 16 bits at EVERY step (one element's
+// `a += b` in c10). That is NOT torch's CPU answer: its index_add_ and
+// scatter_add_ accumulate a 16-bit float in f32 and round once (measured on
+// torch 2.14 CPU and 2.9.1, 2026-09-26), so the torch adapter refuses those
+// adds and its fallback computes them.
+//
+// FLOAT64 SCATTER-ADD (schema 2, 2026-09-28) is IEEE 754 binary64 in 32-bit
+// words with no float instruction and no shaderFloat64: intwise.comp's
+// SoftFloat-structured add, verbatim (round to nearest even, subnormals kept).
+// Its NaN rule is torch's CPU one, MEASURED 2026-09-28 on torch 2.14 over
+// scatter_add_ (1-D, and 2-D along either dimension) and index_add_ (1-D and
+// 2-D) alike: a NaN operand comes out quieted, and where both are NaN the
+// SOURCE's wins, a signaling source over a quiet output included; inf + -inf
+// gives x86's default NaN 0xFFF8000000000000. So each step is f64_add(src, out),
+// whose NaN rule takes the first NaN operand.
+//
+// SUB-WORD ELEMENTS. Storage is addressed as 32-bit words, so two invocations
+// writing different bytes of one word would race. The host plan guarantees
+// that every word an invocation writes is its own: a gather writes whole
+// output words (the output is contiguous and word-aligned), and a scatter of
+// 1- or 2-byte elements groups G = 4 / element-bytes adjacent fibers along
+// `inner`, the innermost other dimension, whose output stride is 1, with every
+// other output stride and the offset multiples of G, or lets a fiber that owns
+// whole words alone write them. Any other sub-word scatter output (schema 2,
+// 2026-09-28; refused as index-scatter-output-misaligned before) is written
+// with 32-bit INTEGER atomics (F_ATOMIC_OUT): an atomicAnd clears the
+// element's bytes and an atomicOr sets them, one invocation a fiber. That
+// is exact because fibers write disjoint elements, so no two invocations ever
+// write the same BYTES, only neighbouring ones, and a fiber still writes its
+// own elements one at a time in `dim` order (a scatter-add reads its own
+// bytes, which nobody else writes, with an atomic too). Integer atomics are
+// core Vulkan; the portability rule above is about FLOAT atomics.
+//
+// AN INDEX OUT OF RANGE is never used as an address. A gather writes the
+// all-ones pattern (NaN for the float types, -1 for the integer ones) and a
+// scatter skips the write; both OR 1 into status[status_slot], which the host
+// reads at its next wait and raises from. torch on CPU raises before running,
+// torch on CUDA asserts on the device and raises at the next synchronisation:
+// this is the second.
+//
+// LONG FIBERS IN PARALLEL (schema 3, 2026-09-29). One invocation a fiber is
+// one invocation for a 1-D scatter: the sub-bit student's MoE routing scatters
+// its 65,536 (token, slot) pairs that way, 23-37 ms a call on an L4 (MEASURED
+// 2026-09-29, b162b930's stage-E step anatomy). For a fiber of at least
+// index_ops::LONG_FIBER elements the planner takes one of three element-parallel
+// paths instead, each the CPU's result bit for bit:
+//   F_ATOMIC_ADD (op 2, int32 and int64 only): one invocation an element adds
+//     its source with a 32-bit integer atomicAdd; an int64 adds its low word,
+//     then its high word plus the carry the low add produced (old + lo < old).
+//     Integer addition is associative and commutative mod 2^width, so the sum
+//     is the one any order gives, the CPU's included.
+//   ELECTED (op 1): three dispatches over a scratch of one 32-bit word a
+//     destination (fibers x bound words, the kit's own buffer):
+//     op 3 CLEAR   scratch[u] = 0 for every word (binding 2 is the scratch);
+//     op 4 ELECT   every element in range does atomicMax(scratch[slot],
+//                  c[dim] + 1), slot = fiber(c) * bound + t, and one out of
+//                  range ORs ST_INDEX into the status word (binding 3);
+//     op 5 WRITE   every element in range whose c[dim] + 1 its slot holds
+//                  writes its source (or the scalar) to out[c with c[dim] :=
+//                  t]; binding 3 is the scratch here, and is only read.
+//     A slot's winner is its LAST writer along the fiber, the element the
+//     CPU's in-order walk leaves there. A destination has one winner, so a
+//     whole-word element is written once; a 1- or 2-byte one is written with
+//     atomicAnd and atomicOr as F_ATOMIC_OUT does, because a neighbouring
+//     destination's winner may share its word. An element whose index is out
+//     of range is skipped by ELECT (which reports it) and by WRITE.
+//   GROUPED (op 2 over float storage, whose order is part of its sum): each
+//     destination's sources are grouped, in their fiber's order, by the radix
+//     module's stable sort (kernels/radix.comp), and each group is added by
+//     one invocation in that order, which is the CPU's walk for that
+//     destination. Over the radix module's scratch (its SCRATCH layout, n the
+//     elements):
+//     op 6 KEYS    element l writes its destination slot (as above) as its key
+//                  and l as its position into half 0 (binding 2 is the
+//                  scratch); an index out of range writes the SENTINEL key,
+//                  which sorts after every slot, and ORs ST_INDEX into the
+//                  status word (binding 3);
+//     (the radix module's histogram, scan and scatter passes, the key's
+//      bytes only: 1 for fewer than 256 slots, 2 below 65,536, else 4, the
+//      sentinel the width's largest value)
+//     op 7 RUNS    the invocation at sorted position q whose key starts a run
+//                  (and is no sentinel) adds the run's sources to their
+//                  destination one after another, in the sorted order, with
+//                  add_elem, alpha included; binding 1 is the scratch here and
+//                  push word 26 (the status slot's) names the half the last
+//                  pass wrote. A 1- or 2-byte destination is read and written
+//                  with atomics, since its word holds other runs' destinations.
+// Op codes 3-7 and F_ATOMIC_ADD are the planner's; a request cannot ask for
+// them (index_ops::IndexOp, request_flags).
+//
+// POISON, DO NOT RETURN: a block that fails the diagnostic guards below (raw
+// ABI misuse; the C entry validates everything first) poisons what it would
+// have written and ORs 2 into the status word, so a drifted bound is loud.
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Src { uint src[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Idx { uint idx[]; };
+layout(std430, set = 0, binding = 2) buffer Out { uint outw[]; };
+layout(std430, set = 0, binding = 3) buffer Status { uint status[]; };
+
+// 28 words (112 bytes), below the 128 bytes every Vulkan device offers. These
+// MIRROR src/index_ops.rs's IndexPlan::push_words, word for word.
+layout(push_constant) uniform Plan {
+    uint op;            // 0 gather, 1 scatter, 2 scatter-add; the planner's 3 clear, 4 elect,
+                        // 5 write, 6 keys, 7 runs
+    uint dtype;         // storage, DT_* below
+    uint dims;          // dim in bits 0-3, inner in bits 4-7, log2 G in bits 8-11
+    uint flags;         // F_* below
+    uint size0, size1, size2, size3;
+    uint idx_off, idx_st0, idx_st1, idx_st2, idx_st3;
+    uint src_off, src_st0, src_st1, src_st2, src_st3;
+    uint out_off, out_st0, out_st1, out_st2, out_st3;
+    uint bound;         // extent of the indexed tensor's dimension `dim`
+    uint value_lo;      // the scalar source (flag F_VALUE) or alpha (F_ALPHA),
+    uint value_hi;      // in the storage's own bits
+    uint status_slot;   // the runs pass: the scratch half the radix sort's last pass wrote
+    uint units;         // invocations with work: output units, fiber groups, elements
+                        // (F_ATOMIC_ADD, elect, write, keys, runs) or scratch words (clear)
+} p;
+
+const uint DT_F32 = 0u;
+const uint DT_BF16 = 1u;
+const uint DT_F16 = 2u;
+const uint DT_I64 = 3u;
+const uint DT_I32 = 4u;
+const uint DT_I16 = 5u;
+const uint DT_I8 = 6u;
+const uint DT_U8 = 7u;    // uint8 and bool: copies only for bool
+const uint DT_F64 = 8u;   // copies, and since schema 2 the binary64 add
+const uint LAST_DT = 8u;
+
+const uint F_I32_INDEX = 1u;   // the index is int32, else int64 as (lo, hi) words
+const uint F_WRAP = 2u;        // a negative index counts from the end (index.Tensor)
+const uint F_VALUE = 4u;       // scatter reads value_lo/hi instead of src
+const uint F_ALPHA = 8u;       // scatter-add scales src by alpha (f32 bits) first
+const uint F_ATOMIC_OUT = 16u; // a sub-word scatter output written with atomics (schema 2)
+const uint F_ATOMIC_ADD = 32u; // an int32 or int64 scatter-add, an element an invocation (schema 3)
+
+const uint OP_CLEAR = 3u;      // the elected scatter's three passes (schema 3)
+const uint OP_ELECT = 4u;
+const uint OP_WRITE = 5u;
+const uint OP_KEYS = 6u;       // the grouped scatter-add's first and last passes (schema 3)
+const uint OP_RUNS = 7u;
+
+const uint ST_INDEX = 1u;      // an index was out of range
+const uint ST_PLAN = 2u;       // the block failed the diagnostic guards
+
+// the bounds the host plan enforces, mirrored (index_ops.rs)
+const uint MAX_WORD = 2147483647u;   // every word index is below 2^31
+
+uint elem_bytes(uint dt) {
+    if (dt == DT_I64 || dt == DT_F64) return 8u;
+    if (dt == DT_F32 || dt == DT_I32) return 4u;
+    if (dt == DT_BF16 || dt == DT_F16 || dt == DT_I16) return 2u;
+    return 1u;
+}
+
+uint size_of(uint k) { return k == 0u ? p.size0 : k == 1u ? p.size1 : k == 2u ? p.size2 : p.size3; }
+uint idx_st(uint k) { return k == 0u ? p.idx_st0 : k == 1u ? p.idx_st1 : k == 2u ? p.idx_st2 : p.idx_st3; }
+uint src_st(uint k) { return k == 0u ? p.src_st0 : k == 1u ? p.src_st1 : k == 2u ? p.src_st2 : p.src_st3; }
+uint out_st(uint k) { return k == 0u ? p.out_st0 : k == 1u ? p.out_st1 : k == 2u ? p.out_st2 : p.out_st3; }
+
+// ---- element access ---------------------------------------------------------
+
+uvec2 src_elem(uint e, uint es) {
+    if (es == 4u) return uvec2(src[e], 0u);
+    if (es == 8u) return uvec2(src[2u * e], src[2u * e + 1u]);
+    if (es == 2u) return uvec2((src[e >> 1u] >> ((e & 1u) * 16u)) & 0xFFFFu, 0u);
+    return uvec2((src[e >> 2u] >> ((e & 3u) * 8u)) & 0xFFu, 0u);
+}
+
+uvec2 out_elem(uint e, uint es) {
+    if (es == 4u) return uvec2(outw[e], 0u);
+    if (es == 8u) return uvec2(outw[2u * e], outw[2u * e + 1u]);
+    if (es == 2u) return uvec2((outw[e >> 1u] >> ((e & 1u) * 16u)) & 0xFFFFu, 0u);
+    return uvec2((outw[e >> 2u] >> ((e & 3u) * 8u)) & 0xFFu, 0u);
+}
+
+// The caller owns the word (see SUB-WORD ELEMENTS), so a read-modify-write of
+// the other bytes is not a race.
+void out_store(uint e, uint es, uvec2 v) {
+    if (es == 4u) {
+        outw[e] = v.x;
+    } else if (es == 8u) {
+        outw[2u * e] = v.x;
+        outw[2u * e + 1u] = v.y;
+    } else if (es == 2u) {
+        uint shift = (e & 1u) * 16u;
+        uint w = outw[e >> 1u];
+        outw[e >> 1u] = (w & ~(0xFFFFu << shift)) | ((v.x & 0xFFFFu) << shift);
+    } else {
+        uint shift = (e & 3u) * 8u;
+        uint w = outw[e >> 2u];
+        outw[e >> 2u] = (w & ~(0xFFu << shift)) | ((v.x & 0xFFu) << shift);
+    }
+}
+
+// A 1- or 2-byte element in a word other invocations also write (F_ATOMIC_OUT).
+// Every access to such a word is atomic, even the read of the invocation's own
+// bytes (an OR of 0 returns the word), so no plain load races a neighbour's
+// atomic. The store clears the element's bytes, then sets them.
+uint out_elem_atomic(uint e, uint es) {
+    uint per = 4u / es;
+    uint shift = (e % per) * es * 8u;
+    return (atomicOr(outw[e / per], 0u) >> shift) & ((1u << (es * 8u)) - 1u);
+}
+
+void out_store_atomic(uint e, uint es, uint bits) {
+    uint per = 4u / es;
+    uint shift = (e % per) * es * 8u;
+    uint mask = ((1u << (es * 8u)) - 1u) << shift;
+    atomicAnd(outw[e / per], ~mask);
+    atomicOr(outw[e / per], (bits << shift) & mask);
+}
+
+uvec2 poison(uint es) {
+    return es == 8u ? uvec2(0xFFFFFFFFu) : uvec2(es == 4u ? 0xFFFFFFFFu : es == 2u ? 0xFFFFu : 0xFFu, 0u);
+}
+
+// The index at element `e` of the index view, checked against `bound`.
+// Returns false (and leaves t alone) for an index out of range.
+bool load_index(uint e, out uint t) {
+    uint b = p.bound;
+    if ((p.flags & F_I32_INDEX) != 0u) {
+        int v = int(idx[e]);
+        if (v >= 0 && uint(v) < b) { t = uint(v); return true; }
+        if ((p.flags & F_WRAP) != 0u && v < 0 && uint(-v) <= b) { t = b - uint(-v); return true; }
+        return false;
+    }
+    uint lo = idx[2u * e];
+    uint hi = idx[2u * e + 1u];
+    if (hi == 0u && lo < b) { t = lo; return true; }
+    // a negative int64 in [-bound, 0): hi is all ones and lo is 2^32 - |v|
+    if ((p.flags & F_WRAP) != 0u && hi == 0xFFFFFFFFu && lo != 0u && (0u - lo) <= b) {
+        t = b - (0u - lo);
+        return true;
+    }
+    return false;
+}
+
+// ---- arithmetic, rounded as c10's scalar types round -------------------------
+
+float bf16_to_f32(uint h) { return uintBitsToFloat(h << 16u); }
+
+uint f32_to_bf16(float x) {
+    uint bits = floatBitsToUint(x);
+    if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu) != 0u) return 0x7FC0u;   // c10's NaN
+    uint lsb = (bits >> 16u) & 1u;
+    return (bits + 0x7FFFu + lsb) >> 16u;
+}
+
+float f16_to_f32(uint h) {
+    uint sign = (h & 0x8000u) << 16u;
+    uint e = (h >> 10u) & 0x1Fu;
+    uint m = h & 0x3FFu;
+    if (e == 0x1Fu) return uintBitsToFloat(sign | 0x7F800000u | (m << 13u));
+    if (e == 0u) {
+        // a subnormal is m * 2^-24, exact in f32 (a small integer times a power of two)
+        precise float v = float(m) * uintBitsToFloat(0x33800000u);
+        return sign != 0u ? -v : v;
+    }
+    return uintBitsToFloat(sign | ((e + 112u) << 23u) | (m << 13u));
+}
+
+// f32 -> f16, round to nearest even, in integers: no dependence on the device's
+// float rounding or denormal mode. NaN -> sign | 0x7E00, as c10 writes it.
+uint f32_to_f16(float x) {
+    uint w = floatBitsToUint(x);
+    uint sign = (w >> 16u) & 0x8000u;
+    uint e = (w >> 23u) & 0xFFu;
+    uint m = w & 0x7FFFFFu;
+    if (e == 0xFFu) return sign | (m != 0u ? 0x7E00u : 0x7C00u);
+    int he = int(e) - 112;
+    if (he >= 31) return sign | 0x7C00u;
+    if (he <= 0) {
+        if (he < -10) return sign;
+        uint mf = m | 0x800000u;
+        uint shift = uint(14 - he);          // 14..24
+        uint q = mf >> shift;
+        uint rem = mf & ((1u << shift) - 1u);
+        uint half_ulp = 1u << (shift - 1u);
+        if (rem > half_ulp || (rem == half_ulp && (q & 1u) != 0u)) q += 1u;
+        return sign | q;                     // q == 0x400 is the smallest normal: still exact
+    }
+    uint h = (uint(he) << 10u) | (m >> 13u);
+    uint rem = m & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u) != 0u)) h += 1u;   // a carry reaches inf correctly
+    return sign | h;
+}
+
+// ---- binary64 in 32-bit words (intwise.comp's, verbatim) --------------------------
+
+uvec2 add64(uvec2 a, uvec2 b) {
+    uint carry;
+    uint lo = uaddCarry(a.x, b.x, carry);
+    return uvec2(lo, a.y + b.y + carry);
+}
+
+uvec2 neg64(uvec2 v) {
+    uint lo = ~v.x + 1u;
+    return uvec2(lo, ~v.y + (lo == 0u ? 1u : 0u));
+}
+
+uvec2 sub64(uvec2 a, uvec2 b) {
+    uint borrow;
+    uint lo = usubBorrow(a.x, b.x, borrow);
+    return uvec2(lo, a.y - b.y - borrow);
+}
+
+// v << s for s in [0, 63]
+uvec2 shl64(uvec2 v, uint s) {
+    if (s == 0u) return v;
+    if (s >= 32u) return uvec2(0u, v.x << (s - 32u));
+    return uvec2(v.x << s, (v.y << s) | (v.x >> (32u - s)));
+}
+
+// v >> s for s in [0, 63], logical
+uvec2 shr64(uvec2 v, uint s) {
+    if (s == 0u) return v;
+    if (s >= 32u) return uvec2(v.y >> (s - 32u), 0u);
+    return uvec2((v.x >> s) | (v.y << (32u - s)), v.y >> s);
+}
+
+// the low s bits of v, for s in [1, 63]
+uvec2 low64(uvec2 v, uint s) {
+    if (s >= 32u) return uvec2(v.x, s == 32u ? 0u : v.y & ((1u << (s - 32u)) - 1u));
+    return uvec2(v.x & ((1u << s) - 1u), 0u);
+}
+
+bool negative64(uvec2 v) { return (v.y & 0x80000000u) != 0u; }
+
+bool ult64(uvec2 a, uvec2 b) {   // unsigned
+    if (a.y != b.y) return a.y < b.y;
+    return a.x < b.x;
+}
+
+bool is_zero64(uvec2 v) { return (v.x | v.y) == 0u; }
+
+// the leading zero bits of v; 64 for zero
+uint clz64(uvec2 v) {
+    if (v.y != 0u) return 31u - uint(findMSB(v.y));
+    if (v.x != 0u) return 63u - uint(findMSB(v.x));
+    return 64u;
+}
+
+// v >> s with every bit shifted out ORed into bit 0 ("jammed"), for any s
+uvec2 shr_jam64(uvec2 v, uint s) {
+    if (s == 0u) return v;
+    if (s >= 63u) return uvec2(is_zero64(v) ? 0u : 1u, 0u);
+    uvec2 r = shr64(v, s);
+    if (!is_zero64(low64(v, s))) r.x |= 1u;
+    return r;
+}
+
+const uvec2 F64_DEFAULT_NAN = uvec2(0u, 0xFFF80000u);   // x86's "QNaN floating-point indefinite"
+
+uint f64_exp(uvec2 d) { return (d.y >> 20u) & 0x7FFu; }
+uvec2 f64_frac(uvec2 d) { return uvec2(d.x, d.y & 0xFFFFFu); }
+bool f64_neg(uvec2 d) { return (d.y & 0x80000000u) != 0u; }
+bool f64_nan(uvec2 d) { return f64_exp(d) == 0x7FFu && !is_zero64(f64_frac(d)); }
+
+// (sign << 63) + (e << 52) + sig, ADDED: a significand whose bit 52 is set
+// carries into the exponent (the hidden bit, or a rounding that reached 2^53)
+uvec2 f64_pack(bool sign, uint e, uvec2 sig) {
+    uvec2 r = add64(uvec2(0u, e << 20u), sig);
+    return uvec2(r.x, r.y | (sign ? 0x80000000u : 0u));
+}
+
+// x86 SSE's rule: the first NaN operand, quieted
+uvec2 f64_propagate(uvec2 a, uvec2 b) {
+    uvec2 n = f64_nan(a) ? a : b;
+    return uvec2(n.x, n.y | 0x00080000u);
+}
+
+// Round sig (its leading one at bit 62 for a normal result; the value is
+// sig * 2^(e - 1084)) to 53 bits, nearest even, and pack it. e < 0 is a
+// subnormal or zero result, shifted right with the lost bits jammed; from
+// e = 0x7FD the result may overflow to an infinity.
+uvec2 f64_round_pack(bool sign, int e, uvec2 sig) {
+    uint round_bits = sig.x & 0x3FFu;
+    if (e < 0) {
+        sig = shr_jam64(sig, uint(-e));
+        e = 0;
+        round_bits = sig.x & 0x3FFu;
+    } else if (e > 0x7FD || (e == 0x7FD && !ult64(add64(sig, uvec2(0x200u, 0u)), uvec2(0u, 0x80000000u)))) {
+        return f64_pack(sign, 0x7FFu, uvec2(0u));
+    }
+    sig = shr64(add64(sig, uvec2(0x200u, 0u)), 10u);
+    if (round_bits == 0x200u) sig.x &= ~1u;      // a tie rounds to even
+    if (is_zero64(sig)) e = 0;
+    return f64_pack(sign, uint(e), sig);
+}
+
+// sig of any width: its leading one brought to bit 62, then rounded; a result
+// with no bits to round is packed as it is
+uvec2 f64_norm_round_pack(bool sign, int e, uvec2 sig) {
+    int shift = int(clz64(sig)) - 1;
+    e -= shift;
+    if (shift >= 10 && uint(e) < 0x7FDu) {
+        return f64_pack(sign, is_zero64(sig) ? 0u : uint(e), shl64(sig, uint(shift - 10)));
+    }
+    return f64_round_pack(sign, e, shl64(sig, uint(shift)));
+}
+
+// |a| + |b| with the result's sign given (a and b of one sign, or b's flipped)
+uvec2 f64_add_mags(uvec2 a, uvec2 b, bool sign) {
+    int ea = int(f64_exp(a));
+    int eb = int(f64_exp(b));
+    uvec2 sa = f64_frac(a);
+    uvec2 sb = f64_frac(b);
+    int diff = ea - eb;
+    if (diff == 0) {
+        if (ea == 0) return add64(a, sb);                  // two subnormals: exact; a carry makes a normal
+        if (ea == 0x7FF) return is_zero64(sa) && is_zero64(sb) ? a : f64_propagate(a, b);
+        return f64_round_pack(sign, ea, shl64(add64(uvec2(0u, 0x00200000u), add64(sa, sb)), 9u));
+    }
+    sa = shl64(sa, 9u);
+    sb = shl64(sb, 9u);
+    int ez;
+    if (diff < 0) {
+        if (eb == 0x7FF) return is_zero64(sb) ? f64_pack(sign, 0x7FFu, uvec2(0u)) : f64_propagate(a, b);
+        ez = eb;
+        sa = ea != 0 ? add64(sa, uvec2(0u, 0x20000000u)) : shl64(sa, 1u);
+        sa = shr_jam64(sa, uint(-diff));
+    } else {
+        if (ea == 0x7FF) return is_zero64(sa) ? a : f64_propagate(a, b);
+        ez = ea;
+        sb = eb != 0 ? add64(sb, uvec2(0u, 0x20000000u)) : shl64(sb, 1u);
+        sb = shr_jam64(sb, uint(diff));
+    }
+    uvec2 sz = add64(uvec2(0u, 0x20000000u), add64(sa, sb));
+    if (ult64(sz, uvec2(0u, 0x40000000u))) {
+        ez -= 1;
+        sz = shl64(sz, 1u);
+    }
+    return f64_round_pack(sign, ez, sz);
+}
+
+// |a| - |b| with a's sign given, flipped where |b| > |a|
+uvec2 f64_sub_mags(uvec2 a, uvec2 b, bool sign) {
+    int ea = int(f64_exp(a));
+    int eb = int(f64_exp(b));
+    uvec2 sa = f64_frac(a);
+    uvec2 sb = f64_frac(b);
+    int diff = ea - eb;
+    if (diff == 0) {
+        if (ea == 0x7FF) return is_zero64(sa) && is_zero64(sb) ? F64_DEFAULT_NAN : f64_propagate(a, b);
+        uvec2 d = sub64(sa, sb);                          // the hidden bits cancel
+        if (is_zero64(d)) return uvec2(0u);                // x - x is +0 under round to nearest
+        int e = ea != 0 ? ea - 1 : 0;
+        if (negative64(d)) {
+            sign = !sign;
+            d = neg64(d);
+        }
+        int shift = int(clz64(d)) - 11;
+        int ez = e - shift;
+        if (ez < 0) {
+            shift = e;
+            ez = 0;
+        }
+        return f64_pack(sign, uint(ez), shl64(d, uint(shift)));   // exact: nothing to round
+    }
+    sa = shl64(sa, 10u);
+    sb = shl64(sb, 10u);
+    int ez;
+    uvec2 sz;
+    if (diff < 0) {
+        sign = !sign;
+        if (eb == 0x7FF) return is_zero64(sb) ? f64_pack(sign, 0x7FFu, uvec2(0u)) : f64_propagate(a, b);
+        sa = add64(sa, ea != 0 ? uvec2(0u, 0x40000000u) : sa);
+        sa = shr_jam64(sa, uint(-diff));
+        sb.y |= 0x40000000u;
+        ez = eb;
+        sz = sub64(sb, sa);
+    } else {
+        if (ea == 0x7FF) return is_zero64(sa) ? a : f64_propagate(a, b);
+        sb = add64(sb, eb != 0 ? uvec2(0u, 0x40000000u) : sb);
+        sb = shr_jam64(sb, uint(diff));
+        sa.y |= 0x40000000u;
+        ez = ea;
+        sz = sub64(sa, sb);
+    }
+    return f64_norm_round_pack(sign, ez - 1, sz);
+}
+
+uvec2 f64_add(uvec2 a, uvec2 b) {
+    return f64_neg(a) == f64_neg(b) ? f64_add_mags(a, b, f64_neg(a)) : f64_sub_mags(a, b, f64_neg(a));
+}
+
+uvec2 add_elem(uvec2 a, uvec2 b, uint dt) {
+    // the source first: where both are NaN, torch's CPU returns the source's
+    // (MEASURED 2026-09-28; see FLOAT64 SCATTER-ADD above)
+    if (dt == DT_F64) return f64_add(b, a);
+    if (dt == DT_F32) {
+        precise float y = uintBitsToFloat(b.x);
+        if ((p.flags & F_ALPHA) != 0u) y = y * uintBitsToFloat(p.value_lo);
+        precise float s = uintBitsToFloat(a.x) + y;
+        return uvec2(floatBitsToUint(s), 0u);
+    }
+    if (dt == DT_BF16) {
+        precise float s = bf16_to_f32(a.x) + bf16_to_f32(b.x);
+        return uvec2(f32_to_bf16(s), 0u);
+    }
+    if (dt == DT_F16) {
+        precise float s = f16_to_f32(a.x) + f16_to_f32(b.x);
+        return uvec2(f32_to_f16(s), 0u);
+    }
+    if (dt == DT_I64) {
+        uint lo = a.x + b.x;
+        uint carry = lo < a.x ? 1u : 0u;
+        return uvec2(lo, a.y + b.y + carry);
+    }
+    if (dt == DT_I32) return uvec2(a.x + b.x, 0u);
+    if (dt == DT_I16) return uvec2((a.x + b.x) & 0xFFFFu, 0u);
+    return uvec2((a.x + b.x) & 0xFFu, 0u);   // int8 and uint8 wrap in their width
+}
+
+// ---- coordinates --------------------------------------------------------------
+
+// Row-major coordinates of linear element `l` in the iteration space.
+uvec4 coords_of(uint l) {
+    uvec4 c;
+    c.w = l % p.size3; l /= p.size3;
+    c.z = l % p.size2; l /= p.size2;
+    c.y = l % p.size1; l /= p.size1;
+    c.x = l;
+    return c;
+}
+
+uint idx_addr(uvec4 c) { return p.idx_off + c.x * p.idx_st0 + c.y * p.idx_st1 + c.z * p.idx_st2 + c.w * p.idx_st3; }
+uint src_addr(uvec4 c) { return p.src_off + c.x * p.src_st0 + c.y * p.src_st1 + c.z * p.src_st2 + c.w * p.src_st3; }
+uint out_addr(uvec4 c) { return p.out_off + c.x * p.out_st0 + c.y * p.out_st1 + c.z * p.out_st2 + c.w * p.out_st3; }
+
+uvec4 with_dim(uvec4 c, uint d, uint t) {
+    if (d == 0u) c.x = t; else if (d == 1u) c.y = t; else if (d == 2u) c.z = t; else c.w = t;
+    return c;
+}
+
+uint comp(uvec4 c, uint k) { return k == 0u ? c.x : k == 1u ? c.y : k == 2u ? c.z : c.w; }
+
+// ---- the operations ----------------------------------------------------------
+
+void gather_unit(uint u, uint es) {
+    uint d = p.dims & 0xFu;
+    uint n = p.size0 * p.size1 * p.size2 * p.size3;
+    if (es == 8u) {
+        uvec4 c = coords_of(u);
+        uint t;
+        uvec2 v;
+        if (load_index(idx_addr(c), t)) {
+            v = src_elem(src_addr(with_dim(c, d, t)), es);
+        } else {
+            v = poison(es);
+            atomicOr(status[p.status_slot], ST_INDEX);
+        }
+        out_store(p.out_off + u, es, v);
+        return;
+    }
+    uint per = 4u / es;
+    uint first = u * per;                 // linear element of the word's first byte
+    uint word = (p.out_off + first) / per;
+    // a word the output only partly fills keeps its other bytes: read it first
+    uint w = first + per > n ? outw[word] : 0u;
+    [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+        if (j >= per || first + j >= n) continue;
+        uvec4 c = coords_of(first + j);
+        uint t;
+        uint bits;
+        if (load_index(idx_addr(c), t)) {
+            bits = src_elem(src_addr(with_dim(c, d, t)), es).x;
+        } else {
+            bits = poison(es).x;
+            atomicOr(status[p.status_slot], ST_INDEX);
+        }
+        uint shift = j * es * 8u;
+        uint mask = es == 4u ? 0xFFFFFFFFu : ((1u << (es * 8u)) - 1u) << shift;
+        w = (w & ~mask) | ((bits << shift) & mask);
+    }
+    outw[word] = w;
+}
+
+void scatter_group(uint v, uint es) {
+    uint d = p.dims & 0xFu;
+    uint inner = (p.dims >> 4u) & 0xFu;
+    uint g = 1u << ((p.dims >> 8u) & 0xFu);
+    // the group's base coordinates: v enumerates the other dimensions row-major,
+    // with `inner`'s extent divided by g (the host made it a multiple of g)
+    uvec4 c = uvec4(0u);
+    uint rest = v;
+    for (int k = 3; k >= 0; --k) {
+        uint uk = uint(k);
+        if (uk == d) continue;
+        uint extent = size_of(uk);
+        if (uk == inner) extent /= g;
+        uint x = rest % extent;
+        rest /= extent;
+        c = with_dim(c, uk, uk == inner ? x * g : x);
+    }
+    uint along = size_of(d);
+    bool add = p.op == 2u;
+    bool atomic_out = (p.flags & F_ATOMIC_OUT) != 0u;
+    for (uint i = 0u; i < along; ++i) {
+        for (uint j = 0u; j < g; ++j) {
+            uvec4 cj = with_dim(c, d, i);
+            if (j > 0u) cj = with_dim(cj, inner, comp(c, inner) + j);
+            uint t;
+            if (!load_index(idx_addr(cj), t)) {
+                atomicOr(status[p.status_slot], ST_INDEX);
+                continue;
+            }
+            uvec2 s = (p.flags & F_VALUE) != 0u ? uvec2(p.value_lo, p.value_hi) : src_elem(src_addr(cj), es);
+            uint e = out_addr(with_dim(cj, d, t));
+            if (atomic_out) {
+                uvec2 v = add ? add_elem(uvec2(out_elem_atomic(e, es), 0u), s, p.dtype) : s;
+                out_store_atomic(e, es, v.x);
+            } else {
+                uvec2 v = add ? add_elem(out_elem(e, es), s, p.dtype) : s;
+                out_store(e, es, v);
+            }
+        }
+    }
+}
+
+// ---- long fibers (schema 3) -------------------------------------------------------
+
+// the fiber of coordinate c: its coordinates off `d`, row-major
+uint fiber_of(uvec4 c, uint d) {
+    uint f = 0u;
+    [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+        if (k != d) f = f * size_of(k) + comp(c, k);
+    }
+    return f;
+}
+
+// the elected passes' scratch words, fibers x bound; all ones where that would
+// reach 2^31. Called only once the extents have passed the guards.
+uint scratch_slots(uint d) {
+    uint fibers = (p.size0 * p.size1 * p.size2 * p.size3) / size_of(d);
+    return fibers > MAX_WORD / p.bound ? 0xFFFFFFFFu : fibers * p.bound;
+}
+
+// F_ATOMIC_ADD: element l's source added into its destination with integer atomics
+void add_atomic(uint l, uint es) {
+    uint d = p.dims & 0xFu;
+    uvec4 c = coords_of(l);
+    uint t;
+    if (!load_index(idx_addr(c), t)) {
+        atomicOr(status[p.status_slot], ST_INDEX);
+        return;
+    }
+    uvec2 s = src_elem(src_addr(c), es);
+    uint e = out_addr(with_dim(c, d, t));
+    if (es == 4u) {
+        atomicAdd(outw[e], s.x);
+        return;
+    }
+    // an int64: the low words, then the high words and this add's own carry
+    uint old = atomicAdd(outw[2u * e], s.x);
+    uint carry = old + s.x < old ? 1u : 0u;
+    atomicAdd(outw[2u * e + 1u], s.y + carry);
+}
+
+// OP_ELECT: each slot's last writer along its fiber, as c[dim] + 1 (0: none)
+void elect(uint l) {
+    uint d = p.dims & 0xFu;
+    uvec4 c = coords_of(l);
+    uint t;
+    if (!load_index(idx_addr(c), t)) {
+        atomicOr(status[p.status_slot], ST_INDEX);
+        return;
+    }
+    atomicMax(outw[fiber_of(c, d) * p.bound + t], comp(c, d) + 1u);
+}
+
+// OP_WRITE: the winners write. Binding 3 (`status`) is the elect pass's scratch.
+void write_elected(uint l, uint es) {
+    uint d = p.dims & 0xFu;
+    uvec4 c = coords_of(l);
+    uint t;
+    if (!load_index(idx_addr(c), t)) return;     // the elect pass reported it
+    if (status[fiber_of(c, d) * p.bound + t] != comp(c, d) + 1u) return;
+    uvec2 s = (p.flags & F_VALUE) != 0u ? uvec2(p.value_lo, p.value_hi) : src_elem(src_addr(c), es);
+    uint e = out_addr(with_dim(c, d, t));
+    if (es >= 4u) {
+        out_store(e, es, s);
+    } else {
+        out_store_atomic(e, es, s.x);
+    }
+}
+
+// ---- the grouped scatter-add (schema 3) ---------------------------------------------
+
+// the key width's largest value, above every slot: the key of an index out of range
+uint group_sentinel(uint slots) {
+    return slots < 256u ? 0xFFu : slots < 65536u ? 0xFFFFu : 0xFFFFFFFFu;
+}
+
+// the radix module's scratch for n elements (radix.comp's SCRATCH): 6n + 256B + 256
+uint radix_scratch_words(uint n) {
+    return 6u * n + 256u * ((n + 1023u) / 1024u) + 256u;
+}
+
+// OP_KEYS: element l's destination slot and its position, into the scratch's half 0
+void group_keys(uint l) {
+    uint d = p.dims & 0xFu;
+    uvec4 c = coords_of(l);
+    uint t;
+    uint key;
+    if (load_index(idx_addr(c), t)) {
+        key = fiber_of(c, d) * p.bound + t;
+    } else {
+        key = group_sentinel(scratch_slots(d));
+        atomicOr(status[p.status_slot], ST_INDEX);
+    }
+    outw[2u * l] = key;
+    outw[2u * l + 1u] = 0u;
+    outw[4u * p.units + l] = l;
+}
+
+// OP_RUNS: at sorted position q, a run's first adds the run to its destination
+// in the sorted (the fiber's) order. Binding 1 (`idx`) is the scratch; the
+// status word's push slot names the half the radix sort's last pass wrote.
+void group_runs(uint q, uint es) {
+    uint d = p.dims & 0xFu;
+    uint n = p.units;
+    uint keys = 2u * n * p.status_slot;
+    uint pos = 4u * n + n * p.status_slot;
+    uint key = idx[keys + 2u * q];
+    if (key == group_sentinel(scratch_slots(d))) return;
+    if (q > 0u && idx[keys + 2u * (q - 1u)] == key) return;   // not the run's first
+    uint t = key % p.bound;
+    for (uint r = q; r < n; ++r) {
+        if (idx[keys + 2u * r] != key) break;
+        uvec4 c = coords_of(idx[pos + r]);
+        uvec2 s = src_elem(src_addr(c), es);
+        uint e = out_addr(with_dim(c, d, t));
+        if (es >= 4u) {
+            out_store(e, es, add_elem(out_elem(e, es), s, p.dtype));
+        } else {
+            out_store_atomic(e, es, add_elem(uvec2(out_elem_atomic(e, es), 0u), s, p.dtype).x);
+        }
+    }
+}
+
+void main() {
+    uint gid = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * gl_WorkGroupSize.x
+             + gl_LocalInvocationID.x;
+    if (gid >= p.units) return;
+    uint es = elem_bytes(p.dtype);
+    uint d = p.dims & 0xFu;
+    // Diagnostic guards for raw-ABI misuse. DIVIDE, DO NOT MULTIPLY: the element
+    // count is checked against the word limit without forming a product that wraps.
+    // Binding 3 of the clear and write passes is no status word, and the runs
+    // pass's status slot names a scratch half: those three report nothing.
+    bool reports = p.op != OP_CLEAR && p.op != OP_WRITE && p.op != OP_RUNS;
+    bool grouped = p.op == OP_KEYS || p.op == OP_RUNS;
+    bool bad = p.op > OP_RUNS || p.dtype > LAST_DT || d > 3u || ((p.dims >> 4u) & 0xFu) > 3u
+            || p.size0 == 0u || p.size1 == 0u || p.size2 == 0u || p.size3 == 0u || p.bound == 0u
+            || p.size1 > MAX_WORD / p.size0 || p.size2 > MAX_WORD / (p.size0 * p.size1)
+            || p.size3 > MAX_WORD / (p.size0 * p.size1 * p.size2)
+            || ((p.flags & F_ALPHA) != 0u && ((p.op != 2u && p.op != OP_RUNS) || p.dtype != DT_F32))
+            || ((p.flags & F_VALUE) != 0u && p.op != 1u && p.op != OP_WRITE)
+            || ((p.flags & F_ATOMIC_OUT) != 0u && (p.op == 0u || p.op > 2u || es >= 4u || ((p.dims >> 8u) & 0xFu) != 0u))
+            || ((p.flags & F_ATOMIC_ADD) != 0u
+                && (p.op != 2u || (p.dtype != DT_I32 && p.dtype != DT_I64) || (p.flags & F_ATOMIC_OUT) != 0u))
+            || (p.op == OP_CLEAR && p.units > uint(outw.length()))
+            || (p.op == OP_ELECT && scratch_slots(d) > uint(outw.length()))
+            || (p.op == OP_WRITE && scratch_slots(d) > uint(status.length()))
+            || (grouped && (p.units != p.size0 * p.size1 * p.size2 * p.size3 || p.units > 306783341u
+                            || scratch_slots(d) == 0xFFFFFFFFu))
+            || (p.op == OP_KEYS && radix_scratch_words(p.units) > uint(outw.length()))
+            || (p.op == OP_RUNS && (p.status_slot > 1u || radix_scratch_words(p.units) > uint(idx.length())))
+            || (reports && p.status_slot >= uint(status.length()));
+    if (bad) {
+        if (reports && p.status_slot < uint(status.length())) atomicOr(status[p.status_slot], ST_PLAN);
+        if (p.op == 0u && gid < uint(outw.length())) outw[gid] = 0xFFFFFFFFu;
+        return;
+    }
+    if (p.op == 0u) {
+        gather_unit(gid, es);
+    } else if (p.op == OP_CLEAR) {
+        outw[gid] = 0u;
+    } else if (p.op == OP_ELECT) {
+        elect(gid);
+    } else if (p.op == OP_WRITE) {
+        write_elected(gid, es);
+    } else if (p.op == OP_KEYS) {
+        group_keys(gid);
+    } else if (p.op == OP_RUNS) {
+        group_runs(gid, es);
+    } else if ((p.flags & F_ATOMIC_ADD) != 0u) {
+        add_atomic(gid, es);
+    } else {
+        scatter_group(gid, es);
+    }
+}

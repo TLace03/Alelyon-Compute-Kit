@@ -1,0 +1,349 @@
+#version 450
+// radix/v1 (intwise schema 6, 2026-09-29): torch's STABLE rank of every element
+// of a long row -- the intwise family's rank_asc and rank_desc (operations 27
+// and 28) -- by a least-significant-digit radix sort, where the walk of
+// intwise.comp compares each element with its whole row. The walk costs a row
+// of L elements L^2 steps; the sub-bit student's MoE routing ranks one row of
+// 65,536 expert ids per block and micro-batch, and the torch adapter's sort
+// (rank, then the index family's scatter and gather) took 47 ms a call on an
+// L4 (MEASURED 2026-09-29, b162b930's stage-E step anatomy: 48 calls, 2.2 s of
+// the step's 24.1 device s). intwise_ops plans this module for a row longer
+// than intwise_ops::RADIX_MIN_ROW with an int64 or int32 output.
+//
+// THE ORDER is intwise.comp's (RANKS there): each element's key is an unsigned
+// value in torch's order -- an integer's with its sign bit flipped; a float's
+// bits made positive-ordered (a negative's complemented, a positive's sign bit
+// set) after -0.0 becomes +0.0, every NaN the one largest key -- and, for a
+// descending rank, the key complemented. Here a key is only as wide as its
+// storage (1, 2, 4 or 8 bytes), which orders every pair as intwise.comp's
+// 64-bit key does, so a row sorts in that many 8-bit digit passes.
+//
+// THE SORT. Each element carries its linear position g in the iteration space
+// (row-major, the row the last dimension). A pass reorders (key, g) pairs by
+// one 8-bit digit, STABLY, from one half of the scratch into the other; the
+// value passes take the key's bytes from the lowest, then (with more than one
+// row) the row passes take the bytes of g / row. After the last pass the
+// elements lie in (row, key, original position) order, so row r fills
+// positions r*L .. r*L + L - 1, and the element at position q has the rank
+// q - r*L: the number of elements that sort before it plus the equal ones at
+// a lower index, which is intwise.comp's rank_of exactly.
+//
+// A PASS is three dispatches:
+//   1 HISTOGRAM  a workgroup counts its block of BLOCK elements' digits
+//                (shared-memory integer atomics: a count is order-free);
+//   2 SCAN       a workgroup a digit turns that digit's counts over the
+//                blocks into exclusive prefixes and writes the digit's total;
+//   3 SCATTER    a workgroup places its block: element i of digit d goes to
+//                (the totals of the digits below d) + (d's count in earlier
+//                blocks) + (d's count earlier in this block), the last from 16
+//                rounds of 64 in order, each invocation counting the lower
+//                invocations of its round that share its digit. Where one
+//                digit holds every element, the pass is the identity and the
+//                block is copied in place (a 64-bit key of small integers is
+//                mostly such passes).
+// Before the passes, 0 KEYS writes (key, g) for every element; after them,
+// 4 RANKS writes every element's rank to the output view, as C (int64 or
+// int32). No float instruction is used anywhere.
+//
+// SCRATCH (the native entry's own buffer, binding 1), in 32-bit words, for n
+// elements and B = ceil(n / BLOCK) blocks: keys of halves 0 and 1 at 0 and
+// 2n (two words an element), positions of halves 0 and 1 at 4n and 5n, the
+// histogram (digit-major, digit * B + block) at 6n, and the 256 digit totals
+// at 6n + 256B. Pass j reads half j & 1 and writes the other.
+//
+// POISON, DO NOT RETURN: a block that fails the diagnostic guards below (raw
+// ABI misuse; the C entry validates everything first) writes nothing to the
+// scratch, and the RANKS pass writes the all-ones pattern, so a drifted plan
+// is loud.
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer X { uint xw[]; };
+layout(std430, set = 0, binding = 1) buffer Scratch { uint sw[]; };
+layout(std430, set = 0, binding = 2) buffer Out { uint outw[]; };
+
+// 20 words (80 bytes), below the 128 bytes every Vulkan device offers. These
+// MIRROR src/radix_ops.rs's RadixPlan::push_words, word for word.
+layout(push_constant) uniform Plan {
+    uint mode;          // 0 keys, 1 histogram, 2 scan, 3 scatter, 4 ranks
+    uint n;             // elements: rows x row
+    uint row;           // the row's length (the last dimension)
+    uint blocks;        // ceil(n / BLOCK)
+    uint pass;          // the digit pass (1-3); the number of passes (4)
+    uint codes;         // x code 0-3, out code 4-7, descending bit 8, value passes 12-15,
+                        // row passes 16-19
+    uint size0, size1, size2, size3;
+    uint x_off, x_st0, x_st1, x_st2, x_st3;
+    uint out_off, out_st0, out_st1, out_st2, out_st3;
+} p;
+
+const uint MODE_KEYS = 0u;
+const uint MODE_HISTOGRAM = 1u;
+const uint MODE_SCAN = 2u;
+const uint MODE_SCATTER = 3u;
+const uint MODE_RANKS = 4u;
+
+const uint BLOCK = 1024u;    // elements a block: 16 rounds of 64
+const uint ROUNDS = 16u;
+const uint DIGITS = 256u;
+
+// storage codes (convert/v1's numbering)
+const uint KEY_F32 = 0u;
+const uint KEY_BF16 = 1u;
+const uint KEY_F16 = 2u;
+const uint DT_I64 = 3u;
+const uint DT_I32 = 4u;
+const uint DT_I16 = 5u;
+const uint DT_I8 = 6u;
+const uint DT_U8 = 7u;
+const uint KEY_F64 = 8u;
+const uint DT_BOOL = 9u;
+
+const uint F_DESCENDING = 0x100u;
+
+// the bound the host plan enforces, mirrored (radix_ops.rs)
+const uint MAX_WORD = 2147483647u;   // every word index is below 2^31
+
+shared uint h[DIGITS];      // histogram: the block's digit counts
+shared uint s[64];          // scan: the invocations' partial sums
+shared uint base[DIGITS];   // scatter: each digit's first sorted position
+shared uint seen[DIGITS];   // scatter: each digit's count in earlier rounds
+shared uint dig[64];        // scatter: the round's digits
+shared uint part[64];       // scatter: the invocations' partial totals
+shared uint whole;          // scatter: nonzero when one digit holds every element
+
+uint key_bytes(uint code) {
+    if (code == KEY_F64 || code == DT_I64) return 8u;
+    if (code == KEY_F32 || code == DT_I32) return 4u;
+    if (code == KEY_BF16 || code == KEY_F16 || code == DT_I16) return 2u;
+    return 1u;   // int8, uint8, bool
+}
+
+uvec4 coords_of(uint l) {
+    uvec4 c;
+    c.w = l % p.size3; l /= p.size3;
+    c.z = l % p.size2; l /= p.size2;
+    c.y = l % p.size1; l /= p.size1;
+    c.x = l;
+    return c;
+}
+
+uint x_addr(uvec4 c) { return p.x_off + c.x * p.x_st0 + c.y * p.x_st1 + c.z * p.x_st2 + c.w * p.x_st3; }
+uint out_addr(uvec4 c) { return p.out_off + c.x * p.out_st0 + c.y * p.out_st1 + c.z * p.out_st2 + c.w * p.out_st3; }
+
+uvec2 x_raw(uint e, uint es) {
+    if (es == 8u) return uvec2(xw[2u * e], xw[2u * e + 1u]);
+    if (es == 4u) return uvec2(xw[e], 0u);
+    if (es == 2u) return uvec2((xw[e >> 1u] >> ((e & 1u) * 16u)) & 0xFFFFu, 0u);
+    return uvec2((xw[e >> 2u] >> ((e & 3u) * 8u)) & 0xFFu, 0u);
+}
+
+// intwise.comp's float_key, verbatim: -0.0 is +0.0, every NaN the largest,
+// and otherwise the bits made positive-ordered (`sign` the sign bit's mask)
+uint float_key(uint b, uint sign, uint exp_mask, uint mant_mask) {
+    if ((b & exp_mask) == exp_mask && (b & mant_mask) != 0u) return sign | (sign - 1u);   // NaN: all ones
+    if (b == sign) b = 0u;                                                              // -0.0
+    return (b & sign) != 0u ? ~b & (sign | (sign - 1u)) : b | sign;
+}
+
+// the element's key in torch's order, as wide as its storage (key_bytes)
+uvec2 radix_key(uint code, uvec2 raw) {
+    if (code == KEY_F32) return uvec2(float_key(raw.x, 0x80000000u, 0x7F800000u, 0x007FFFFFu), 0u);
+    if (code == KEY_BF16) return uvec2(float_key(raw.x, 0x8000u, 0x7F80u, 0x007Fu), 0u);
+    if (code == KEY_F16) return uvec2(float_key(raw.x, 0x8000u, 0x7C00u, 0x03FFu), 0u);
+    if (code == KEY_F64) {
+        if ((raw.y & 0x7FF00000u) == 0x7FF00000u && ((raw.y & 0x000FFFFFu) | raw.x) != 0u) return uvec2(0xFFFFFFFFu);
+        if (raw.y == 0x80000000u && raw.x == 0u) raw = uvec2(0u);   // -0.0
+        return (raw.y & 0x80000000u) != 0u ? ~raw : uvec2(raw.x, raw.y | 0x80000000u);
+    }
+    if (code == DT_I64) return uvec2(raw.x, raw.y ^ 0x80000000u);
+    if (code == DT_I32) return uvec2(raw.x ^ 0x80000000u, 0u);
+    if (code == DT_I16) return uvec2((raw.x ^ 0x8000u) & 0xFFFFu, 0u);
+    if (code == DT_I8) return uvec2((raw.x ^ 0x80u) & 0xFFu, 0u);
+    if (code == DT_BOOL) return uvec2(raw.x != 0u ? 1u : 0u, 0u);
+    return uvec2(raw.x & 0xFFu, 0u);   // uint8
+}
+
+// ---- the scratch ------------------------------------------------------------------
+
+uint key_word(uint half_, uint i, uint w) { return 2u * p.n * half_ + 2u * i + w; }
+uint pos_word(uint half_, uint i) { return 4u * p.n + p.n * half_ + i; }
+uint hist_word(uint digit, uint block) { return 6u * p.n + digit * p.blocks + block; }
+uint total_word(uint digit) { return 6u * p.n + DIGITS * p.blocks + digit; }
+
+uint value_passes() { return (p.codes >> 12u) & 0xFu; }
+uint row_passes() { return (p.codes >> 16u) & 0xFu; }
+
+// element i of half `half_`'s digit in the current pass
+uint digit_of(uint half_, uint i) {
+    uint vp = value_passes();
+    if (p.pass < vp) {
+        uint word = sw[key_word(half_, i, p.pass >> 2u)];
+        return (word >> ((p.pass & 3u) * 8u)) & 0xFFu;
+    }
+    uint r = sw[pos_word(half_, i)] / p.row;
+    return (r >> ((p.pass - vp) * 8u)) & 0xFFu;
+}
+
+void move_pair(uint from_half, uint i, uint to_half, uint j) {
+    sw[key_word(to_half, j, 0u)] = sw[key_word(from_half, i, 0u)];
+    sw[key_word(to_half, j, 1u)] = sw[key_word(from_half, i, 1u)];
+    sw[pos_word(to_half, j)] = sw[pos_word(from_half, i)];
+}
+
+// ---- the modes ----------------------------------------------------------------------
+
+void make_keys(uint g) {
+    uint code = p.codes & 0xFu;
+    uvec2 k = radix_key(code, x_raw(x_addr(coords_of(g)), key_bytes(code)));
+    if ((p.codes & F_DESCENDING) != 0u) k = ~k;
+    sw[key_word(0u, g, 0u)] = k.x;
+    sw[key_word(0u, g, 1u)] = k.y;
+    sw[pos_word(0u, g)] = g;
+}
+
+void histogram(uint b, uint t) {
+    uint half_ = p.pass & 1u;
+    for (uint d = t; d < DIGITS; d += 64u) h[d] = 0u;
+    barrier();
+    for (uint r = 0u; r < ROUNDS; ++r) {
+        uint i = b * BLOCK + r * 64u + t;
+        if (i < p.n) atomicAdd(h[digit_of(half_, i)], 1u);
+    }
+    barrier();
+    for (uint d = t; d < DIGITS; d += 64u) sw[hist_word(d, b)] = h[d];
+}
+
+void scan_digit(uint digit, uint t) {
+    uint chunk = (p.blocks + 63u) / 64u;
+    uint lo = min(t * chunk, p.blocks);
+    uint hi = min(lo + chunk, p.blocks);
+    uint sum = 0u;
+    for (uint b = lo; b < hi; ++b) sum += sw[hist_word(digit, b)];
+    s[t] = sum;
+    barrier();
+    if (t == 0u) {
+        uint run = 0u;
+        for (uint k = 0u; k < 64u; ++k) {
+            uint v = s[k];
+            s[k] = run;
+            run += v;
+        }
+        sw[total_word(digit)] = run;
+    }
+    barrier();
+    uint run = s[t];
+    for (uint b = lo; b < hi; ++b) {
+        uint v = sw[hist_word(digit, b)];
+        sw[hist_word(digit, b)] = run;
+        run += v;
+    }
+}
+
+void scatter_block(uint b, uint t) {
+    uint from_half = p.pass & 1u;
+    uint to_half = from_half ^ 1u;
+    // each digit's first position: the exclusive scan of the totals, four a lane
+    uint local_base[4];
+    uint acc = 0u;
+    [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+        local_base[j] = acc;
+        acc += sw[total_word(4u * t + j)];
+    }
+    part[t] = acc;
+    if (t == 0u) whole = 0u;
+    barrier();
+    if (t == 0u) {
+        uint run = 0u;
+        for (uint k = 0u; k < 64u; ++k) {
+            uint v = part[k];
+            part[k] = run;
+            run += v;
+        }
+    }
+    barrier();
+    [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+        uint d = 4u * t + j;
+        base[d] = part[t] + local_base[j];
+        seen[d] = 0u;
+        if (sw[total_word(d)] == p.n) whole = 1u;
+    }
+    barrier();
+    if (whole != 0u) {
+        // one digit holds every element: this pass keeps the order
+        for (uint r = 0u; r < ROUNDS; ++r) {
+            uint i = b * BLOCK + r * 64u + t;
+            if (i < p.n) move_pair(from_half, i, to_half, i);
+        }
+        return;
+    }
+    for (uint r = 0u; r < ROUNDS; ++r) {
+        uint i = b * BLOCK + r * 64u + t;
+        bool live = i < p.n;
+        uint mine = live ? digit_of(from_half, i) : DIGITS;
+        dig[t] = mine;
+        barrier();
+        if (live) {
+            uint before = 0u;
+            for (uint j = 0u; j < t; ++j) {
+                if (dig[j] == mine) before += 1u;
+            }
+            move_pair(from_half, i, to_half, base[mine] + sw[hist_word(mine, b)] + seen[mine] + before);
+        }
+        barrier();
+        if (live) atomicAdd(seen[mine], 1u);
+        barrier();
+    }
+}
+
+void write_rank(uint q, bool bad) {
+    uint oc = (p.codes >> 4u) & 0xFu;
+    if (bad) {
+        if (q < uint(outw.length())) outw[q] = 0xFFFFFFFFu;
+        return;
+    }
+    uint g = sw[pos_word(p.pass & 1u, q)];
+    uint rank = q - (g / p.row) * p.row;
+    uint e = out_addr(coords_of(g));
+    if (oc == DT_I64) {
+        outw[2u * e] = rank;
+        outw[2u * e + 1u] = 0u;
+    } else {
+        outw[e] = rank;
+    }
+}
+
+void main() {
+    uint wg = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint g = wg * 64u + t;
+    uint code = p.codes & 0xFu;
+    uint oc = (p.codes >> 4u) & 0xFu;
+    uint passes = value_passes() + row_passes();
+    // Diagnostic guards for raw-ABI misuse. DIVIDE, DO NOT MULTIPLY: the element
+    // count and the scratch size are checked without forming a product that wraps.
+    bool bad = p.mode > MODE_RANKS || p.n == 0u || p.row == 0u || p.n % p.row != 0u
+            || p.size0 == 0u || p.size1 == 0u || p.size2 == 0u || p.size3 == 0u || p.size3 != p.row
+            || p.size1 > MAX_WORD / p.size0 || p.size2 > MAX_WORD / (p.size0 * p.size1)
+            || p.size3 > MAX_WORD / (p.size0 * p.size1 * p.size2)
+            || p.size0 * p.size1 * p.size2 * p.size3 != p.n
+            || p.blocks != (p.n + BLOCK - 1u) / BLOCK
+            || code > DT_BOOL || (oc != DT_I64 && oc != DT_I32)
+            || value_passes() != key_bytes(code)
+            || (p.mode >= MODE_HISTOGRAM && p.mode <= MODE_SCATTER && p.pass >= passes)
+            || (p.mode == MODE_RANKS && p.pass != passes)
+            || p.n > (MAX_WORD - DIGITS) / 7u
+            || uint(sw.length()) < 6u * p.n + DIGITS * p.blocks + DIGITS;
+    if (p.mode == MODE_KEYS) {
+        if (!bad && g < p.n) make_keys(g);
+    } else if (p.mode == MODE_HISTOGRAM) {
+        if (!bad && wg < p.blocks) histogram(wg, t);
+    } else if (p.mode == MODE_SCAN) {
+        if (!bad && wg < DIGITS) scan_digit(wg, t);
+    } else if (p.mode == MODE_SCATTER) {
+        if (!bad && wg < p.blocks) scatter_block(wg, t);
+    } else if (p.mode == MODE_RANKS) {
+        if (g < p.n) write_rank(g, bad);
+    }
+}

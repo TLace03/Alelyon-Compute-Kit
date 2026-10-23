@@ -1,0 +1,1084 @@
+#version 450
+// intwise/v1 (2026-09-28): integer and bool pointwise operations over strided
+// views of at most four dimensions, for the tensors the f32 pointwise family
+// refuses by dtype and no float composition can carry exactly: int64 index
+// arithmetic, int16 offsets, uint8 bit unpacking, bool masks. MEASURED
+// 2026-09-27 (df5200c9): after convert/v1 and the adapter's composition, one
+// toy stage-E step of the sub-bit student still sent about 1,200 such calls
+// to the host (sub, add, mul, fill_, zero_, arange, compares, bitwise_and,
+// bitwise_right_shift).
+//
+// STORAGE CODES (convert/v1's numbering; this family takes the integer ones):
+//   3 i64  4 i32  5 i16  6 i8  7 u8  9 bool
+//
+// THE ANSWER IS torch's CPU KERNEL'S, BIT FOR BIT. torch computes a binary
+// operation in the common dtype C of its operands (at::result_type) and casts
+// the result to the output's dtype. Every value here is carried as a signed
+// 64-bit integer (lo, hi) in 32-bit arithmetic, so shaderInt64 plays no part:
+//   load      an operand is sign- or zero-extended from its own storage, then
+//             WRAPPED to C (below); a scalar operand is wrapped to C as well
+//   compute   add, sub and mul modulo 2^64. Truncation modulo 2^w commutes
+//             with them, so wrapping the 64-bit result to C gives C's own
+//             two's complement arithmetic, the wrap torch's C++ produces.
+//   wrap      to C: i64 as is; i32, i16 and i8 sign-extended from their low
+//             bits; u8 zero-extended; bool 1 if nonzero, else 0 (torch's bool
+//             add is a logical or and its mul a logical and, which this is)
+//   store     truncated to the output's width, bool as nonzero
+// Shifts follow c10's BinaryOpsKernel exactly: with w the width of C and
+// max = w - 1 for a signed C, w for u8, a right shift by b < 0 (read as C) or
+// b >= max is a shift by max (the sign for a signed C, 0 for u8), and a left
+// shift by b < 0 or b >= w is 0; otherwise a >> b (arithmetic for a signed C)
+// and a << b, wrapped to C. abs and neg wrap (|MIN| is MIN). A comparison
+// compares C values and yields 0 or 1.
+//
+// OPERATIONS (the op field; operands in brackets):
+//   0 add [x, y|s] x + alpha*y   1 sub [x, y|s] x - alpha*y   2 mul [x, y|s]
+//   3 and  4 or  5 xor  6 shl  7 shr                            [x, y|s]
+//   8 eq  9 ne  10 lt  11 le  12 gt  13 ge                      [x, y|s]
+//   14 neg [x]   15 abs [x]   16 fill [s]   17 arange: start s, step alpha,
+//   element l (row-major over the shape) is s + l*alpha
+//   18 div_trunc  19 div_floor  20 remainder  21 fmod           [x, s]
+//   24 cumsum [x]: the running sum along the LAST dimension (schema 3; THE SCAN below)
+//   25 tril [x]  26 triu [x]: x where column - row <= s (tril) or >= s (triu)
+//   over the last two dimensions, else 0 (schema 4; TRIANGLES below)
+//   27 rank_asc [x]  28 rank_desc [x]: each element's STABLE rank along the
+//   LAST dimension, x of any storage code (schema 5; RANKS below)
+// A missing tensor operand's binding is bound to some live buffer and never read.
+//
+// DIVISION (18-21) is c10's integer division by a SCALAR divisor, the only
+// form the plan admits (a tensor divisor could hold a zero, and c10 raises
+// ZeroDivisionError for that, which a shader cannot): the scalar wrapped to C
+// is nonzero, and not -1 in an i32 or i64 C (MIN / -1 overflows C++'s
+// division there). div_trunc is C++'s a / b; div_floor subtracts one where the
+// signs differ and the remainder is nonzero (c10's div_floor_integer);
+// remainder is Python's (the result takes the divisor's sign); fmod is C++'s
+// a % b (the dividend's). The quotient and remainder come from an unsigned
+// 64-bit restoring division of the magnitudes, with the signs applied after.
+//
+// THE SCAN (schema 3, 2026-09-28). 24 cumsum is torch's CPU cumsum along the
+// request's LAST dimension, the row (the adapter moves torch's `dim` there).
+// The CPU kernel (cpu_cum_base_kernel) casts x to the output's dtype, adds
+// along the row in index order in acc_type (int64 for every integer type) and
+// stores each running sum cast to the output, so element k of a row is
+// C(x_0) + ... + C(x_k) wrapped to C, which is what this computes. Addition
+// modulo 2^64 is associative and the wrap commutes with it, so the grouping
+// of the additions cannot change a bit: one WORKGROUP a row (units = rows,
+// the product of dimensions 0-2), each of its 64 invocations summing its own
+// contiguous chunk of the row, then walking the chunk again from the sum of
+// the chunks before it and writing every running sum. The output is written
+// element by element, a 1- or 2-byte one always with atomics (F_ATOMIC), and
+// may be x's own view (in place): an invocation reads each element of its
+// chunk before it writes it, and writes only its chunk. C = bool is refused
+// (torch's CPU kernel is not built for bool and raises); a bool x is 0 or 1.
+// The row length is bounded by the plan alone (intwise_ops::SCAN_LIMIT): it
+// bounds a dispatch's duration, not an address.
+//
+// TRIANGLES (schema 4, 2026-09-28). 25 tril and 26 triu are torch's tril and
+// triu over the request's last two dimensions (row i, column j; the leading
+// ones are the batch): element (.., i, j) is x's where j - i <= s (tril) or
+// j - i >= s (triu), and 0 elsewhere. s is the scalar word read as a signed
+// 64-bit diagonal, NOT wrapped to C: torch's diagonal is an int64 whatever the
+// dtype. No arithmetic touches x, so an element is moved, not computed: the
+// adapter sends a float, complex or bool tensor as the integer code of its
+// width (x = out = C), and wrap(C, extend(C, bits)) is the bits themselves (a
+// NaN's payload, a -0.0) while 0 is every dtype's zero (+0.0, false).
+//
+// RANKS (schema 5, 2026-09-28). 27 rank_asc and 28 rank_desc give each element
+// of a row (the request's LAST dimension) its position in torch's STABLE sort
+// of that row, wrapped to C: the number of elements that sort before it (below
+// it for rank_asc, above it for rank_desc) plus the number EQUAL to it at a
+// lower index. The adapter scatters values and indices by these ranks to make
+// sort and topk. x may be any storage code, compared as torch's sort compares
+// (MEASURED 2026-09-28, torch 2.14 CPU): integers and bool by value, and a
+// float with -0.0 equal to +0.0 and every NaN equal to every other and above
+// +infinity. Each element's key is an unsigned 64-bit value in that order: an
+// integer's with its sign bit flipped; a float's bits made positive-ordered
+// (a negative's complemented, a positive's sign bit set) after -0.0 becomes
+// +0.0, and every NaN the one largest key. No float instruction is used. Each
+// invocation walks its element's row once, so a rank costs its row's length;
+// the plan bounds the row and the total work (intwise_ops::RANK_ROW_LIMIT,
+// RANK_WORK_LIMIT), which bound a dispatch's duration, not an address.
+//
+// BINARY64 (schema 2, 2026-09-28). This file built with -DF64=1 is the module
+// intwise_f64.spv. It computes torch's float64 pointwise arithmetic (C = f64)
+// in the same 32-bit words, bit for bit as torch's x86 CPU kernels compute it,
+// and no float instruction is used: IEEE 754 binary64 add, sub, mul and div,
+// round to nearest even, subnormals kept (no flush), and torch's CPU NaN rule:
+// a NaN operand comes out quieted; where both are NaN, mul and div return x's
+// (x86 SSE's first operand) and add and sub return y's, because torch computes
+// them as x + alpha*y and forms the product first (MEASURED 2026-09-28, torch
+// 2.14 CPU: its vector body, scalar tail and strided loop alike); an invalid
+// operation such as inf - inf, 0 * inf or 0/0 gives x86's default NaN,
+// 0xFFF8000000000000. neg and abs only flip or clear the sign, a NaN's too,
+// and do not quiet it. The arithmetic
+// follows Berkeley SoftFloat's structure: a significand with its leading one
+// at bit 62, ten rounding bits below the 53 kept, and every bit lost to a
+// shift jammed into bit 0. Division is a 63-bit restoring division with the
+// remainder as the sticky bit. An operand of any storage code is widened to
+// f64 as torch casts it: exactly for f32, bf16, f16 (through f32) and the
+// integers up to 2^53; int64 above that rounds to nearest even; a NaN gets
+// the quiet bit (x86's cvtss2sd). The output is f64, or bool for a
+// comparison (IEEE: a NaN is unordered, and -0 == +0).
+//   0 add [x, y|s]: x + y (x - y when alpha is -1.0)   1 sub: x - y (or x + y)
+//   2 mul   22 div   8-13 the comparisons              [x, y|s]
+//   14 neg: the sign flipped (a NaN's too)   15 abs: the sign cleared
+//   23 reciprocal [x]: 1 / x   16 fill [s]
+// The scalar and alpha words carry an f64's bits. alpha is +1.0 or -1.0 only,
+// because torch's CPU computes x + alpha*y two ways: one fused multiply-add
+// in its vectorized loop, two roundings in its scalar one. For another alpha,
+// the CPU's own answer depends on the path. The bitwise operations, the
+// shifts, arange and the integer divisions are the integer module's; div and
+// reciprocal are this module's.
+//
+// SUB-WORD OUTPUTS, as convert/v1 wrote them until 2026-10-01: a DENSE output
+// of 1 or 2 bytes (row-major from a 32-bit word) is written a whole word per
+// invocation, and any other one element per invocation with an atomicAnd that
+// clears the element's bytes and an atomicOr that sets them (F_ATOMIC). An
+// output may be an input's own view (in place): each invocation reads its
+// elements before it writes them, and only them.
+//
+// POISON, DO NOT RETURN: a block that fails the diagnostic guards below (raw
+// ABI misuse; the C entry validates everything first) writes the all-ones
+// pattern where it would have written, so a drifted bound is loud.
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer X { uint xw[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Y { uint yw[]; };
+layout(std430, set = 0, binding = 2) buffer Out { uint outw[]; };
+
+// 27 words (108 bytes), below the 128 bytes every Vulkan device offers. These
+// MIRROR src/intwise_ops.rs's IntwisePlan::push_words, word for word.
+layout(push_constant) uniform Plan {
+    uint codes;         // x 0-3, y 4-7, out 8-11, compute (C) 12-15, op 16-23
+    uint flags;         // F_ATOMIC (bit 0), F_Y_SCALAR (bit 1)
+    uint size0, size1, size2, size3;
+    uint x_off, x_st0, x_st1, x_st2, x_st3;
+    uint y_off, y_st0, y_st1, y_st2, y_st3;
+    uint out_off, out_st0, out_st1, out_st2, out_st3;
+    uint s_lo, s_hi;    // the scalar operand, fill's value, arange's start
+    uint a_lo, a_hi;    // add and sub's alpha, arange's step
+    uint units;         // invocations with work: output words (dense sub-word) or elements;
+                        // the scan's rows, one workgroup each
+    uint n;             // elements: size0 * size1 * size2 * size3
+} p;
+
+const uint DT_I64 = 3u;
+const uint DT_I32 = 4u;
+const uint DT_I16 = 5u;
+const uint DT_I8 = 6u;
+const uint DT_U8 = 7u;
+const uint DT_BOOL = 9u;
+
+const uint OP_ADD = 0u;
+const uint OP_SUB = 1u;
+const uint OP_MUL = 2u;
+const uint OP_AND = 3u;
+const uint OP_OR = 4u;
+const uint OP_XOR = 5u;
+const uint OP_SHL = 6u;
+const uint OP_SHR = 7u;
+const uint OP_EQ = 8u;
+const uint OP_NE = 9u;
+const uint OP_LT = 10u;
+const uint OP_LE = 11u;
+const uint OP_GT = 12u;
+const uint OP_GE = 13u;
+const uint OP_NEG = 14u;
+const uint OP_ABS = 15u;
+const uint OP_FILL = 16u;
+const uint OP_ARANGE = 17u;
+const uint OP_DIV_TRUNC = 18u;
+const uint OP_DIV_FLOOR = 19u;
+const uint OP_REMAINDER = 20u;
+const uint OP_FMOD = 21u;
+const uint LAST_OP = 21u;   // the last elementwise operation of the integer module
+#if !F64
+// the integer module's scan (schema 3), dispatched one workgroup a row
+const uint OP_CUMSUM = 24u;
+// the integer module's triangles (schema 4), elementwise
+const uint OP_TRIL = 25u;
+const uint OP_TRIU = 26u;
+// the integer module's ranks (schema 5), elementwise, x of any storage code
+const uint OP_RANK_ASC = 27u;
+const uint OP_RANK_DESC = 28u;
+// the float storage codes a rank's x may carry (convert/v1's numbering)
+const uint KEY_F32 = 0u;
+const uint KEY_BF16 = 1u;
+const uint KEY_F16 = 2u;
+const uint KEY_F64 = 8u;
+#endif
+
+const uint F_ATOMIC = 1u;    // a sub-word output written element by element
+const uint F_Y_SCALAR = 2u;  // y is the scalar (s_lo, s_hi), not a tensor
+const uint KNOWN_FLAGS = 3u;
+
+#if F64
+// the binary64 module's float storage codes beside the integer ones, and its
+// two operations (schema 2)
+const uint DT_F32 = 0u;
+const uint DT_BF16 = 1u;
+const uint DT_F16 = 2u;
+const uint DT_F64 = 8u;
+const uint OP_DIV = 22u;
+const uint OP_RECIPROCAL = 23u;
+#endif
+
+// the bound the host plan enforces, mirrored (intwise_ops.rs)
+const uint MAX_WORD = 2147483647u;   // every word index is below 2^31
+
+bool is_int_code(uint dt) { return (dt >= DT_I64 && dt <= DT_U8) || dt == DT_BOOL; }
+
+uint elem_bytes(uint dt) {
+    if (dt == DT_I64) return 8u;
+    if (dt == DT_I32) return 4u;
+    if (dt == DT_I16) return 2u;
+#if F64
+    if (dt == DT_F64) return 8u;
+    if (dt == DT_F32) return 4u;
+    if (dt == DT_F16 || dt == DT_BF16) return 2u;
+#endif
+    return 1u;
+}
+
+// ---- signed 64-bit values as (lo, hi) --------------------------------------------
+
+uvec2 add64(uvec2 a, uvec2 b) {
+    uint carry;
+    uint lo = uaddCarry(a.x, b.x, carry);
+    return uvec2(lo, a.y + b.y + carry);
+}
+
+uvec2 neg64(uvec2 v) {
+    uint lo = ~v.x + 1u;
+    return uvec2(lo, ~v.y + (lo == 0u ? 1u : 0u));
+}
+
+// the low 64 bits of a * b (the same for signed and unsigned operands)
+uvec2 mul64(uvec2 a, uvec2 b) {
+    uint hi, lo;
+    umulExtended(a.x, b.x, hi, lo);
+    return uvec2(lo, hi + a.x * b.y + a.y * b.x);
+}
+
+bool lt64(uvec2 a, uvec2 b) {   // signed
+    if (a.y != b.y) return int(a.y) < int(b.y);
+    return a.x < b.x;
+}
+
+uvec2 sext32(uint v) { return uvec2(v, (v & 0x80000000u) != 0u ? 0xFFFFFFFFu : 0u); }
+
+// v << s for s in [0, 63]
+uvec2 shl64(uvec2 v, uint s) {
+    if (s == 0u) return v;
+    if (s >= 32u) return uvec2(0u, v.x << (s - 32u));
+    return uvec2(v.x << s, (v.y << s) | (v.x >> (32u - s)));
+}
+
+bool negative64(uvec2 v) { return (v.y & 0x80000000u) != 0u; }
+
+bool ult64(uvec2 a, uvec2 b) {   // unsigned
+    if (a.y != b.y) return a.y < b.y;
+    return a.x < b.x;
+}
+
+uvec2 sub64(uvec2 a, uvec2 b) {
+    uint borrow;
+    uint lo = usubBorrow(a.x, b.x, borrow);
+    return uvec2(lo, a.y - b.y - borrow);
+}
+
+// n / d and n % d of unsigned 64-bit values, d != 0: one bit a step, from the
+// top. `top` carries the bit a shift of the partial remainder pushes out, so
+// a divisor above 2^63 needs no special case.
+void udivmod64(uvec2 n, uvec2 d, out uvec2 q, out uvec2 r) {
+    if (n.y == 0u && d.y == 0u) {
+        q = uvec2(n.x / d.x, 0u);
+        r = uvec2(n.x % d.x, 0u);
+        return;
+    }
+    q = uvec2(0u);
+    r = uvec2(0u);
+    for (int i = 63; i >= 0; --i) {
+        uint top = r.y >> 31u;
+        uint bit = i >= 32 ? (n.y >> uint(i - 32)) & 1u : (n.x >> uint(i)) & 1u;
+        r = uvec2((r.x << 1u) | bit, (r.y << 1u) | (r.x >> 31u));
+        if (top != 0u || !ult64(r, d)) {
+            r = sub64(r, d);
+            if (i >= 32) q.y |= 1u << uint(i - 32); else q.x |= 1u << uint(i);
+        }
+    }
+}
+
+// C++'s truncating a / b and a % b of signed 64-bit values, b != 0; the
+// magnitude of MIN is 2^63, which the unsigned division carries exactly
+void sdivmod64(uvec2 a, uvec2 b, out uvec2 q, out uvec2 r) {
+    bool an = negative64(a);
+    bool bn = negative64(b);
+    uvec2 uq, ur;
+    udivmod64(an ? neg64(a) : a, bn ? neg64(b) : b, uq, ur);
+    q = an != bn ? neg64(uq) : uq;
+    r = an ? neg64(ur) : ur;
+}
+
+// arithmetic v >> s for s in [0, 63]
+uvec2 sar64(uvec2 v, uint s) {
+    if (s == 0u) return v;
+    uint fill = (v.y & 0x80000000u) != 0u ? 0xFFFFFFFFu : 0u;
+    if (s >= 32u) return uvec2(uint(int(v.y) >> int(s - 32u)), fill);
+    return uvec2((v.x >> s) | (v.y << (32u - s)), uint(int(v.y) >> int(s)));
+}
+
+// A 64-bit value wrapped to C's width and extended back: C's own value of it.
+uvec2 wrap(uint c, uvec2 v) {
+    if (c == DT_I64) return v;
+    if (c == DT_I32) return sext32(v.x);
+    if (c == DT_I16) return sext32((v.x & 0x8000u) != 0u ? v.x | 0xFFFF0000u : v.x & 0xFFFFu);
+    if (c == DT_I8) return sext32((v.x & 0x80u) != 0u ? v.x | 0xFFFFFF00u : v.x & 0xFFu);
+    if (c == DT_U8) return uvec2(v.x & 0xFFu, 0u);
+    return uvec2((v.x | v.y) != 0u ? 1u : 0u, 0u);   // bool
+}
+
+uint width(uint c) { return c == DT_I64 ? 64u : c == DT_I32 ? 32u : c == DT_I16 ? 16u : 8u; }
+bool is_signed(uint c) { return c == DT_I64 || c == DT_I32 || c == DT_I16 || c == DT_I8; }
+
+// ---- load and store ------------------------------------------------------------
+
+uvec2 x_raw(uint e, uint es) {
+    if (es == 8u) return uvec2(xw[2u * e], xw[2u * e + 1u]);
+    if (es == 4u) return uvec2(xw[e], 0u);
+    if (es == 2u) return uvec2((xw[e >> 1u] >> ((e & 1u) * 16u)) & 0xFFFFu, 0u);
+    return uvec2((xw[e >> 2u] >> ((e & 3u) * 8u)) & 0xFFu, 0u);
+}
+
+uvec2 y_raw(uint e, uint es) {
+    if (es == 8u) return uvec2(yw[2u * e], yw[2u * e + 1u]);
+    if (es == 4u) return uvec2(yw[e], 0u);
+    if (es == 2u) return uvec2((yw[e >> 1u] >> ((e & 1u) * 16u)) & 0xFFFFu, 0u);
+    return uvec2((yw[e >> 2u] >> ((e & 3u) * 8u)) & 0xFFu, 0u);
+}
+
+// an element's own value, sign- or zero-extended from its storage
+uvec2 extend(uint dt, uvec2 raw) {
+    if (dt == DT_I64) return raw;
+    if (dt == DT_I32) return sext32(raw.x);
+    if (dt == DT_I16) return sext32((raw.x & 0x8000u) != 0u ? raw.x | 0xFFFF0000u : raw.x);
+    if (dt == DT_I8) return sext32((raw.x & 0x80u) != 0u ? raw.x | 0xFFFFFF00u : raw.x);
+    if (dt == DT_BOOL) return uvec2(raw.x != 0u ? 1u : 0u, 0u);
+    return uvec2(raw.x, 0u);   // u8
+}
+
+// the output storage's bits for a value
+uvec2 store_bits(uint dt, uvec2 v) {
+#if F64
+    if (dt == DT_F64) return v;
+#endif
+    if (dt == DT_I64) return v;
+    if (dt == DT_I32) return uvec2(v.x, 0u);
+    if (dt == DT_I16) return uvec2(v.x & 0xFFFFu, 0u);
+    if (dt == DT_BOOL) return uvec2((v.x | v.y) != 0u ? 1u : 0u, 0u);
+    return uvec2(v.x & 0xFFu, 0u);   // i8 and u8
+}
+
+#if F64
+// ---- binary64 in 32-bit words (the module intwise_f64.spv) ------------------------
+
+// v >> s for s in [0, 63], logical
+uvec2 shr64(uvec2 v, uint s) {
+    if (s == 0u) return v;
+    if (s >= 32u) return uvec2(v.y >> (s - 32u), 0u);
+    return uvec2((v.x >> s) | (v.y << (32u - s)), v.y >> s);
+}
+
+// the low s bits of v, for s in [1, 63]
+uvec2 low64(uvec2 v, uint s) {
+    if (s >= 32u) return uvec2(v.x, s == 32u ? 0u : v.y & ((1u << (s - 32u)) - 1u));
+    return uvec2(v.x & ((1u << s) - 1u), 0u);
+}
+
+// -1, 0 or 1 as a compares with b (unsigned)
+int cmp64(uvec2 a, uvec2 b) {
+    if (a.y != b.y) return a.y < b.y ? -1 : 1;
+    if (a.x != b.x) return a.x < b.x ? -1 : 1;
+    return 0;
+}
+
+bool is_zero64(uvec2 v) { return (v.x | v.y) == 0u; }
+
+// the leading zero bits of v; 64 for zero
+uint clz64(uvec2 v) {
+    if (v.y != 0u) return 31u - uint(findMSB(v.y));
+    if (v.x != 0u) return 63u - uint(findMSB(v.x));
+    return 64u;
+}
+
+// v >> s with every bit shifted out ORed into bit 0 ("jammed"), for any s
+uvec2 shr_jam64(uvec2 v, uint s) {
+    if (s == 0u) return v;
+    if (s >= 63u) return uvec2(is_zero64(v) ? 0u : 1u, 0u);
+    uvec2 r = shr64(v, s);
+    if (!is_zero64(low64(v, s))) r.x |= 1u;
+    return r;
+}
+
+// Round the unsigned magnitude m (nonzero) to `bits` significant bits, to
+// nearest even. Returns the rounded significand q (bits wide, leading one set,
+// or 2^bits after a carry) and the position of m's leading one in `msb`.
+// (convert.comp's, verbatim)
+uvec2 round_sig(uvec2 m, uint bits, out uint msb) {
+    msb = m.y != 0u ? 32u + uint(findMSB(m.y)) : uint(findMSB(m.x));
+    if (msb < bits) return shl64(m, bits - 1u - msb);
+    uint s = msb - (bits - 1u);           // 1..63
+    uvec2 q = shr64(m, s);
+    uvec2 rem = low64(m, s);
+    uvec2 half_ulp = shl64(uvec2(1u, 0u), s - 1u);
+    int c = cmp64(rem, half_ulp);
+    if (c > 0 || (c == 0 && (q.x & 1u) != 0u)) {
+        q.x += 1u;
+        if (q.x == 0u) q.y += 1u;
+    }
+    return q;
+}
+
+// f16 -> f32 bits, exact (convert.comp's)
+uint f16_to_f32(uint h) {
+    uint sign = (h & 0x8000u) << 16u;
+    uint e = (h >> 10u) & 0x1Fu;
+    uint m = h & 0x3FFu;
+    if (e == 0x1Fu) return sign | 0x7F800000u | (m << 13u);
+    if (e == 0u) {
+        if (m == 0u) return sign;
+        uint t = uint(findMSB(m));
+        return sign | ((t + 103u) << 23u) | (((m << (23u - t)) & 0x7FFFFFu));
+    }
+    return sign | ((e + 112u) << 23u) | (m << 13u);
+}
+
+// f32 bits -> f64, exact; a NaN gets the quiet bit (x86's cvtss2sd; convert.comp's)
+uvec2 f32_to_f64(uint w) {
+    uint sign = w & 0x80000000u;
+    uint e = (w >> 23u) & 0xFFu;
+    uint m = w & 0x7FFFFFu;
+    if (e == 0xFFu) {
+        if (m == 0u) return uvec2(0u, sign | 0x7FF00000u);
+        uvec2 pm = shl64(uvec2(m | 0x400000u, 0u), 29u);
+        return uvec2(pm.x, sign | 0x7FF00000u | pm.y);
+    }
+    if (e == 0u) {
+        if (m == 0u) return uvec2(0u, sign);
+        uint t = uint(findMSB(m));
+        uvec2 pm = shl64(uvec2(m & ((1u << t) - 1u), 0u), 52u - t);
+        return uvec2(pm.x, sign | ((t + 874u) << 20u) | pm.y);
+    }
+    uvec2 pm = shl64(uvec2(m, 0u), 29u);
+    return uvec2(pm.x, sign | ((e + 896u) << 20u) | pm.y);
+}
+
+// signed 64-bit -> f64, round to nearest even (x86's cvtsi2sd; convert.comp's)
+uvec2 i64_to_f64(uvec2 v) {
+    if (v.x == 0u && v.y == 0u) return uvec2(0u);
+    uint sign = v.y & 0x80000000u;
+    uvec2 m = sign != 0u ? neg64(v) : v;
+    uint msb;
+    uvec2 q = round_sig(m, 53u, msb);
+    if (q.y == 0x200000u) {                  // 2^53 after a carry
+        q = uvec2(0u, 0x100000u);
+        msb += 1u;
+    }
+    return uvec2(q.x, sign | ((msb + 1023u) << 20u) | (q.y & 0xFFFFFu));
+}
+
+// an operand's value as C = f64 holds it: torch's cast from its storage
+uvec2 to_f64(uint dt, uvec2 raw) {
+    if (dt == DT_F64) return raw;
+    if (dt == DT_F32) return f32_to_f64(raw.x);
+    if (dt == DT_BF16) return f32_to_f64(raw.x << 16u);
+    if (dt == DT_F16) return f32_to_f64(f16_to_f32(raw.x));
+    return i64_to_f64(extend(dt, raw));      // the integers and bool
+}
+
+const uvec2 F64_DEFAULT_NAN = uvec2(0u, 0xFFF80000u);   // x86's "QNaN floating-point indefinite"
+
+uint f64_exp(uvec2 d) { return (d.y >> 20u) & 0x7FFu; }
+uvec2 f64_frac(uvec2 d) { return uvec2(d.x, d.y & 0xFFFFFu); }
+bool f64_neg(uvec2 d) { return (d.y & 0x80000000u) != 0u; }
+bool f64_nan(uvec2 d) { return f64_exp(d) == 0x7FFu && !is_zero64(f64_frac(d)); }
+
+// (sign << 63) + (e << 52) + sig, ADDED: a significand whose bit 52 is set
+// carries into the exponent (the hidden bit, or a rounding that reached 2^53)
+uvec2 f64_pack(bool sign, uint e, uvec2 sig) {
+    uvec2 r = add64(uvec2(0u, e << 20u), sig);
+    return uvec2(r.x, r.y | (sign ? 0x80000000u : 0u));
+}
+
+// x86 SSE's rule: the first NaN operand, quieted
+uvec2 f64_propagate(uvec2 a, uvec2 b) {
+    uvec2 n = f64_nan(a) ? a : b;
+    return uvec2(n.x, n.y | 0x00080000u);
+}
+
+// Round sig (its leading one at bit 62 for a normal result; the value is
+// sig * 2^(e - 1084)) to 53 bits, nearest even, and pack it. e < 0 is a
+// subnormal or zero result, shifted right with the lost bits jammed; from
+// e = 0x7FD the result may overflow to an infinity.
+uvec2 f64_round_pack(bool sign, int e, uvec2 sig) {
+    uint round_bits = sig.x & 0x3FFu;
+    if (e < 0) {
+        sig = shr_jam64(sig, uint(-e));
+        e = 0;
+        round_bits = sig.x & 0x3FFu;
+    } else if (e > 0x7FD || (e == 0x7FD && !ult64(add64(sig, uvec2(0x200u, 0u)), uvec2(0u, 0x80000000u)))) {
+        return f64_pack(sign, 0x7FFu, uvec2(0u));
+    }
+    sig = shr64(add64(sig, uvec2(0x200u, 0u)), 10u);
+    if (round_bits == 0x200u) sig.x &= ~1u;      // a tie rounds to even
+    if (is_zero64(sig)) e = 0;
+    return f64_pack(sign, uint(e), sig);
+}
+
+// sig of any width: its leading one brought to bit 62, then rounded; a result
+// with no bits to round is packed as it is
+uvec2 f64_norm_round_pack(bool sign, int e, uvec2 sig) {
+    int shift = int(clz64(sig)) - 1;
+    e -= shift;
+    if (shift >= 10 && uint(e) < 0x7FDu) {
+        return f64_pack(sign, is_zero64(sig) ? 0u : uint(e), shl64(sig, uint(shift - 10)));
+    }
+    return f64_round_pack(sign, e, shl64(sig, uint(shift)));
+}
+
+// |a| + |b| with the result's sign given (a and b of one sign, or b's flipped)
+uvec2 f64_add_mags(uvec2 a, uvec2 b, bool sign) {
+    int ea = int(f64_exp(a));
+    int eb = int(f64_exp(b));
+    uvec2 sa = f64_frac(a);
+    uvec2 sb = f64_frac(b);
+    int diff = ea - eb;
+    if (diff == 0) {
+        if (ea == 0) return add64(a, sb);                  // two subnormals: exact; a carry makes a normal
+        if (ea == 0x7FF) return is_zero64(sa) && is_zero64(sb) ? a : f64_propagate(a, b);
+        return f64_round_pack(sign, ea, shl64(add64(uvec2(0u, 0x00200000u), add64(sa, sb)), 9u));
+    }
+    sa = shl64(sa, 9u);
+    sb = shl64(sb, 9u);
+    int ez;
+    if (diff < 0) {
+        if (eb == 0x7FF) return is_zero64(sb) ? f64_pack(sign, 0x7FFu, uvec2(0u)) : f64_propagate(a, b);
+        ez = eb;
+        sa = ea != 0 ? add64(sa, uvec2(0u, 0x20000000u)) : shl64(sa, 1u);
+        sa = shr_jam64(sa, uint(-diff));
+    } else {
+        if (ea == 0x7FF) return is_zero64(sa) ? a : f64_propagate(a, b);
+        ez = ea;
+        sb = eb != 0 ? add64(sb, uvec2(0u, 0x20000000u)) : shl64(sb, 1u);
+        sb = shr_jam64(sb, uint(diff));
+    }
+    uvec2 sz = add64(uvec2(0u, 0x20000000u), add64(sa, sb));
+    if (ult64(sz, uvec2(0u, 0x40000000u))) {
+        ez -= 1;
+        sz = shl64(sz, 1u);
+    }
+    return f64_round_pack(sign, ez, sz);
+}
+
+// |a| - |b| with a's sign given, flipped where |b| > |a|
+uvec2 f64_sub_mags(uvec2 a, uvec2 b, bool sign) {
+    int ea = int(f64_exp(a));
+    int eb = int(f64_exp(b));
+    uvec2 sa = f64_frac(a);
+    uvec2 sb = f64_frac(b);
+    int diff = ea - eb;
+    if (diff == 0) {
+        if (ea == 0x7FF) return is_zero64(sa) && is_zero64(sb) ? F64_DEFAULT_NAN : f64_propagate(a, b);
+        uvec2 d = sub64(sa, sb);                          // the hidden bits cancel
+        if (is_zero64(d)) return uvec2(0u);                // x - x is +0 under round to nearest
+        int e = ea != 0 ? ea - 1 : 0;
+        if (negative64(d)) {
+            sign = !sign;
+            d = neg64(d);
+        }
+        int shift = int(clz64(d)) - 11;
+        int ez = e - shift;
+        if (ez < 0) {
+            shift = e;
+            ez = 0;
+        }
+        return f64_pack(sign, uint(ez), shl64(d, uint(shift)));   // exact: nothing to round
+    }
+    sa = shl64(sa, 10u);
+    sb = shl64(sb, 10u);
+    int ez;
+    uvec2 sz;
+    if (diff < 0) {
+        sign = !sign;
+        if (eb == 0x7FF) return is_zero64(sb) ? f64_pack(sign, 0x7FFu, uvec2(0u)) : f64_propagate(a, b);
+        sa = add64(sa, ea != 0 ? uvec2(0u, 0x40000000u) : sa);
+        sa = shr_jam64(sa, uint(-diff));
+        sb.y |= 0x40000000u;
+        ez = eb;
+        sz = sub64(sb, sa);
+    } else {
+        if (ea == 0x7FF) return is_zero64(sa) ? a : f64_propagate(a, b);
+        sb = add64(sb, eb != 0 ? uvec2(0u, 0x40000000u) : sb);
+        sb = shr_jam64(sb, uint(diff));
+        sa.y |= 0x40000000u;
+        ez = ea;
+        sz = sub64(sa, sb);
+    }
+    return f64_norm_round_pack(sign, ez - 1, sz);
+}
+
+uvec2 f64_add(uvec2 a, uvec2 b) {
+    return f64_neg(a) == f64_neg(b) ? f64_add_mags(a, b, f64_neg(a)) : f64_sub_mags(a, b, f64_neg(a));
+}
+
+uvec2 f64_sub(uvec2 a, uvec2 b) {
+    return f64_neg(a) == f64_neg(b) ? f64_sub_mags(a, b, f64_neg(a)) : f64_add_mags(a, b, f64_neg(a));
+}
+
+// a subnormal's fraction with its leading one moved to bit 52, and the
+// exponent that keeps the value (1 - the shift)
+void f64_norm_subnormal(inout int e, inout uvec2 sig) {
+    int shift = int(clz64(sig)) - 11;
+    e = 1 - shift;
+    sig = shl64(sig, uint(shift));
+}
+
+// a * b, all 128 bits, as four words from the lowest
+uvec4 mul64x64(uvec2 a, uvec2 b) {
+    uint h00, l00, h01, l01, h10, l10, h11, l11;
+    umulExtended(a.x, b.x, h00, l00);
+    umulExtended(a.x, b.y, h01, l01);
+    umulExtended(a.y, b.x, h10, l10);
+    umulExtended(a.y, b.y, h11, l11);
+    uint c1, c2, d1, d2, d3;
+    uint w1 = uaddCarry(h00, l01, c1);
+    w1 = uaddCarry(w1, l10, c2);
+    uint w2 = uaddCarry(h01, h10, d1);
+    w2 = uaddCarry(w2, l11, d2);
+    w2 = uaddCarry(w2, c1 + c2, d3);
+    return uvec4(l00, w1, w2, h11 + d1 + d2 + d3);
+}
+
+uvec2 f64_mul(uvec2 a, uvec2 b) {
+    bool sign = f64_neg(a) != f64_neg(b);
+    int ea = int(f64_exp(a));
+    int eb = int(f64_exp(b));
+    uvec2 sa = f64_frac(a);
+    uvec2 sb = f64_frac(b);
+    if (ea == 0x7FF) {
+        if (!is_zero64(sa) || (eb == 0x7FF && !is_zero64(sb))) return f64_propagate(a, b);
+        return eb == 0 && is_zero64(sb) ? F64_DEFAULT_NAN : f64_pack(sign, 0x7FFu, uvec2(0u));
+    }
+    if (eb == 0x7FF) {
+        if (!is_zero64(sb)) return f64_propagate(a, b);
+        return ea == 0 && is_zero64(sa) ? F64_DEFAULT_NAN : f64_pack(sign, 0x7FFu, uvec2(0u));
+    }
+    if (ea == 0) {
+        if (is_zero64(sa)) return f64_pack(sign, 0u, uvec2(0u));
+        f64_norm_subnormal(ea, sa);
+    }
+    if (eb == 0) {
+        if (is_zero64(sb)) return f64_pack(sign, 0u, uvec2(0u));
+        f64_norm_subnormal(eb, sb);
+    }
+    int ez = ea + eb - 0x3FF;
+    sa = shl64(uvec2(sa.x, sa.y | 0x00100000u), 10u);
+    sb = shl64(uvec2(sb.x, sb.y | 0x00100000u), 11u);
+    uvec4 w = mul64x64(sa, sb);
+    uvec2 sz = uvec2(w.z | ((w.x | w.y) != 0u ? 1u : 0u), w.w);
+    if (ult64(sz, uvec2(0u, 0x40000000u))) {
+        ez -= 1;
+        sz = shl64(sz, 1u);
+    }
+    return f64_round_pack(sign, ez, sz);
+}
+
+uvec2 f64_div(uvec2 a, uvec2 b) {
+    bool sign = f64_neg(a) != f64_neg(b);
+    int ea = int(f64_exp(a));
+    int eb = int(f64_exp(b));
+    uvec2 sa = f64_frac(a);
+    uvec2 sb = f64_frac(b);
+    if (ea == 0x7FF) {
+        if (!is_zero64(sa)) return f64_propagate(a, b);
+        if (eb == 0x7FF) return is_zero64(sb) ? F64_DEFAULT_NAN : f64_propagate(a, b);
+        return f64_pack(sign, 0x7FFu, uvec2(0u));
+    }
+    if (eb == 0x7FF) return is_zero64(sb) ? f64_pack(sign, 0u, uvec2(0u)) : f64_propagate(a, b);
+    if (eb == 0) {
+        if (is_zero64(sb)) return ea == 0 && is_zero64(sa) ? F64_DEFAULT_NAN : f64_pack(sign, 0x7FFu, uvec2(0u));
+        f64_norm_subnormal(eb, sb);
+    }
+    if (ea == 0) {
+        if (is_zero64(sa)) return f64_pack(sign, 0u, uvec2(0u));
+        f64_norm_subnormal(ea, sa);
+    }
+    int ez = ea - eb + 0x3FE;
+    sa.y |= 0x00100000u;
+    sb.y |= 0x00100000u;
+    // the quotient's 63 bits, 62 down to 0, leading one at 62: the partial
+    // remainder stays below 2 * sb < 2^54, so it never leaves its 64 bits
+    uvec2 r = sa;
+    if (ult64(sa, sb)) {
+        ez -= 1;
+        r = shl64(sa, 1u);
+    }
+    uvec2 q = uvec2(0u);
+    for (int i = 62; i >= 0; --i) {
+        if (!ult64(r, sb)) {
+            r = sub64(r, sb);
+            if (i >= 32) q.y |= 1u << uint(i - 32); else q.x |= 1u << uint(i);
+        }
+        r = shl64(r, 1u);
+    }
+    if (!is_zero64(r)) q.x |= 1u;                   // what remains is below the last bit: sticky
+    return f64_round_pack(sign, ez, q);
+}
+
+// IEEE comparisons: a NaN is unordered, and -0 == +0
+bool f64_both_zero(uvec2 a, uvec2 b) { return (a.x | b.x) == 0u && ((a.y | b.y) & 0x7FFFFFFFu) == 0u; }
+
+bool f64_eq(uvec2 a, uvec2 b) {
+    if (f64_nan(a) || f64_nan(b)) return false;
+    return all(equal(a, b)) || f64_both_zero(a, b);
+}
+
+bool f64_lt(uvec2 a, uvec2 b) {
+    if (f64_nan(a) || f64_nan(b)) return false;
+    bool sa = f64_neg(a);
+    if (sa != f64_neg(b)) return sa && !f64_both_zero(a, b);
+    return !all(equal(a, b)) && (sa != ult64(a, b));
+}
+
+bool f64_le(uvec2 a, uvec2 b) {
+    if (f64_nan(a) || f64_nan(b)) return false;
+    bool sa = f64_neg(a);
+    if (sa != f64_neg(b)) return sa || f64_both_zero(a, b);
+    return all(equal(a, b)) || (sa != ult64(a, b));
+}
+
+// the binary64 module's block: C is f64, x and y any storage code, the output
+// f64 for an arithmetic operation and bool for a comparison, and add and sub's
+// alpha +1.0 or -1.0 (the plan admits no other)
+bool f64_block_ok(uint op, uint x_code, uint y_code, uint out_code, uint c) {
+    bool compare = op >= OP_EQ && op <= OP_GE;
+    bool arith = op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_DIV || op == OP_RECIPROCAL
+              || op == OP_NEG || op == OP_ABS || op == OP_FILL;
+    bool unit_alpha = p.a_lo == 0u && (p.a_hi & 0x7FFFFFFFu) == 0x3FF00000u;
+    return (compare || arith) && (p.codes >> 24u) == 0u && (p.flags & ~KNOWN_FLAGS) == 0u
+        && c == DT_F64 && x_code <= DT_BOOL && y_code <= DT_BOOL
+        && out_code == (compare ? DT_BOOL : DT_F64)
+        && (unit_alpha || (op != OP_ADD && op != OP_SUB));
+}
+#endif
+
+// ---- coordinates --------------------------------------------------------------
+
+uvec4 coords_of(uint l) {
+    uvec4 c;
+    c.w = l % p.size3; l /= p.size3;
+    c.z = l % p.size2; l /= p.size2;
+    c.y = l % p.size1; l /= p.size1;
+    c.x = l;
+    return c;
+}
+
+uint x_addr(uvec4 c) { return p.x_off + c.x * p.x_st0 + c.y * p.x_st1 + c.z * p.x_st2 + c.w * p.x_st3; }
+uint y_addr(uvec4 c) { return p.y_off + c.x * p.y_st0 + c.y * p.y_st1 + c.z * p.y_st2 + c.w * p.y_st3; }
+uint out_addr(uvec4 c) { return p.out_off + c.x * p.out_st0 + c.y * p.out_st1 + c.z * p.out_st2 + c.w * p.out_st3; }
+
+// ---- the operation ---------------------------------------------------------------
+
+uvec2 shifted_left(uint c, uvec2 a, uvec2 b) {
+    uint w = width(c);
+    if (lt64(b, uvec2(0u)) || !lt64(b, uvec2(w, 0u))) return uvec2(0u);
+    return wrap(c, shl64(a, b.x));
+}
+
+uvec2 shifted_right(uint c, uvec2 a, uvec2 b) {
+    uint most = is_signed(c) ? width(c) - 1u : width(c);
+    uint s = (lt64(b, uvec2(0u)) || !lt64(b, uvec2(most, 0u))) ? most : b.x;   // at most 63
+    return wrap(c, sar64(a, s));      // a signed C sign-fills; a u8 value is non-negative
+}
+
+#if !F64
+// ---- ranks (schema 5) ------------------------------------------------------------
+
+uint key_bytes(uint code) {
+    if (code == KEY_F32) return 4u;
+    if (code == KEY_F64) return 8u;
+    if (code == KEY_BF16 || code == KEY_F16) return 2u;
+    return elem_bytes(code);
+}
+
+// a 16- or 32-bit float's key: -0.0 is +0.0, every NaN the largest, and
+// otherwise the bits made positive-ordered (`sign` the sign bit's mask)
+uint float_key(uint b, uint sign, uint exp_mask, uint mant_mask) {
+    if ((b & exp_mask) == exp_mask && (b & mant_mask) != 0u) return sign | (sign - 1u);   // NaN: all ones
+    if (b == sign) b = 0u;                                                              // -0.0
+    return (b & sign) != 0u ? ~b & (sign | (sign - 1u)) : b | sign;
+}
+
+// the sort key of x's element at `co`, as an unsigned 64-bit value in torch's
+// order (RANKS in the header)
+uvec2 key_at(uvec4 co, uint code) {
+    uvec2 raw = x_raw(x_addr(co), key_bytes(code));
+    if (code == KEY_F32) return uvec2(float_key(raw.x, 0x80000000u, 0x7F800000u, 0x007FFFFFu), 0u);
+    if (code == KEY_BF16) return uvec2(float_key(raw.x, 0x8000u, 0x7F80u, 0x007Fu), 0u);
+    if (code == KEY_F16) return uvec2(float_key(raw.x, 0x8000u, 0x7C00u, 0x03FFu), 0u);
+    if (code == KEY_F64) {
+        if ((raw.y & 0x7FF00000u) == 0x7FF00000u && ((raw.y & 0x000FFFFFu) | raw.x) != 0u) return uvec2(0xFFFFFFFFu);
+        if (raw.y == 0x80000000u && raw.x == 0u) raw = uvec2(0u);   // -0.0
+        return (raw.y & 0x80000000u) != 0u ? ~raw : uvec2(raw.x, raw.y | 0x80000000u);
+    }
+    uvec2 v = extend(code, raw);   // an integer or bool: its value, the sign bit flipped
+    return uvec2(v.x, v.y ^ 0x80000000u);
+}
+
+// the stable rank of the element at `co` in its row (dimension 3)
+uint rank_of(uvec4 co, bool descending, uint code) {
+    uvec2 mine = key_at(co, code);
+    uint k = co.w;
+    uint r = 0u;
+    for (uint j = 0u; j < p.size3; ++j) {
+        co.w = j;
+        uvec2 other = key_at(co, code);
+        bool before = descending ? ult64(mine, other) : ult64(other, mine);
+        if (before || (j < k && all(equal(other, mine)))) r += 1u;
+    }
+    return r;
+}
+#endif
+
+// The value of element l (linear, row-major over the shape) in C, before the store.
+#if F64
+uvec2 value_of(uint l, uint op, uint c, uint x_code, uint y_code) {
+    uvec2 s = uvec2(p.s_lo, p.s_hi);             // an f64's bits: y's scalar, fill's value
+    if (op == OP_FILL) return s;
+    uvec4 co = coords_of(l);
+    uvec2 a = to_f64(x_code, x_raw(x_addr(co), elem_bytes(x_code)));
+    if (op == OP_NEG) return uvec2(a.x, a.y ^ 0x80000000u);
+    if (op == OP_ABS) return uvec2(a.x, a.y & 0x7FFFFFFFu);
+    if (op == OP_RECIPROCAL) return f64_div(uvec2(0u, 0x3FF00000u), a);
+    uvec2 b = (p.flags & F_Y_SCALAR) != 0u ? s : to_f64(y_code, y_raw(y_addr(co), elem_bytes(y_code)));
+    bool minus = (p.a_hi & 0x80000000u) != 0u;   // alpha is -1.0
+    // x + alpha*y: torch forms alpha*y first, so y's NaN wins (its sign kept:
+    // x86 multiplies a NaN by -1.0 without flipping it)
+    if ((op == OP_ADD || op == OP_SUB) && f64_nan(b)) return uvec2(b.x, b.y | 0x00080000u);
+    if (op == OP_ADD) return minus ? f64_sub(a, b) : f64_add(a, b);
+    if (op == OP_SUB) return minus ? f64_add(a, b) : f64_sub(a, b);
+    if (op == OP_MUL) return f64_mul(a, b);
+    if (op == OP_DIV) return f64_div(a, b);
+    bool r;
+    if (op == OP_EQ) r = f64_eq(a, b);
+    else if (op == OP_NE) r = !f64_eq(a, b);
+    else if (op == OP_LT) r = f64_lt(a, b);
+    else if (op == OP_LE) r = f64_le(a, b);
+    else if (op == OP_GT) r = f64_lt(b, a);
+    else r = f64_le(b, a);   // ge
+    return uvec2(r ? 1u : 0u, 0u);
+}
+#else
+uvec2 value_of(uint l, uint op, uint c, uint x_code, uint y_code) {
+    uvec2 s = wrap(c, uvec2(p.s_lo, p.s_hi));
+    if (op == OP_FILL) return s;
+    if (op == OP_ARANGE) return wrap(c, add64(uvec2(p.s_lo, p.s_hi), mul64(uvec2(l, 0u), uvec2(p.a_lo, p.a_hi))));
+    uvec4 co = coords_of(l);
+    if (op == OP_RANK_ASC || op == OP_RANK_DESC) return wrap(c, uvec2(rank_of(co, op == OP_RANK_DESC, x_code), 0u));
+    uvec2 a = wrap(c, extend(x_code, x_raw(x_addr(co), elem_bytes(x_code))));
+    if (op == OP_NEG) return wrap(c, neg64(a));
+    if (op == OP_ABS) return wrap(c, lt64(a, uvec2(0u)) ? neg64(a) : a);
+    if (op == OP_TRIL || op == OP_TRIU) {
+        uvec2 d = sext32(co.w - co.z);     // j - i: both below 2^31, so an int32's
+        uvec2 k = uvec2(p.s_lo, p.s_hi);   // the diagonal, NOT wrapped to C
+        return (op == OP_TRIL ? !lt64(k, d) : !lt64(d, k)) ? a : uvec2(0u);
+    }
+    uvec2 b = (p.flags & F_Y_SCALAR) != 0u ? s : wrap(c, extend(y_code, y_raw(y_addr(co), elem_bytes(y_code))));
+    uvec2 alpha = wrap(c, uvec2(p.a_lo, p.a_hi));
+    if (op == OP_ADD) return wrap(c, add64(a, mul64(alpha, b)));
+    if (op == OP_SUB) return wrap(c, add64(a, neg64(mul64(alpha, b))));
+    if (op == OP_MUL) return wrap(c, mul64(a, b));
+    if (op == OP_AND) return a & b;
+    if (op == OP_OR) return a | b;
+    if (op == OP_XOR) return wrap(c, a ^ b);
+    if (op == OP_SHL) return shifted_left(c, a, b);
+    if (op == OP_SHR) return shifted_right(c, a, b);
+    if (op >= OP_DIV_TRUNC && op <= OP_FMOD) {
+        uvec2 q, m;
+        sdivmod64(a, b, q, m);
+        bool inexact = (m.x | m.y) != 0u;
+        if (op == OP_DIV_TRUNC) return wrap(c, q);
+        if (op == OP_DIV_FLOOR) return wrap(c, inexact && negative64(a) != negative64(b) ? add64(q, uvec2(0xFFFFFFFFu)) : q);
+        if (op == OP_REMAINDER) return wrap(c, inexact && negative64(m) != negative64(b) ? add64(m, b) : m);
+        return wrap(c, m);   // fmod
+    }
+    bool r;
+    if (op == OP_EQ) r = a == b;
+    else if (op == OP_NE) r = a != b;
+    else if (op == OP_LT) r = lt64(a, b);
+    else if (op == OP_LE) r = !lt64(b, a);
+    else if (op == OP_GT) r = lt64(b, a);
+    else r = !lt64(a, b);   // ge
+    return uvec2(r ? 1u : 0u, 0u);
+}
+#endif
+
+#if !F64
+// ---- the scan: cumsum along the last dimension (schema 3) --------------------------
+
+const uint SCAN_LANES = 64u;   // local_size_x: one chunk of the row an invocation
+shared uvec2 chunk_sums[SCAN_LANES];
+
+// element k of the row at `co` (whose w is replaced), in C
+uvec2 row_value(uvec4 co, uint k, uint x_code, uint c) {
+    co.w = k;
+    return wrap(c, extend(x_code, x_raw(x_addr(co), elem_bytes(x_code))));
+}
+
+// one output element's bits at element index e; a 1- or 2-byte one with atomics
+void store_element(uint e, uvec2 v, uint out_es) {
+    if (out_es == 8u) {
+        outw[2u * e] = v.x;
+        outw[2u * e + 1u] = v.y;
+    } else if (out_es == 4u) {
+        outw[e] = v.x;
+    } else {
+        uint per_word = 4u / out_es;
+        uint shift = (e % per_word) * out_es * 8u;
+        uint mask = ((1u << (out_es * 8u)) - 1u) << shift;
+        atomicAnd(outw[e / per_word], ~mask);
+        atomicOr(outw[e / per_word], (v.x << shift) & mask);
+    }
+}
+
+// One workgroup a row. Every return above the barrier depends on the push
+// block and the workgroup's id alone, so a whole workgroup takes it or none does.
+void scan_row(uint x_code, uint out_code, uint c) {
+    uint row = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    if (row >= p.units) return;
+    uint lane = gl_LocalInvocationID.x;
+    uint out_es = elem_bytes(out_code);
+    // Diagnostic guards for raw-ABI misuse, as the elementwise block's below.
+    bool bad = (p.codes >> 24u) != 0u || (p.flags & ~F_ATOMIC) != 0u
+            || !is_int_code(x_code) || !is_int_code(out_code) || !is_int_code(c) || c == DT_BOOL
+            || ((p.flags & F_ATOMIC) != 0u) != (out_es < 4u)
+            || p.size0 == 0u || p.size1 == 0u || p.size2 == 0u || p.size3 == 0u
+            || p.size1 > MAX_WORD / p.size0 || p.size2 > MAX_WORD / (p.size0 * p.size1)
+            || p.size3 > MAX_WORD / (p.size0 * p.size1 * p.size2)
+            || p.n != p.size0 * p.size1 * p.size2 * p.size3
+            || p.units != p.size0 * p.size1 * p.size2;
+    if (bad) {
+        if (lane == 0u && row < uint(outw.length())) outw[row] = 0xFFFFFFFFu;
+        return;
+    }
+    uvec4 co;
+    uint r = row;
+    co.z = r % p.size2; r /= p.size2;
+    co.y = r % p.size1; r /= p.size1;
+    co.x = r;
+    co.w = 0u;
+    // this invocation's chunk [first, end) of the row: len < 2^31, so no sum wraps
+    uint len = p.size3;
+    uint per = (len + SCAN_LANES - 1u) / SCAN_LANES;
+    uint first = min(lane * per, len);
+    uint end = min(first + per, len);
+    uvec2 sum = uvec2(0u);
+    for (uint k = first; k < end; ++k) sum = add64(sum, row_value(co, k, x_code, c));
+    chunk_sums[lane] = sum;
+    memoryBarrierShared();
+    barrier();
+    uvec2 run = uvec2(0u);
+    for (uint j = 0u; j < lane; ++j) run = add64(run, chunk_sums[j]);
+    for (uint k = first; k < end; ++k) {
+        run = add64(run, row_value(co, k, x_code, c));
+        co.w = k;
+        store_element(out_addr(co), store_bits(out_code, wrap(c, run)), out_es);
+    }
+}
+#endif
+
+void main() {
+#if !F64
+    // (above the elementwise block, which the binary64 module compiles unchanged)
+    if (((p.codes >> 16u) & 0xFFu) == OP_CUMSUM) {   // uniform: a push constant
+        scan_row(p.codes & 0xFu, (p.codes >> 8u) & 0xFu, (p.codes >> 12u) & 0xFu);
+        return;
+    }
+#endif
+    uint gid = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * gl_WorkGroupSize.x
+             + gl_LocalInvocationID.x;
+    if (gid >= p.units) return;
+    uint x_code = p.codes & 0xFu;
+    uint y_code = (p.codes >> 4u) & 0xFu;
+    uint out_code = (p.codes >> 8u) & 0xFu;
+    uint c = (p.codes >> 12u) & 0xFu;
+    uint op = (p.codes >> 16u) & 0xFFu;
+    uint out_es = elem_bytes(out_code);
+    // Diagnostic guards for raw-ABI misuse. DIVIDE, DO NOT MULTIPLY: the element
+    // count is checked against the word limit without forming a product that wraps.
+    bool atomic = (p.flags & F_ATOMIC) != 0u;
+#if F64
+    bool bad = !f64_block_ok(op, x_code, y_code, out_code, c)
+#else
+    bool rank = op == OP_RANK_ASC || op == OP_RANK_DESC;
+    bool x_ok = is_int_code(x_code)
+             || (rank && (x_code == KEY_F32 || x_code == KEY_BF16 || x_code == KEY_F16 || x_code == KEY_F64));
+    bool bad = (op > LAST_OP && op != OP_TRIL && op != OP_TRIU && !rank) || (p.codes >> 24u) != 0u
+            || (p.flags & ~KNOWN_FLAGS) != 0u
+            || !x_ok || !is_int_code(y_code) || !is_int_code(out_code) || !is_int_code(c)
+            || (op >= OP_DIV_TRUNC && op <= OP_FMOD
+                && ((p.flags & F_Y_SCALAR) == 0u || c == DT_BOOL
+                    || all(equal(wrap(c, uvec2(p.s_lo, p.s_hi)), uvec2(0u)))))
+#endif
+            || (atomic && (out_es >= 4u || p.units != p.n))
+            || p.size0 == 0u || p.size1 == 0u || p.size2 == 0u || p.size3 == 0u
+            || p.size1 > MAX_WORD / p.size0 || p.size2 > MAX_WORD / (p.size0 * p.size1)
+            || p.size3 > MAX_WORD / (p.size0 * p.size1 * p.size2)
+            || p.n != p.size0 * p.size1 * p.size2 * p.size3
+            || (out_es < 4u && !atomic
+                && (p.out_off % (4u / out_es) != 0u || p.out_st3 != 1u || p.out_st2 != p.size3
+                    || p.out_st1 != p.size2 * p.size3 || p.out_st0 != p.size1 * p.size2 * p.size3));
+    if (bad) {
+        if (gid < uint(outw.length())) outw[gid] = 0xFFFFFFFFu;
+        return;
+    }
+    if (out_es >= 4u) {
+        uvec2 v = store_bits(out_code, value_of(gid, op, c, x_code, y_code));
+        uint e = out_addr(coords_of(gid));
+        if (out_es == 4u) {
+            outw[e] = v.x;
+        } else {
+            outw[2u * e] = v.x;
+            outw[2u * e + 1u] = v.y;
+        }
+        return;
+    }
+    if (atomic) {
+        // one element of a strided sub-word output: clear its bytes, then set them
+        uint bits = store_bits(out_code, value_of(gid, op, c, x_code, y_code)).x;
+        uint e = out_addr(coords_of(gid));
+        uint per_word = 4u / out_es;
+        uint shift = (e % per_word) * out_es * 8u;
+        uint mask = ((1u << (out_es * 8u)) - 1u) << shift;
+        atomicAnd(outw[e / per_word], ~mask);
+        atomicOr(outw[e / per_word], (bits << shift) & mask);
+        return;
+    }
+    // a dense sub-word output: this invocation owns output word `word`, which
+    // holds linear elements first .. first + per - 1; every value is computed
+    // (every input element read) before the word is written
+    uint per = 4u / out_es;
+    uint first = gid * per;
+    uint word = (p.out_off + first) / per;
+    uint w = first + per > p.n ? outw[word] : 0u;   // a partly filled last word keeps its other bytes
+    [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+        if (j >= per || first + j >= p.n) continue;
+        uint bits = store_bits(out_code, value_of(first + j, op, c, x_code, y_code)).x;
+        uint shift = j * out_es * 8u;
+        uint mask = ((1u << (out_es * 8u)) - 1u) << shift;
+        w = (w & ~mask) | ((bits << shift) & mask);
+    }
+    outw[word] = w;
+}

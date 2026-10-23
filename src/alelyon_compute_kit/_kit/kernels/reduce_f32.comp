@@ -7,7 +7,11 @@
 // plan (src/reduce_ops.rs) validates every address; the guards here are
 // diagnostics against raw misuse, not the contract.
 //
-// op:     0 sum, 1 amax (NaN-propagating), 2 sum of squares
+// op:     0 sum, 1 amax (NaN-propagating), 2 sum of squares,
+//         3 max of |x| (NaN-propagating; linalg_vector_norm with ord=inf), taken
+//           as an INTEGER max of the sign-cleared bits: non-negative floats order
+//           as their bits do, and a float max may flush a subnormal (measured on
+//           the RX 9070 XT 2026-09-27: a row of negative subnormals gave 0)
 // finish: 0 none, 1 multiply by scale, 2 square root (applied after combining)
 // A second dispatch over the [outputs, splits] partial buffer with splits=1
 // combines the splits; the host decides whether it is needed.
@@ -85,11 +89,18 @@ shared uint nan_seen[256];
 const uint NAN_BITS = 0x7fc00000u;
 const uint NEG_INF_BITS = 0xff800000u;
 
+// Combine two partials of one reduction: a sum, amax's float max, or op 3's
+// integer max on magnitudes' bits (see the op table above).
+float combine(uint op, float a, float b) {
+    if (op == 3u) return uintBitsToFloat(max(floatBitsToUint(a), floatBitsToUint(b)));
+    return op == 1u ? max(a, b) : a + b;
+}
+
 void main() {
     uint lane = gl_LocalInvocationID.x;
     uint group = gl_WorkGroupID.x;
     // Uniform diagnostics: an invalid plan cannot masquerade as a computed value.
-    bool invalid = p.op > 2u || p.finish > 2u || p.ndim == 0u || p.ndim > 6u ||
+    bool invalid = p.op > 3u || p.finish > 2u || p.ndim == 0u || p.ndim > 6u ||
                    p.splits == 0u || p.chunk == 0u || p.reduced_mask == 0u ||
                    (p.reduced_mask >> p.ndim) != 0u;
     uint kept = group / p.splits;
@@ -116,6 +127,8 @@ void main() {
     }
     uint start = split * p.chunk;
     uint stop = min(start + p.chunk, reduced_count);
+    bool max_op = p.op == 1u || p.op == 3u;
+    // op 3 starts from +0: its values are magnitudes, and -inf's bits would win an integer max
     float acc = p.op == 1u ? uintBitsToFloat(NEG_INF_BITS) : 0.0;
     uint saw_nan = 0u;
     for (uint r = start + lane; r < stop; r += 256u) {
@@ -136,6 +149,11 @@ void main() {
         } else if (p.op == 1u) {
             if (v != v) saw_nan = 1u;
             acc = max(acc, v);
+        } else if (p.op == 3u) {
+            // |v| by clearing the sign bit, and the max on the bits: no float
+            // instruction sees a subnormal it could flush (the exact-bit rule)
+            if (v != v) saw_nan = 1u;
+            acc = uintBitsToFloat(max(floatBitsToUint(acc), floatBitsToUint(v) & 0x7FFFFFFFu));
         } else {
             acc += v * v;
         }
@@ -145,14 +163,14 @@ void main() {
     barrier();
     for (uint s = 128u; s > 0u; s >>= 1u) {
         if (lane < s) {
-            partial[lane] = p.op == 1u ? max(partial[lane], partial[lane + s]) : partial[lane] + partial[lane + s];
+            partial[lane] = combine(p.op, partial[lane], partial[lane + s]);
             nan_seen[lane] |= nan_seen[lane + s];
         }
         barrier();
     }
     if (lane == 0u) {
         float result = partial[0];
-        if (p.op == 1u && nan_seen[0] != 0u) result = uintBitsToFloat(NAN_BITS);
+        if (max_op && nan_seen[0] != 0u) result = uintBitsToFloat(NAN_BITS);
         if (p.finish == 1u) result *= uintBitsToFloat(p.scale_bits);
         else if (p.finish == 2u) result = sqrt(result);
         STORE_OUT(group, result);

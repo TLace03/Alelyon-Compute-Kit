@@ -180,8 +180,23 @@ def encode(values, codebook, *, group: int = 16) -> VQArray:
 
 
 def fit_codebook(values, *, group: int = 16, iterations: int = 4,
-                 sample_vectors: int = 4096) -> np.ndarray:
-    """Bounded deterministic calibration; does not establish task quality."""
+                 sample_vectors: int = 4096, init=None) -> np.ndarray:
+    """Bounded deterministic calibration; does not establish task quality.
+
+    `init` warm-starts the refit from an existing (16, group) book, which is
+    what `VQAdamW.step` passes: each state's current codebook. Warm-started,
+    an entry the calibration sample leaves empty is KEPT when the whole tensor
+    still selects it. The strided sample can miss every vector a rarely used
+    entry serves; reseeding that entry then re-encoded those vectors onto a
+    neighbour and moved them on an exactly zero gradient (F1-S in
+    docs/audits/2026-09-21-ack-lowbit-parked-commit-resolution.md). A warm
+    start alone did not help, because the seeded entry was still empty in the
+    sample. The whole-tensor pass runs only when the sample is smaller than
+    the tensor and leaves empty an entry that no lower-index row duplicates.
+    A duplicate can never be selected, because `encode` breaks ties by lowest
+    index, so it is reseeded without the pass; that covers the zeroed moment
+    books of a fresh optimizer.
+    """
     group = _group(group)
     iterations = _integer(iterations, "iterations", 0, 32)
     sample_vectors = _integer(sample_vectors, "sample_vectors", ENTRIES, 65536)
@@ -190,16 +205,26 @@ def fit_codebook(values, *, group: int = 16, iterations: int = 4,
         raise ValueError("codebook calibration needs at least one complete vector")
     complete = x[:x.size // group * group].reshape(-1, group)
     sample = complete[np.linspace(0, len(complete) - 1, min(len(complete), sample_vectors), dtype=np.int64)]
-    book = sample[np.linspace(0, len(sample) - 1, ENTRIES, dtype=np.int64)].copy()
+    if init is None:
+        book = sample[np.linspace(0, len(sample) - 1, ENTRIES, dtype=np.int64)].copy()
+    else:
+        book = _book(init, group).copy()
     for _ in range(iterations):
         assigned = encode(sample, book, group=group)
         pos = np.arange(len(sample))
         idx = (assigned.codes[pos // 8] >> ((pos % 8) * 4).astype(np.uint32)) & 15
+        kept = set()
+        empty = set(range(ENTRIES)) - set(np.unique(idx).tolist())
+        reachable = [e for e in empty if not any(np.array_equal(book[e], book[j]) for j in range(e))]
+        if init is not None and len(sample) < len(complete) and reachable:
+            whole = encode(complete, book, group=group)
+            every = np.arange(len(complete))
+            kept = set(np.unique((whole.codes[every // 8] >> ((every % 8) * 4).astype(np.uint32)) & 15).tolist())
         for entry in range(ENTRIES):
             selected = sample[idx == entry]
             if len(selected):
                 book[entry] = selected.mean(axis=0, dtype=np.float64).astype(np.float32)
-            else:
+            elif entry not in kept:
                 book[entry] = _reseed(sample, book)
     return book
 
@@ -365,9 +390,14 @@ class VQAdamW:
         scratch = self.backend.adamw(self.weight, self.momentum, self.variance, gradient,
                                     lr=self.lr, beta1=self.betas[0], beta2=self.betas[1],
                                     eps=self.eps, weight_decay=self.weight_decay, step=next_step)
+        # Each updated array warm-starts from its own state's codebook, so the
+        # pairing below must be exact. `zip` alone would drop a fourth array
+        # without a word, where the unpacking this replaced refused it.
+        if len(scratch) != 3:
+            raise ValueError(f"vq AdamW update returned {len(scratch)} arrays, not 3")
         encoded = []
-        for value in scratch:
-            book = fit_codebook(value, group=self.weight.group)
+        for value, state in zip(scratch, (self.weight, self.momentum, self.variance)):
+            book = fit_codebook(value, group=self.weight.group, init=state.codebook)
             encoded.append(self.backend.encode(value, book, group=self.weight.group))
         changed = int(np.count_nonzero(encoded[0].decode() != self.weight.decode()))
         self.weight, self.momentum, self.variance = encoded

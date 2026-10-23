@@ -89,10 +89,10 @@ ACK_ERR_FOREIGN = -7     # buffer belongs to another device
 ACK_ERR_FREED = -8       # buffer handle is unknown to its device (freed, or never allocated)
 ACK_ERR_ABI = -9         # the caller's AckAbiInfo is smaller than the library's
 ACK_ERR_POISONED = -10   # the device's state is unknown after a failed wait, or it is lost; close and reopen
-ACK_ERR_UNSUPPORTED_OP = -11   # the operator's kernels could not be built on this device (BF16 cooperative matrices absent)
+ACK_ERR_UNSUPPORTED_OP = -11   # the operator's kernels could not be built on this device (BF16, or for ack_matmul_f16 fp16, cooperative matrices absent)
 ACK_ERR_TIMING = -12     # declared, and unreachable since deferred submission: no C entry times a dispatch any more, so every product entry reports NaN in ms_out
 
-ACK_ABI_VERSION = 10     # the C ABI this module is written for; ack_abi_info must agree exactly
+ACK_ABI_VERSION = 14     # the C ABI this module is written for; ack_abi_info must agree exactly
 ACK_OP_MATMUL_BF16 = 1
 ACK_OP_CAST = 2
 ACK_OP_MATMUL_F32 = 4    # matmul-f32/v1: ack_matmul_f32 with the 64-byte plan block
@@ -101,21 +101,60 @@ ACK_OP_REDUCE = 16       # reduce-f32/v1: ack_reduce with the 80-byte request bl
 ACK_OP_ROWWISE = 32      # rowwise-f32/v2: ack_rowwise with the kernel's 16-byte push block (ABI 8)
 ACK_OP_LOSS = 64         # indexed-cross-entropy-f32/v2: ack_loss, which validates and uploads its own targets (ABI 9)
 ACK_OP_EMBEDDING = 128   # embedding-f32/v2: ack_embedding, which derives and uploads its index and CSR images (ABI 9)
+ACK_OP_MATMUL_F16 = 256  # ack_matmul_f16 and ack_matmul_f16_z: the bf16 pair with fp16 operands (ABI 11)
+ACK_OP_INDEX = 512       # index/v1: ack_index, gather/scatter/scatter-add with the indices kept on the device (ABI 12)
+ACK_OP_CONVERT = 1024    # convert/v1: ack_convert, a dtype conversion over strided views, rounded as c10 rounds (ABI 13)
+ACK_OP_INTWISE = 2048    # intwise/v1: ack_intwise, torch's integer and bool pointwise arithmetic (ABI 14)
 # the operator schemas this module is written for; the handshake requires each
 # exactly (0 means the library does not declare that operator's signature)
 ACK_OP_SCHEMA_MATMUL_BF16 = 2  # 2: ack_matmul_bf16_z, the z-grid product beside ack_matmul_bf16 (ABI 10, 2026-09-09)
 ACK_OP_SCHEMA_CAST = 1
 ACK_OP_SCHEMA_MATMUL_F32 = 2  # 2: kinds 2-3, the plain-fp32 v2 kernel through the same block (2026-09-09)
-ACK_OP_SCHEMA_POINTWISE = 3  # 3: bf16 storage switches in flags bits 2 and 3, same block, 2026-09-10;
+ACK_OP_SCHEMA_POINTWISE = 8  # 8: operations 43-46 (minimum, maximum, relu, threshold_backward),
+                             # selections decided on the bits, same block, 2026-10-16;
+                             # 7 was binary16 storage in flags bits 10-13, same operations and block,
+                             # 2026-09-29;
+                             # 6 was operations 40-42 (tanh, log, xlogy), in correctly rounded adds
+                             # and multiplies only, same block, 2026-09-28;
+                             # 5 was operations 37-39 (silu_backward, x*silu(y), the SiLU gate's
+                             # gradient), same block, 2026-09-28;
+                             # 4 was operations 24-36 (exp, round, comparisons, logical, where)
+                             # and bool storage in flags bits 6-9, same block, 2026-09-22;
+                             # 3 was the bf16 storage switches in flags bits 2-5, 2026-09-10;
                              # 2 was operations 6-23 (reciprocal .. triu) in the same block, 2026-09-07
 # 2 since 2026-09-10: `ack_reduce` also accepts the 80-byte block followed
 # by one STORAGE FLAGS word (bit 0 the input holds bf16, bit 1 the output
 # does). The 80-byte block still means f32 on both sides, so a caller that
 # never sends the longer one is bit-for-bit the caller it was.
-ACK_OP_SCHEMA_REDUCE = 2
+# 3 since 2026-09-27: operation 3, AbsMax (the largest |x|, the norm of order
+# infinity), in the same block.
+# 4 since 2026-09-29: storage bit 2, a float64 sum (input, partials and output
+# float64) on v1's plan with a binary64 add in integer words.
+ACK_OP_SCHEMA_REDUCE = 4
 ACK_OP_SCHEMA_ROWWISE = 1
 ACK_OP_SCHEMA_LOSS = 1
 ACK_OP_SCHEMA_EMBEDDING = 1
+ACK_OP_SCHEMA_MATMUL_F16 = 1  # 1: both entries, the z grid included (ABI 11, 2026-09-26)
+ACK_OP_SCHEMA_INDEX = 3  # 3: a long fiber's scatter (elected) or int32/int64 scatter-add
+                         # (integer atomics) an element an invocation, same request and results
+                         # (2026-09-29);
+                         # 2: a 1- or 2-byte scatter output in any layout, written with integer
+                         # atomics where fibers share words, not refused, and the float64
+                         # scatter-add in binary64 (2026-09-28);
+                         # 1: gather, scatter, scatter-add over strided views (ABI 12, 2026-09-26)
+ACK_OP_SCHEMA_CONVERT = 2  # 2: a strided 1- or 2-byte output written with atomics, not refused;
+                           # 1: every storage pair but float -> integer (ABI 13, 2026-09-27)
+ACK_OP_SCHEMA_INTWISE = 6  # 6: a rank row longer than 1,024 with an int64 or int32 output ranked
+                           # by the radix module (radix/v1), past the walk's row and work limits
+                           # (2026-09-29);
+                           # 5: operations 27 rank_asc and 28 rank_desc, each element's stable rank
+                           # along the last dimension, x of any storage code (2026-09-28);
+                           # 4: operations 25 tril and 26 triu over the last two dimensions, the
+                           # diagonal in the scalar word (2026-09-28); 3: operation 24, cumsum along
+                           # the last dimension, an integer C (2026-09-28); 2: C = float64, the binary64 module: add, sub (alpha
+                           # +-1.0), mul, div, reciprocal, neg, abs, fill and the comparisons, operands
+                           # of any storage code (2026-09-28); 1: add .. arange on
+                           # i64/i32/i16/i8/u8/bool (ABI 14)
 POINTWISE_PUSH_BYTES = 120   # the pointwise family's plan block, thirty little-endian u32
 REDUCE_PUSH_BYTES = 80       # the reduce family's request block, twenty little-endian u32 (splits and chunk left 0)
 ROWWISE_PUSH_BYTES = 16      # the row family's request block: rows, cols, operation, epsilon bits
@@ -165,6 +204,8 @@ ACK_FEATURE_BITS = {
     "subgroup_size_control": 16,
     "coopmat_bf16_16x16x16_subgroup": 32,
     "shader_int16": 64,
+    "shader_float16": 128,                      # ABI 11
+    "coopmat_f16_16x16x16_subgroup": 256,       # ABI 11
 }
 ACK_DTYPE_NAMES = {1: "bf16", 2: "f32"}
 
@@ -182,9 +223,117 @@ _POD_SIZES = {
 }
 # Built on demand, never at import: evaluating np.dtype here would make numpy
 # a hard import-time dependency again, which is exactly what this file avoids.
+def _coopmat_shape(a: np.ndarray, b: np.ndarray, a_t, b_t) -> tuple[int, int, int]:
+    """(m, n, k) of a 16-bit cooperative-matrix product, or a refusal by name:
+    bool layout flags, 2-D operands, agreeing reductions and positive uint32
+    dimensions. Shared by `Device.matmul` and `Device.matmul_f16`."""
+    if not isinstance(a_t, (bool, np.bool_)) or not isinstance(b_t, (bool, np.bool_)):
+        raise AckShapeError("matmul layout flags must be bool")
+    if a.ndim != 2 or b.ndim != 2:
+        raise AckShapeError("matmul takes 2-D operands")
+    m, k = (a.shape[1], a.shape[0]) if a_t else a.shape
+    k2, n = (b.shape[1], b.shape[0]) if b_t else b.shape
+    if k != k2:
+        raise AckShapeError(f"reduction mismatch: A gives K={k}, B gives K={k2}")
+    if not all(0 < dimension <= 0xFFFFFFFF for dimension in (m, n, k)):
+        raise AckShapeError("matmul dimensions must be positive uint32 values")
+    return m, n, k
+
+
 def _matmul_dtypes():
     n = _require_numpy("the matmul convenience API")
     return (n.dtype(n.float32), n.dtype(n.uint16))
+
+
+def _index_storage(dtype, bf16: bool) -> int:
+    """index/v1's storage code for a numpy dtype (src/index_ops.rs `Dtype`):
+    bf16 is uint16 bits named by `bf16=True`; bool is uint8 storage; uint16 is
+    int16 storage, whose wrapping add is the same bits."""
+    n = _require_numpy("the index convenience API")
+    dtype = n.dtype(dtype)
+    if bf16:
+        if dtype != n.uint16:
+            raise AckError("bf16=True names uint16 arrays of bf16 bits")
+        return 1
+    codes = {
+        n.dtype(n.float32): 0, n.dtype(n.float16): 2, n.dtype(n.int64): 3, n.dtype(n.int32): 4,
+        n.dtype(n.int16): 5, n.dtype(n.uint16): 5, n.dtype(n.int8): 6, n.dtype(n.uint8): 7,
+        n.dtype(n.bool_): 7, n.dtype(n.float64): 8,
+    }
+    if dtype not in codes or dtype.byteorder == ">":
+        raise AckError(f"the index family does not carry {dtype}")
+    return codes[dtype]
+
+
+#: convert/v1's storage codes (src/convert_ops.rs `Code`), by name
+CONVERT_CODES = {"float32": 0, "bfloat16": 1, "float16": 2, "int64": 3, "int32": 4, "int16": 5,
+                 "int8": 6, "uint8": 7, "float64": 8, "bool": 9}
+
+
+#: intwise/v1's operations (src/intwise_ops.rs `IntOp`), by name
+INTWISE_OPS = {"add": 0, "sub": 1, "mul": 2, "and": 3, "or": 4, "xor": 5, "shl": 6, "shr": 7,
+               "eq": 8, "ne": 9, "lt": 10, "le": 11, "gt": 12, "ge": 13, "neg": 14, "abs": 15,
+               "fill": 16, "arange": 17, "div_trunc": 18, "div_floor": 19, "remainder": 20, "fmod": 21,
+               "div": 22, "reciprocal": 23, "cumsum": 24, "tril": 25, "triu": 26, "rank_asc": 27,
+               "rank_desc": 28}
+_INTWISE_DTYPES = ("int64", "int32", "int16", "int8", "uint8", "bool")
+# with C = float64 (schema 2) an operand may also be a float; bf16 has no numpy dtype
+_INTWISE_F64_OPERANDS = ("float64", "float32", "float16") + _INTWISE_DTYPES
+
+
+def _intwise_code(dtype, binary64: bool = False) -> int:
+    n = _require_numpy("the intwise convenience API")
+    dtype = n.dtype(dtype)
+    if dtype.byteorder == ">" or dtype.name not in (_INTWISE_F64_OPERANDS if binary64 else _INTWISE_DTYPES):
+        raise AckError(f"the intwise family does not carry {dtype}"
+                       + ("" if binary64 else " where C is an integer type"))
+    return CONVERT_CODES[dtype.name]
+
+
+def _f64_bits(value) -> int:
+    """An f64's bits as the signed 64-bit word the request's scalar and alpha carry."""
+    return struct.unpack("<q", struct.pack("<d", float(value)))[0]
+
+
+def _convert_code(dtype, bf16: bool) -> int:
+    """convert/v1's storage code for a numpy dtype: bf16 is uint16 bits named
+    by `bf16=True`; uint16 otherwise has no code (int16 storage would convert
+    its large values wrongly)."""
+    n = _require_numpy("the convert convenience API")
+    dtype = n.dtype(dtype)
+    if bf16:
+        if dtype != n.uint16:
+            raise AckError("bf16=True names uint16 arrays of bf16 bits")
+        return CONVERT_CODES["bfloat16"]
+    if dtype.byteorder == ">" or dtype.name not in CONVERT_CODES:
+        raise AckError(f"the convert family does not carry {dtype}")
+    return CONVERT_CODES[dtype.name]
+
+
+def _index_dim(dim: int, ndim: int, name: str) -> int:
+    if not 1 <= ndim <= 4:
+        raise AckShapeError(f"{name} takes arrays of 1 to 4 dimensions, not {ndim}")
+    if not -ndim <= dim < ndim:
+        raise AckShapeError(f"{name} dim {dim} is out of range for {ndim} dimensions")
+    return dim % ndim
+
+
+def _index_shapes(index_shape, tensor_shape, dim: int, name: str, tensor: str) -> None:
+    """torch's rule: the index has the tensor's rank and is no larger off `dim`."""
+    if len(index_shape) != len(tensor_shape):
+        raise AckShapeError(f"{name} index rank {len(index_shape)} is not {tensor}'s {len(tensor_shape)}")
+    for d, (i, t) in enumerate(zip(index_shape, tensor_shape)):
+        if d != dim and i > t:
+            raise AckShapeError(f"{name} index {tuple(index_shape)} exceeds {tensor} {tuple(tensor_shape)} off dim {dim}")
+
+
+def _c_strides(shape) -> list:
+    """Row-major element strides."""
+    strides, step = [0] * len(shape), 1
+    for k in range(len(shape) - 1, -1, -1):
+        strides[k] = step
+        step *= shape[k]
+    return strides
 
 
 class AckAbiInfo(ctypes.Structure):
@@ -212,6 +361,84 @@ class AckAbiInfo(ctypes.Structure):
         # until each one's C entry exists, so adding one moves no other field
         ("op_schema_loss", ctypes.c_uint32),        # reserved in ABI 6, set in ABI 9
         ("op_schema_embedding", ctypes.c_uint32),
+        ("op_schema_matmul_f16", ctypes.c_uint32),   # appended in ABI 11
+        ("op_schema_index", ctypes.c_uint32),        # ABI 11's reserved word, set in ABI 12; no field moved
+        ("op_schema_convert", ctypes.c_uint32),      # appended in ABI 13
+        ("op_schema_intwise", ctypes.c_uint32),      # ABI 13's zero reserved word, set in ABI 14
+    ]
+
+
+class AckIndexRequest(ctypes.Structure):
+    """One `ack_index` call's request (index/v1, ABI 12): the operation, the
+    storage code, the iteration shape with its indexed dimension, and each
+    operand's element offset and strides; the library plans the dispatch
+    itself. 200 bytes, the layout src/ffi.rs pins."""
+
+    _fields_ = [
+        ("op", ctypes.c_uint32),
+        ("dtype", ctypes.c_uint32),
+        ("ndim", ctypes.c_uint32),
+        ("dim", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("status_slot", ctypes.c_uint32),
+        ("shape", ctypes.c_uint64 * 4),
+        ("index_offset", ctypes.c_uint64),
+        ("index_strides", ctypes.c_uint64 * 4),
+        ("src_offset", ctypes.c_uint64),
+        ("src_strides", ctypes.c_uint64 * 4),
+        ("out_offset", ctypes.c_uint64),
+        ("out_strides", ctypes.c_uint64 * 4),
+        ("bound", ctypes.c_uint64),
+        ("value", ctypes.c_uint64),
+        ("alpha_bits", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
+    ]
+
+
+class AckConvertRequest(ctypes.Structure):
+    """One `ack_convert` call's request (convert/v1, ABI 13): the input and
+    output storage codes (`CONVERT_CODES`), the shape, and each operand's
+    element offset and strides; the library plans the dispatch itself. 128
+    bytes, the layout src/ffi.rs pins."""
+
+    _fields_ = [
+        ("src_code", ctypes.c_uint32),
+        ("out_code", ctypes.c_uint32),
+        ("ndim", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("shape", ctypes.c_uint64 * 4),
+        ("in_offset", ctypes.c_uint64),
+        ("in_strides", ctypes.c_uint64 * 4),
+        ("out_offset", ctypes.c_uint64),
+        ("out_strides", ctypes.c_uint64 * 4),
+    ]
+
+
+class AckIntwiseRequest(ctypes.Structure):
+    """One `ack_intwise` call's request (intwise/v1, ABI 14): the operation
+    (`INTWISE_OPS`), the storage codes of x, y, the output and C (the common
+    dtype torch computes in), flags (bit 0: y is `scalar`), the shape, each
+    operand's element offset and strides, the scalar and alpha. 200 bytes,
+    the layout src/ffi.rs pins."""
+
+    _fields_ = [
+        ("op", ctypes.c_uint32),
+        ("x_code", ctypes.c_uint32),
+        ("y_code", ctypes.c_uint32),
+        ("out_code", ctypes.c_uint32),
+        ("compute_code", ctypes.c_uint32),
+        ("ndim", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
+        ("shape", ctypes.c_uint64 * 4),
+        ("x_offset", ctypes.c_uint64),
+        ("x_strides", ctypes.c_uint64 * 4),
+        ("y_offset", ctypes.c_uint64),
+        ("y_strides", ctypes.c_uint64 * 4),
+        ("out_offset", ctypes.c_uint64),
+        ("out_strides", ctypes.c_uint64 * 4),
+        ("scalar", ctypes.c_int64),
+        ("alpha", ctypes.c_int64),
     ]
 
 
@@ -312,6 +539,10 @@ def capability_record(abi: AckAbiInfo, info: AckDeviceInfo) -> dict:
             "op_schema_matmul_bf16": abi.op_schema_matmul_bf16,
             "op_schema_cast": abi.op_schema_cast,
             "op_schema_matmul_f32": abi.op_schema_matmul_f32,
+            "op_schema_matmul_f16": abi.op_schema_matmul_f16,
+            "op_schema_index": abi.op_schema_index,
+            "op_schema_convert": abi.op_schema_convert,
+            "op_schema_intwise": abi.op_schema_intwise,
             "op_schema_pointwise": abi.op_schema_pointwise,
             "reserved_op_schemas": {
                 "reduce": abi.op_schema_reduce,
@@ -530,6 +761,29 @@ class _Lib:
             ctypes.c_uint32, ctypes.c_uint32,
             ctypes.POINTER(ctypes.c_double),
         ]
+        # ABI 11: the fp16 pair, the bf16 pair's exact signatures
+        c.ack_matmul_f16.restype = ctypes.c_int32
+        c.ack_matmul_f16.argtypes = list(c.ack_matmul_bf16.argtypes)
+        c.ack_matmul_f16_z.restype = ctypes.c_int32
+        c.ack_matmul_f16_z.argtypes = list(c.ack_matmul_bf16_z.argtypes)
+        # ABI 12: index/v1: device, src, index, out, status, the request, its size, ms_out
+        c.ack_index.restype = ctypes.c_int32
+        c.ack_index.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.POINTER(AckIndexRequest), ctypes.c_size_t, ctypes.POINTER(ctypes.c_double),
+        ]
+        # ABI 13: convert/v1: device, src, out, the request, its size, ms_out
+        c.ack_convert.restype = ctypes.c_int32
+        c.ack_convert.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.POINTER(AckConvertRequest), ctypes.c_size_t, ctypes.POINTER(ctypes.c_double),
+        ]
+        # ABI 14: intwise/v1: device, x, y, out, the request, its size, ms_out
+        c.ack_intwise.restype = ctypes.c_int32
+        c.ack_intwise.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.POINTER(AckIntwiseRequest), ctypes.c_size_t, ctypes.POINTER(ctypes.c_double),
+        ]
         # pointwise-f32/v1 (ABI 6): device, x, y, z, out, the 120-byte plan block, its length, ms_out
         c.ack_pointwise.restype = ctypes.c_int32
         c.ack_pointwise.argtypes = [
@@ -628,6 +882,10 @@ class _Lib:
             ("rowwise", info.op_schema_rowwise, ACK_OP_SCHEMA_ROWWISE),
             ("loss", info.op_schema_loss, ACK_OP_SCHEMA_LOSS),
             ("embedding", info.op_schema_embedding, ACK_OP_SCHEMA_EMBEDDING),
+            ("matmul_f16", info.op_schema_matmul_f16, ACK_OP_SCHEMA_MATMUL_F16),
+            ("index", info.op_schema_index, ACK_OP_SCHEMA_INDEX),
+            ("convert", info.op_schema_convert, ACK_OP_SCHEMA_CONVERT),
+            ("intwise", info.op_schema_intwise, ACK_OP_SCHEMA_INTWISE),
         ):
             if reported != written_for:
                 raise AckUnavailable(
@@ -635,11 +893,13 @@ class _Lib:
                     "(0 means the operator's signature is not declared): rebuild the library or update the binding"
                 )
         needed = (ACK_OP_MATMUL_BF16 | ACK_OP_CAST | ACK_OP_MATMUL_F32 | ACK_OP_POINTWISE | ACK_OP_REDUCE
-                  | ACK_OP_ROWWISE | ACK_OP_LOSS | ACK_OP_EMBEDDING)
+                  | ACK_OP_ROWWISE | ACK_OP_LOSS | ACK_OP_EMBEDDING | ACK_OP_MATMUL_F16 | ACK_OP_INDEX
+                  | ACK_OP_CONVERT | ACK_OP_INTWISE)
         if info.operators & needed != needed:
             raise AckUnavailable(
                 f"library operators {info.operators:#x} lack the matmul and cast, or the pointwise, reduce, "
-                f"rowwise, loss or embedding family, this module binds ({needed:#x})"
+                f"rowwise, loss, embedding, fp16 matmul, index, convert or intwise family, this module binds "
+                f"({needed:#x})"
             )
         self.info = info
         return info
@@ -907,43 +1167,438 @@ class Device:
         with self._lock:
             self._require_open()
             self.last_ms = None
-            if not isinstance(a_t, (bool, np.bool_)) or not isinstance(b_t, (bool, np.bool_)):
-                raise AckShapeError("matmul layout flags must be bool")
             a, b = np.asarray(a), np.asarray(b)
             if any(operand.dtype not in _matmul_dtypes() for operand in (a, b)):
                 raise AckError("matmul operand dtype must be native float32 or uint16 BF16 bits")
-            if a.ndim != 2 or b.ndim != 2:
-                raise AckShapeError("matmul takes 2-D operands")
-            m, k = (a.shape[1], a.shape[0]) if a_t else a.shape
-            k2, n = (b.shape[1], b.shape[0]) if b_t else b.shape
-            if k != k2:
-                raise AckShapeError(f"reduction mismatch: A gives K={k}, B gives K={k2}")
-            if not all(0 < dimension <= 0xFFFFFFFF for dimension in (m, n, k)):
-                raise AckShapeError("matmul dimensions must be positive uint32 values")
+            m, n, k = _coopmat_shape(a, b, a_t, b_t)
             a16 = a if a.dtype == np.uint16 else to_bf16(a)
             b16 = b if b.dtype == np.uint16 else to_bf16(b)
-            # Register each allocation as soon as it succeeds. Cleanup cannot
-            # depend on CPython refcounting or on reaching the final allocation.
+            return self._coopmat_product("ack_matmul_bf16", "matmul", a16, b16, m, n, k, a_t, b_t)
+
+    def matmul_f16(self, a: np.ndarray, b: np.ndarray, *, a_t: bool = False, b_t: bool = False) -> np.ndarray:
+        """`matmul` through the fp16 cooperative-matrix modules (ABI 11):
+        the same shapes, layout flags and f32 result, with fp16 operands, for
+        a device whose tensor cores take fp16 and not bf16 (NVIDIA Turing).
+
+        A native float16 array is sent as it is. A float32 array is rounded to
+        fp16 by numpy (round to nearest even), and REFUSED if a finite value
+        falls outside fp16's range (|x| > 65504): that value would reach the
+        device as an infinity, and the product would be wrong without an error.
+        A device without fp16 cooperative matrices refuses by code
+        (ACK_ERR_UNSUPPORTED_OP). `last_ms` is NaN on success, as for `matmul`.
+        """
+        with self._lock:
+            self._require_open()
+            self.last_ms = None
+            a, b = np.asarray(a), np.asarray(b)
+            halves = []
+            for label, operand in (("A", a), ("B", b)):
+                if operand.dtype == np.float16:
+                    halves.append(np.ascontiguousarray(operand))
+                elif operand.dtype == np.float32:
+                    # an overflow is detected and refused just below, so numpy's
+                    # own warning about the same cast would only repeat it
+                    with np.errstate(over="ignore"):
+                        rounded = operand.astype(np.float16)
+                    overflow = np.isfinite(operand) & ~np.isfinite(rounded)
+                    if overflow.any():
+                        raise AckError(
+                            f"matmul_f16 operand {label} holds {int(overflow.sum())} finite value(s) outside "
+                            "fp16's range (|x| > 65504), which would reach the device as infinity"
+                        )
+                    halves.append(np.ascontiguousarray(rounded))
+                else:
+                    raise AckError("matmul_f16 operand dtype must be native float16 or float32")
+            m, n, k = _coopmat_shape(a, b, a_t, b_t)
+            return self._coopmat_product("ack_matmul_f16", "matmul_f16", halves[0], halves[1], m, n, k, a_t, b_t)
+
+    # ---- index/v1 (ABI 12) ------------------------------------------------------
+
+    def gather(self, src, dim: int, index, *, bf16: bool = False) -> np.ndarray:
+        """`torch.gather(src, dim, index)` on the device (index/v1): arrays of
+        rank 1-4, `index` int64 or int32 with `index.shape[d] <= src.shape[d]`
+        off `dim`. The result has `index`'s shape and `src`'s dtype, copied bit
+        for bit. An index out of range raises IndexError (the kit never reads
+        with it). `bf16=True` names a uint16 array as bf16 bits."""
+        np = _require_numpy("Device.gather")
+        src, index = np.asarray(src), np.asarray(index)
+        dim = _index_dim(dim, src.ndim, "gather")
+        _index_shapes(index.shape, src.shape, dim, "gather", "src")
+        out = np.empty(index.shape, src.dtype)
+        return self._index("gather", 0, src, index, out, index.shape, dim, src.shape[dim],
+                           _c_strides(index.shape), _c_strides(src.shape), _c_strides(index.shape), bf16=bf16)
+
+    def index_select(self, src, dim: int, index, *, bf16: bool = False) -> np.ndarray:
+        """`torch.index_select(src, dim, index)` on the device: `index` 1-D int64
+        or int32, the result `src`'s shape with `len(index)` along `dim`."""
+        np = _require_numpy("Device.index_select")
+        src, index = np.asarray(src), np.asarray(index)
+        dim = _index_dim(dim, src.ndim, "index_select")
+        if index.ndim != 1:
+            raise AckShapeError("index_select takes a 1-D index")
+        shape = src.shape[:dim] + (index.shape[0],) + src.shape[dim + 1:]
+        out = np.empty(shape, src.dtype)
+        idx_st = [0] * len(shape)
+        idx_st[dim] = 1
+        return self._index("index_select", 0, src, index, out, shape, dim, src.shape[dim],
+                           idx_st, _c_strides(src.shape), _c_strides(shape), bf16=bf16)
+
+    def scatter(self, out, dim: int, index, src=None, *, value=None, bf16: bool = False) -> np.ndarray:
+        """`out.scatter(dim, index, src)` (or `value=`) on the device, returned
+        as a new array: each index writes `src` at the same coordinates, and a
+        repeated index leaves the LAST value in index order, as torch's CPU
+        kernel does. `index.shape[d] <= src.shape[d]` everywhere and
+        `<= out.shape[d]` off `dim`."""
+        np = _require_numpy("Device.scatter")
+        out, index = np.asarray(out), np.asarray(index)
+        dim = _index_dim(dim, out.ndim, "scatter")
+        _index_shapes(index.shape, out.shape, dim, "scatter", "out")
+        if (src is None) == (value is None):
+            raise AckShapeError("scatter takes exactly one of src and value")
+        src_st = [0] * out.ndim
+        if src is not None:
+            src = np.asarray(src)
+            if src.dtype != out.dtype:
+                raise AckError(f"scatter src dtype {src.dtype} is not out's {out.dtype}")
+            if src.ndim != index.ndim or any(i > s for i, s in zip(index.shape, src.shape)):
+                raise AckShapeError(f"scatter index {index.shape} exceeds src {src.shape}")
+            src_st = _c_strides(src.shape)
+        return self._index("scatter", 1, src, index, out.copy(), index.shape, dim, out.shape[dim],
+                           _c_strides(index.shape), src_st, _c_strides(out.shape), bf16=bf16, value=value)
+
+    def scatter_add(self, out, dim: int, index, src, *, bf16: bool = False) -> np.ndarray:
+        """`out.scatter_add(dim, index, src)` on the device, returned as a new
+        array. Each destination adds its sources in index order and rounds each
+        step in its own dtype: numpy's order and rounding, and torch's CPU
+        result for float32 and integers. For float16 (and bf16 bits) torch's
+        CPU kernels instead accumulate in f32 and round once (measured), so a
+        16-bit result can differ from torch's in the last place. float64 adds
+        in binary64 as torch's CPU does, NaN rule included (index schema 2).
+        Not for bool."""
+        np = _require_numpy("Device.scatter_add")
+        out, index, src = np.asarray(out), np.asarray(index), np.asarray(src)
+        dim = _index_dim(dim, out.ndim, "scatter_add")
+        _index_shapes(index.shape, out.shape, dim, "scatter_add", "out")
+        if src.dtype != out.dtype:
+            raise AckError(f"scatter_add src dtype {src.dtype} is not out's {out.dtype}")
+        if src.ndim != index.ndim or any(i > s for i, s in zip(index.shape, src.shape)):
+            raise AckShapeError(f"scatter_add index {index.shape} exceeds src {src.shape}")
+        return self._index("scatter_add", 2, src, index, out.copy(), index.shape, dim, out.shape[dim],
+                           _c_strides(index.shape), _c_strides(src.shape), _c_strides(out.shape), bf16=bf16)
+
+    def index_add(self, out, dim: int, index, src, *, alpha: float = 1.0, bf16: bool = False) -> np.ndarray:
+        """`out.index_add(dim, index, src, alpha=alpha)` on the device, returned
+        as a new array: `src` is `out`'s shape with `len(index)` along `dim`.
+        The same order and rounding as `scatter_add`; an alpha other than 1 is
+        taken for float32 only (`src * alpha` in f32, then the add)."""
+        return self._index_along("index_add", 2, out, dim, index, src, alpha=alpha, bf16=bf16)
+
+    def index_copy(self, out, dim: int, index, src, *, bf16: bool = False) -> np.ndarray:
+        """`out.index_copy(dim, index, src)` on the device, returned as a new
+        array; a repeated index leaves the last row in index order."""
+        return self._index_along("index_copy", 1, out, dim, index, src, alpha=1.0, bf16=bf16)
+
+    def _index_along(self, name, op, out, dim, index, src, *, alpha, bf16) -> np.ndarray:
+        np = _require_numpy(f"Device.{name}")
+        out, index, src = np.asarray(out), np.asarray(index), np.asarray(src)
+        dim = _index_dim(dim, out.ndim, name)
+        if index.ndim != 1:
+            raise AckShapeError(f"{name} takes a 1-D index")
+        want = out.shape[:dim] + (index.shape[0],) + out.shape[dim + 1:]
+        if src.shape != want:
+            raise AckShapeError(f"{name} src {src.shape} is not {want}")
+        if src.dtype != out.dtype:
+            raise AckError(f"{name} src dtype {src.dtype} is not out's {out.dtype}")
+        idx_st = [0] * out.ndim
+        idx_st[dim] = 1
+        return self._index(name, op, src, index, out.copy(), src.shape, dim, out.shape[dim],
+                           idx_st, _c_strides(src.shape), _c_strides(out.shape), bf16=bf16, alpha=alpha)
+
+    def _index(self, name, op, src, index, out, shape, dim, bound, idx_st, src_st, out_st,
+               *, bf16=False, value=None, alpha=1.0) -> np.ndarray:
+        """One `ack_index` call: upload, dispatch, check the status word,
+        download `out`. `src` is None for a value scatter (its buffer is then
+        `out`'s, which the kit allows for an unread source)."""
+        np = _require_numpy(f"Device.{name}")
+        code = _index_storage(out.dtype, bf16)
+        if index.dtype not in (np.int64, np.int32):
+            raise AckError(f"{name} index dtype must be int64 or int32, not {index.dtype}")
+        if not 1 <= len(shape) <= 4:
+            raise AckShapeError(f"{name} takes 1 to 4 dimensions, not {len(shape)}")
+        if any(extent == 0 for extent in shape) or out.size == 0:
+            return out
+        if op == 2 and out.dtype == np.bool_:
+            raise AckError(f"{name} does not add {out.dtype} (a bool add is a logical or)")
+        flags = 0
+        if index.dtype == np.int32:
+            flags |= 1
+        request = AckIndexRequest()
+        request.op, request.dtype, request.ndim, request.dim = op, code, len(shape), dim
+        if value is not None:
+            flags |= 4
+            bits = np.asarray(value, dtype=out.dtype).reshape(1).view(np.uint8)
+            request.value = int.from_bytes(bits.tobytes(), "little")
+        if alpha != 1.0:
+            if op != 2 or out.dtype != np.float32:
+                raise AckError(f"{name} takes an alpha other than 1 for float32 only")
+            flags |= 8
+            request.alpha_bits = int(np.asarray(alpha, np.float32).view(np.uint32))
+        request.flags = flags
+        for k in range(len(shape)):
+            request.shape[k] = shape[k]
+            request.index_strides[k] = idx_st[k]
+            request.src_strides[k] = src_st[k]
+            request.out_strides[k] = out_st[k]
+        request.bound = bound
+        with self._lock:
+            self._require_open()
+            self.last_ms = None
             with ExitStack() as cleanup:
-                ba = self.buffer(a16.nbytes)
-                cleanup.callback(ba.free)
-                bb = self.buffer(b16.nbytes)
-                cleanup.callback(bb.free)
-                bc = self.buffer(m * n * 4)
-                cleanup.callback(bc.free)
-                ba.upload(a16)
-                bb.upload(b16)
+                def upload(array):
+                    raw = np.ascontiguousarray(array).reshape(-1).view(np.uint8)
+                    # whole words: the kit addresses storage as 32-bit words
+                    padded = np.zeros(max(4, -(-raw.nbytes // 4) * 4), np.uint8)
+                    padded[:raw.nbytes] = raw
+                    buffer = self.buffer(padded.nbytes)
+                    cleanup.callback(buffer.free)
+                    buffer.upload(padded)
+                    return buffer
+                b_index = upload(index)
+                b_out = upload(out)
+                b_src = upload(src) if src is not None else b_out
+                b_status = upload(np.zeros(4, np.uint32))
                 ms = ctypes.c_double(0.0)
-                rc = self._lib.cdll.ack_matmul_bf16(
-                    self._handle, ba._handle, bb._handle, bc._handle, m, n, k, int(a_t), int(b_t), ctypes.byref(ms)
-                )
+                rc = self._lib.cdll.ack_index(self._handle, b_src._handle, b_index._handle, b_out._handle,
+                                              b_status._handle, ctypes.byref(request),
+                                              ctypes.sizeof(request), ctypes.byref(ms))
                 if rc == ACK_ERR_SHAPE:
                     raise AckShapeError(self._lib.last_error())
                 if rc != ACK_OK:
-                    raise _kit_error("matmul", rc, self._lib.last_error())
-                result = bc.download(np.float32).reshape(m, n)
+                    raise _kit_error(name, rc, self._lib.last_error())
+                status = b_status.download(np.uint32)
+                if status[request.status_slot] & 1:
+                    raise IndexError(f"{name}: an index is out of range for dimension {dim} of extent {bound}")
+                raw = b_out.download(np.uint8)[:out.nbytes]
                 self.last_ms = ms.value
-                return result
+                return raw.view(out.dtype).reshape(out.shape).copy()
+
+    # ---- convert/v1 (ABI 13) ------------------------------------------------------
+
+    def convert(self, src, dtype, *, bf16: bool = False, out_bf16: bool = False) -> np.ndarray:
+        """`src` converted to `dtype` on the device (convert/v1), rounded as c10
+        rounds: float -> float through float32 to nearest even, int -> float to
+        nearest even from the exact value, int -> int by two's complement
+        truncation, anything -> bool as nonzero. A float -> integer conversion
+        raises AckShapeError: c10's cast is undefined out of range, so the kit
+        refuses it by name. `bf16=True` names a uint16 `src` as bf16 bits;
+        `out_bf16=True` returns bf16 bits as uint16 (and ignores `dtype`)."""
+        np = _require_numpy("Device.convert")
+        src = np.asarray(src)
+        out_dtype = np.dtype(np.uint16) if out_bf16 else np.dtype(dtype)
+        return self.convert_view(src, out_dtype, src.shape, 0, _c_strides(src.shape), bf16=bf16, out_bf16=out_bf16)
+
+    # ---- intwise/v1 (ABI 14) ------------------------------------------------------
+
+    def intwise(self, op: str, x=None, y=None, *, scalar=0, alpha=1, compute=None,
+                out_dtype=None, shape=None) -> np.ndarray:
+        """torch's integer or bool pointwise operation `op` (`INTWISE_OPS`) on
+        the device (intwise/v1), over dense arrays: x and y of one shape, or y
+        None and `scalar` in its place. `compute` is C, the dtype torch computes
+        in (default numpy's result_type of the operands, which agrees with
+        torch's for these types); the result is `out_dtype` (default bool for a
+        comparison, else C). fill and arange take no operands: `shape` and
+        `out_dtype` name the output, `scalar` is the value or the start and
+        `alpha` arange's step. The divisions (div_trunc, div_floor, remainder,
+        fmod) take y None and `scalar` as the divisor, which must be nonzero in
+        C and not -1 in an int32 or int64 C (the kit refuses those by name).
+        Operands are wrapped to C and the result truncated to the output as c10
+        casts; see kernels/intwise.comp.
+
+        With `compute=np.float64` (schema 2) the binary64 module computes
+        torch's float64 arithmetic bit for bit: add and sub (alpha 1 or -1),
+        mul, div, reciprocal, neg, abs, fill and the comparisons, x and y of
+        float64, float32, float16 or an integer or bool dtype, widened as torch
+        casts them; `scalar` is a float. With a float operand name `compute`:
+        numpy promotes float32 with int64 to float64 where torch keeps float32.
+
+        cumsum (schema 3) takes x alone and sums along its LAST axis in an
+        integer C, which is also the output's dtype by default, as torch's
+        cumsum(x, -1, dtype=C) computes it (torch's own default C for an
+        integer or bool x is int64: name it).
+
+        tril and triu (schema 4) take x alone and keep it over its last two
+        axes where column - row <= `scalar` (tril) or >= `scalar` (triu), the
+        diagonal, else 0. They move bits and compute none, so a float array
+        goes as the integer view of its width (x.view(np.int32) for float32).
+
+        rank_asc and rank_desc (schema 5) take x alone, of any dtype (float64,
+        float32, float16, an integer or bool), and give each element its
+        position in the stable ascending or descending sort of its row (the
+        LAST axis), as int64 by default: numpy's argsort(kind="stable") inverted.
+        Floats compare as torch's sort compares them: -0.0 equals +0.0, and
+        every NaN is equal to every other and larger than +inf."""
+        np = _require_numpy("Device.intwise")
+        if op not in INTWISE_OPS:
+            raise AckError(f"intwise has no operation {op!r}")
+        code = INTWISE_OPS[op]
+        if op in ("fill", "arange"):
+            if shape is None or out_dtype is None:
+                raise AckError(f"intwise {op} takes shape= and out_dtype=")
+            xs = None
+            out_shape = tuple(int(e) for e in shape)
+            compute = np.dtype(out_dtype) if compute is None else np.dtype(compute)
+        else:
+            xs = np.ascontiguousarray(x)
+            out_shape = xs.shape
+            if y is not None:
+                y = np.ascontiguousarray(y)
+                if y.shape != xs.shape:
+                    raise AckShapeError(f"intwise takes x and y of one shape, not {xs.shape} and {y.shape}")
+            if compute is None and op in ("rank_asc", "rank_desc"):
+                compute = np.int64   # a rank is an integer whatever x is
+            if compute is None:
+                operands = (xs.dtype,) if y is None else (xs.dtype, y.dtype)
+                if any(d.kind == "f" for d in operands) and np.dtype(np.float64) not in operands:
+                    raise AckError("intwise with a float operand takes compute= (numpy's float promotion is "
+                                   "not torch's: float32 with int64 is float64 in numpy, float32 in torch)")
+                compute = np.result_type(*operands)
+            compute = np.dtype(compute)
+        binary64 = compute == np.dtype(np.float64)
+        compare = op in ("eq", "ne", "lt", "le", "gt", "ge")
+        out_dtype = np.dtype(out_dtype) if out_dtype is not None else np.dtype(bool if compare else compute)
+        if len(out_shape) == 0:
+            flat = self.intwise(op, None if xs is None else xs.reshape(1), None if y is None else y.reshape(1),
+                                scalar=scalar, alpha=alpha, compute=compute, out_dtype=out_dtype,
+                                shape=None if shape is None else (1,))
+            return flat.reshape(())
+        if not 1 <= len(out_shape) <= 4:
+            raise AckShapeError(f"intwise takes 1 to 4 dimensions, not {out_shape}")
+        out = np.empty(out_shape, out_dtype)
+        if out.size == 0:
+            return out
+        request = AckIntwiseRequest()
+        request.op = code
+        request.compute_code = _intwise_code(compute, binary64)
+        request.out_code = _intwise_code(out_dtype, binary64)
+        # a rank's x may be any dtype, whatever C is
+        x_any = binary64 or op in ("rank_asc", "rank_desc")
+        request.x_code = _intwise_code(xs.dtype, x_any) if xs is not None else request.compute_code
+        request.y_code = _intwise_code(y.dtype, binary64) if y is not None else request.compute_code
+        request.ndim = len(out_shape)
+        request.flags = 1 if (xs is not None and y is None
+                              and op not in ("neg", "abs", "reciprocal", "cumsum", "tril", "triu",
+                                             "rank_asc", "rank_desc")) else 0
+        strides = _c_strides(out_shape)
+        for k in range(len(out_shape)):
+            request.shape[k] = out_shape[k]
+            request.x_strides[k] = request.y_strides[k] = request.out_strides[k] = strides[k]
+        if binary64:
+            request.scalar, request.alpha = _f64_bits(scalar), _f64_bits(alpha)
+        else:
+            request.scalar, request.alpha = int(scalar), int(alpha)
+        with self._lock:
+            self._require_open()
+            self.last_ms = None
+            with ExitStack() as cleanup:
+                def buffer_with(array):
+                    # whole words: the kit addresses storage as 32-bit words
+                    raw = np.zeros(max(4, -(-array.nbytes // 4) * 4), np.uint8)
+                    raw[:array.nbytes] = array.reshape(-1).view(np.uint8)
+                    buffer = self.buffer(raw.nbytes)
+                    cleanup.callback(buffer.free)
+                    buffer.upload(raw)
+                    return buffer
+                b_out = buffer_with(np.zeros(out.nbytes, np.uint8))
+                b_x = buffer_with(xs) if xs is not None else b_out
+                b_y = buffer_with(y) if y is not None else b_out
+                ms = ctypes.c_double(0.0)
+                rc = self._lib.cdll.ack_intwise(self._handle, b_x._handle, b_y._handle, b_out._handle,
+                                                ctypes.byref(request), ctypes.sizeof(request), ctypes.byref(ms))
+                if rc == ACK_ERR_SHAPE:
+                    raise AckShapeError(self._lib.last_error())
+                if rc != ACK_OK:
+                    raise _kit_error("intwise", rc, self._lib.last_error())
+                got = b_out.download(np.uint8)[:out.nbytes]
+                self.last_ms = ms.value
+                return got.view(out_dtype).reshape(out_shape).copy()
+
+    def convert_view(self, base, dtype, shape, offset: int, strides, *, bf16: bool = False,
+                     out_bf16: bool = False) -> np.ndarray:
+        """`convert` over a strided view of `base` (uploaded whole, in C order):
+        `shape` of rank 1-4, an element `offset` and element `strides` into
+        `base`'s flat storage. The result is a new dense array of `dtype`."""
+        np = _require_numpy("Device.convert_view")
+        base = np.ascontiguousarray(base)
+        out_dtype = np.dtype(np.uint16) if out_bf16 else np.dtype(dtype)
+        src_code = _convert_code(base.dtype, bf16)
+        out_code = _convert_code(out_dtype, out_bf16)
+        shape = tuple(int(extent) for extent in shape)
+        if len(shape) == 0:
+            return self.convert_view(base, dtype, (1,), offset, (0,), bf16=bf16, out_bf16=out_bf16).reshape(())
+        if not 1 <= len(shape) <= 4 or len(strides) != len(shape):
+            raise AckShapeError(f"convert takes 1 to 4 dimensions with one stride each, not {shape} / {tuple(strides)}")
+        out = np.empty(shape, out_dtype)
+        if out.size == 0:
+            return out
+        request = AckConvertRequest()
+        request.src_code, request.out_code, request.ndim, request.flags = src_code, out_code, len(shape), 0
+        out_strides = _c_strides(shape)
+        for k in range(len(shape)):
+            request.shape[k] = shape[k]
+            request.in_strides[k] = int(strides[k])
+            request.out_strides[k] = out_strides[k]
+        request.in_offset, request.out_offset = int(offset), 0
+        with self._lock:
+            self._require_open()
+            self.last_ms = None
+            with ExitStack() as cleanup:
+                def buffer_of(nbytes):
+                    # whole words: the kit addresses storage as 32-bit words
+                    buffer = self.buffer(max(4, -(-nbytes // 4) * 4))
+                    cleanup.callback(buffer.free)
+                    return buffer
+                raw = base.reshape(-1).view(np.uint8)
+                b_src = buffer_of(raw.nbytes)
+                padded = np.zeros(b_src.nbytes, np.uint8)
+                padded[:raw.nbytes] = raw
+                b_src.upload(padded)
+                b_out = buffer_of(out.nbytes)
+                ms = ctypes.c_double(0.0)
+                rc = self._lib.cdll.ack_convert(self._handle, b_src._handle, b_out._handle, ctypes.byref(request),
+                                                ctypes.sizeof(request), ctypes.byref(ms))
+                if rc == ACK_ERR_SHAPE:
+                    raise AckShapeError(self._lib.last_error())
+                if rc != ACK_OK:
+                    raise _kit_error("convert", rc, self._lib.last_error())
+                got = b_out.download(np.uint8)[:out.nbytes]
+                self.last_ms = ms.value
+                return got.view(out_dtype).reshape(shape).copy()
+
+    def _coopmat_product(self, entry: str, name: str, a16, b16, m: int, n: int, k: int, a_t, b_t) -> np.ndarray:
+        """One product through a 16-bit cooperative-matrix entry, from operands
+        already in their 16-bit storage. The caller holds the lock."""
+        # Register each allocation as soon as it succeeds. Cleanup cannot
+        # depend on CPython refcounting or on reaching the final allocation.
+        with ExitStack() as cleanup:
+            ba = self.buffer(a16.nbytes)
+            cleanup.callback(ba.free)
+            bb = self.buffer(b16.nbytes)
+            cleanup.callback(bb.free)
+            bc = self.buffer(m * n * 4)
+            cleanup.callback(bc.free)
+            ba.upload(a16)
+            bb.upload(b16)
+            ms = ctypes.c_double(0.0)
+            rc = getattr(self._lib.cdll, entry)(
+                self._handle, ba._handle, bb._handle, bc._handle, m, n, k, int(a_t), int(b_t), ctypes.byref(ms)
+            )
+            if rc == ACK_ERR_SHAPE:
+                raise AckShapeError(self._lib.last_error())
+            if rc != ACK_OK:
+                raise _kit_error(name, rc, self._lib.last_error())
+            result = bc.download(np.float32).reshape(m, n)
+            self.last_ms = ms.value
+            return result
 
     def live_objects(self) -> int:
         """Vulkan objects the device's context has created and not destroyed

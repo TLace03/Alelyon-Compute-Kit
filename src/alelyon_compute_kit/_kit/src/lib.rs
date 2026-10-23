@@ -10,25 +10,91 @@
 
 use ash::vk;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::c_void;
 use std::io::Cursor;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::ops::Bound;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+pub mod amp_ops;
+pub mod attention_fused;
 pub mod attention_ops;
 pub mod batch;
+pub mod convert_ops;
+pub mod device_choice;
 pub mod embedding_ops;
+pub mod expert_factor_ops;
 pub mod ffi;
+pub mod head_loss_ops;
+pub mod index_ops;
+pub mod intwise_ops;
 pub mod loss_ops;
 pub mod matmul_ops;
-pub mod packed2_ops;
+pub mod nf4_ops;
 pub mod pointwise_ops;
+pub mod radix_ops;
 pub mod reduce_ops;
+pub mod rotary_ops;
 pub mod row_ops;
-pub mod vq_ops;
+pub mod student_norm_ops;
+pub mod swiglu_ops;
+pub mod vq4_ops;
+pub mod weighted_bag_ops;
 
 pub use batch::{Access, AccessKind, FlushReason, ALL_FLUSH_REASONS, FLUSH_REASON_COUNT};
+
+// ---- the transfer clock (off by default) ------------------------------------
+//
+// A process-wide switch and cumulative counters. On, `Context::download_into`
+// and `Context::upload` time their flush (the submission of whatever is
+// recorded, and the wait for it and for any batch in flight) apart from the
+// rest of the transfer (the staging, the copy's own submission and wait, and
+// the host copy). A recorded upload flushes nothing, so its whole time is
+// the rest. Off, the two methods read one atomic each and nothing else. A
+// transfer that fails part-way records nothing.
+
+/// The clock's words, in order: what each cumulative counter holds.
+pub const TRANSFER_CLOCK_NAMES: [&str; 7] = [
+    "download_calls",
+    "download_flush_ns",
+    "download_copy_ns",
+    "upload_calls",
+    "upload_flush_ns",
+    "upload_copy_ns",
+    "upload_recorded_calls",
+];
+static TRANSFER_CLOCK_ON: AtomicBool = AtomicBool::new(false);
+static TRANSFER_CLOCK: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// Switch the transfer clock on or off for this process.
+pub fn set_transfer_clock(on: bool) {
+    TRANSFER_CLOCK_ON.store(on, Ordering::SeqCst);
+}
+
+/// Whether the transfer clock is on.
+pub fn transfer_clock_on() -> bool {
+    TRANSFER_CLOCK_ON.load(Ordering::Relaxed)
+}
+
+/// The clock's cumulative words (`TRANSFER_CLOCK_NAMES`); a caller
+/// differences two readings.
+pub fn transfer_clock_ns() -> [u64; 7] {
+    std::array::from_fn(|i| TRANSFER_CLOCK[i].load(Ordering::Relaxed))
+}
+
+/// Record one finished transfer: `calls` is word 0 (download) or 3 (upload),
+/// with its flush and its rest in the two words after it.
+fn transfer_clock_add(calls: usize, flush_ns: u64, rest_ns: u64) {
+    TRANSFER_CLOCK[calls].fetch_add(1, Ordering::Relaxed);
+    TRANSFER_CLOCK[calls + 1].fetch_add(flush_ns, Ordering::Relaxed);
+    TRANSFER_CLOCK[calls + 2].fetch_add(rest_ns, Ordering::Relaxed);
+}
+
+/// Nanoseconds between two instants, saturating at u64::MAX.
+fn clock_ns(from: std::time::Instant, to: std::time::Instant) -> u64 {
+    u64::try_from(to.saturating_duration_since(from).as_nanos()).unwrap_or(u64::MAX)
+}
 
 /// Milestone-1 result of asking the driver what it has.
 #[derive(Debug, Clone)]
@@ -48,6 +114,39 @@ pub struct DeviceReport {
     /// declares the SPIR-V `Int16` capability (a review decoded every module:
     /// it is the only one), so `open` requires and enables the feature.
     pub shader_int16: bool,
+    /// `shaderIntegerDotProduct` (core 1.3 / VK_KHR_shader_integer_dot_product):
+    /// queried, not required -- `open` enables it when the driver has it, and
+    /// nothing here fails without it. `decode_probe`'s VQ8 kernel declares
+    /// `dotPacked4x8EXT` and reads this field to decide whether to dispatch it.
+    pub integer_dot_product: bool,
+    /// `shaderFloat16` (core 1.2): queried, not required -- `open` enables it
+    /// when the driver has it. The fp16 cooperative-matrix modules declare the
+    /// SPIR-V `Float16` capability, so `ack_matmul_f16` builds them only on a
+    /// device where this is set (and `f16_cooperative_matrix` is too).
+    pub shader_float16: bool,
+    /// `shaderRoundingModeRTEFloat16` and `shaderDenormPreserveFloat16` (core
+    /// 1.2 float controls, 2026-09-29): a module may declare round-to-nearest-
+    /// even and denormal preservation for 16-bit floats, so a hardware
+    /// conversion to binary16 is IEEE's (subnormals kept, an overflow to
+    /// infinity). The fused attention's fp16 modules take the hardware
+    /// conversion only when both are set (`ack_attention_f16_fwd`).
+    pub f16_rounding_rte: bool,
+    pub f16_denorm_preserve: bool,
+    /// `shaderDenormPreserveFloat32` and `shaderSignedZeroInfNanPreserveFloat32`
+    /// (core 1.2 float controls, 2026-10-03): a module may declare that its
+    /// FP32 arithmetic keeps subnormals and keeps a zero's sign, an infinity
+    /// and a NaN through every operation (no `0 + x -> x` folding). The MoE
+    /// combine moe-combine/v1 declares both, because its sum (`out + w * y`
+    /// from +0.0, the reference model's order) keeps subnormal products and
+    /// turns `0 + -0` into `+0`; `MoeCombineKernel` refuses a device where
+    /// either is unset.
+    pub f32_denorm_preserve: bool,
+    pub f32_signed_zero_inf_nan_preserve: bool,
+    /// The 16x16x16 fp16 x fp16 -> f32 subgroup-scope cooperative shape the
+    /// fp16 matmul modules are written for is among the driver's properties:
+    /// the fp16 counterpart of `bf16_cooperative_matrix`, for a device such as
+    /// NVIDIA Turing whose tensor cores take fp16 and not bf16.
+    pub f16_cooperative_matrix: bool,
     pub coopmat_shapes: Vec<CoopmatShape>,
     pub device_local_bytes: u64,
     /// Identity, as the driver declares it (readiness ledger, "ABI/capability
@@ -63,6 +162,36 @@ pub struct DeviceReport {
     /// Compute limits beyond the ones `Context` checks against.
     pub max_workgroup_invocations: u32,
     pub max_workgroup_size: [u32; 3],
+    /// R1: whether `Context::open` found a queue family that supports
+    /// `TRANSFER` and neither `COMPUTE` nor `GRAPHICS` (a dedicated DMA
+    /// family) and was able to request a queue from it. `false` on a device
+    /// with no such family, or with only one queue family altogether --
+    /// `copy_from_staging_async` still works on such a device (R2's
+    /// fallback), it just does the ordinary synchronous copy on the compute
+    /// queue instead of overlapping it.
+    pub transfer_queue: bool,
+    /// The family index `transfer_queue` was taken from, when it is `true`.
+    pub transfer_queue_family: Option<u32>,
+    /// R2: whether the device reports `VK_KHR_timeline_semaphore` (core in
+    /// Vulkan 1.2) and `Context::open` enabled it. `false` makes
+    /// `copy_from_staging_async` take the same synchronous fallback as a
+    /// missing transfer queue.
+    pub timeline_semaphores: bool,
+    /// `VK_EXT_external_memory_host`: whether the driver reports it, in which
+    /// case `open` enables it. It lets memory this process allocated itself be
+    /// imported as device-visible memory with no copy. The streaming
+    /// pipeline's pinned host ring imports its ring this way, so an unbuffered
+    /// file read lands directly in memory the transfer queue copies from.
+    /// Queried, not required: without it the ring falls back to a mapped
+    /// HOST_CACHED staging area, and says so.
+    pub external_memory_host: bool,
+    /// `minImportedHostPointerAlignment` of that extension: the address and
+    /// size alignment an import needs. `0` when the extension is absent.
+    pub min_imported_host_pointer_alignment: u64,
+    /// How `Context::open` chose this device: the `ACK_DEVICE` choice in
+    /// force, the rule that picked it and any device it did not admit
+    /// (`device_choice.rs`). Declared by the kit, not read from the driver.
+    pub selection: String,
 }
 
 impl DeviceReport {
@@ -94,6 +223,20 @@ pub struct CoopmatShape {
     pub result_type: String,
     pub scope: String,
     pub saturating: bool,
+}
+
+impl CoopmatShape {
+    /// The shape every cooperative-matrix product here is written for:
+    /// 16x16x16 at subgroup scope with `operand` A and B and an f32 result.
+    pub fn is_16x16x16_subgroup_to_f32(&self, operand: &str) -> bool {
+        self.m == 16
+            && self.n == 16
+            && self.k == 16
+            && self.a_type == operand
+            && self.b_type == operand
+            && self.result_type == "float32"
+            && self.scope == "subgroup"
+    }
 }
 
 /// VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR: read from
@@ -207,6 +350,9 @@ impl std::error::Error for AckError {}
 
 pub type Result<T> = std::result::Result<T, AckError>;
 
+/// `(timeline semaphore, value)` pairs a submission waits on or signals.
+type TimelineValues = Vec<(vk::Semaphore, u64)>;
+
 static NEXT_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// One logical device, one compute queue, one command pool.
@@ -245,10 +391,67 @@ pub struct Context {
     queue: vk::Queue,
     queue_family: u32,
     command_pool: vk::CommandPool,
+    /// R1: a queue from a dedicated TRANSFER (DMA) family, when the device
+    /// exposes one (`report.transfer_queue`). `None` on a device without one
+    /// -- every method below that would use it falls back to the compute
+    /// queue instead (R2's `copy_from_staging_async` fallback).
+    transfer_queue: Option<vk::Queue>,
+    /// The family `transfer_queue` was taken from; also `report.transfer_queue_family`.
+    transfer_queue_family: Option<u32>,
+    /// The transfer queue's own command pool (one pool per family). `None`
+    /// exactly when `transfer_queue` is `None`. Created and destroyed
+    /// alongside `command_pool`, outside `live_objects()`'s count.
+    transfer_command_pool: Option<vk::CommandPool>,
+    /// R2: one owned timeline semaphore, or `None` when the driver does not
+    /// report `VK_KHR_timeline_semaphore` (`report.timeline_semaphores`).
+    timeline: Option<vk::Semaphore>,
+    /// The last value this context signalled `timeline` to; the next async
+    /// copy signals `timeline_value + 1`. Meaningless when `timeline` is `None`.
+    timeline_value: Cell<u64>,
+    /// The largest ticket value `await_transfer` has armed and no submission
+    /// has yet consumed (R2). Waiting for the largest value implies every
+    /// smaller one has also been reached, since the timeline only counts up,
+    /// so a single slot -- not a list -- is enough for any number of pending
+    /// `await_transfer` calls between two submissions. Consumed (taken) by
+    /// the next `one_shot` or `flush` submission on the compute queue, which
+    /// is what "the next submission's wait list" means (R2's doc comment).
+    pending_transfer_wait: Cell<Option<u64>>,
+    /// Async transfer-queue command buffers not yet known to be safe to free
+    /// (R2): `(ticket value, command buffer)`, reaped opportunistically by
+    /// `copy_from_staging_async` and by `wait_transfer` once
+    /// `vkGetSemaphoreCounterValue` shows the timeline has passed that value,
+    /// and unconditionally at `Drop` (after `device_wait_idle`, which
+    /// guarantees every one of them has by then). Each entry is a tracked
+    /// object (`vk_allocate_transfer_command_buffer` calls `track(1)`), so
+    /// `live_objects()` counts it exactly as long as it is live here.
+    pending_transfer_cbs: RefCell<Vec<(u64, vk::CommandBuffer)>>,
+    /// Timeline values the NEXT compute submission signals when it completes.
+    /// This is COMPUTE_DONE: the streaming pipeline (`stream`) has its transfer
+    /// queue wait on it before it overwrites a VRAM slot a kernel was reading.
+    /// Consumed by whichever of `one_shot` and `flush` submits next, exactly
+    /// like `pending_transfer_wait`. If that submission fails, the values are
+    /// signalled from the host instead (`release_signals`), so a queue waiting
+    /// on them is not left waiting forever.
+    pending_signals: RefCell<Vec<(vk::Semaphore, u64)>>,
     memory: vk::PhysicalDeviceMemoryProperties,
     pub report: DeviceReport,
     /// Vulkan 1.3 subgroupSizeControl + computeFullSubgroups were enabled.
     pub subgroup_size_control: bool,
+    /// Vulkan 1.2 storageBuffer8BitAccess and shaderInt8 were both enabled,
+    /// which the pointwise family's bool-storage modules declare; without
+    /// them those modules are refused by name rather than built.
+    pub bool_storage: bool,
+    /// The device's [minSubgroupSize, maxSubgroupSize]: the only widths a
+    /// compute pipeline may require (see `can_require_subgroup_size`).
+    pub subgroup_size_range: (u32, u32),
+    /// requiredSubgroupSizeStages includes COMPUTE.
+    pub required_subgroup_size_compute: bool,
+    /// The device reports shaderRoundingModeRTEFloat16/64 and
+    /// shaderDenormPreserveFloat16/64 (core 1.2 float controls): the modes the
+    /// fp16-output product modules declare, for 16- and 64-bit alike, since a
+    /// device whose float controls are only 32-bit independent needs both.
+    /// Without all four those modules are refused by code, not built.
+    pub fp16_rounding_declarable: bool,
     /// Valid bits of the compute queue's timestamps (36..=64); deltas are
     /// reduced modulo 2^bits (review finding ACK-L0-04).
     pub timestamp_valid_bits: u32,
@@ -305,6 +508,12 @@ pub struct Context {
     /// starts again at set 0, which is how the arena is reset without the
     /// context holding a back-pointer to every kernel the caller owns.
     batch_gen: Cell<u64>,
+    /// Whether `dispatch` may reuse the descriptor set a kernel's CURRENT
+    /// bindings were last written into, within the same batch generation
+    /// (`ACK_DESCRIPTOR_REUSE`, default on; `0` turns it off for an A/B). The
+    /// write it skips is identical, and the set is in the recording batch's own
+    /// bank, so nothing in flight can see it change.
+    descriptor_reuse: Cell<bool>,
     /// The descriptor bank (0 or 1) the open batch's kernels hand sets out of:
     /// the one the batch in flight is not using (asynchronous flushes,
     /// 2026-09-10). A kernel's arena holds two banks so a batch can be
@@ -334,6 +543,40 @@ pub struct Context {
     /// `ACK_DEFERRED_UPLOAD=1` at open, which the torch adapter sets before it
     /// opens, or `set_deferred_upload(true)`.
     deferred_upload: Cell<bool>,
+    /// Fences of COMPLETED submissions, reset and kept for the next submission
+    /// instead of destroyed (2026-09-22), while `fence_pool_enabled`. Measured
+    /// on an NVIDIA L4 (driver 580.173.02) under the torch adapter: one A0
+    /// training update made 2,186 `vkCreateFence` and 2,187 `vkDestroyFence`
+    /// calls costing 2.03 s of host time between them, one pair per batch and
+    /// per one-shot submission. A pooled fence is a LIVE object, counted by
+    /// `live_objects()` and by `pooled_objects()`, as a pooled buffer is; it is
+    /// in the unsignalled state (reset when it was pooled), and at most
+    /// `batch::FENCE_POOL_MAX` are held.
+    fence_pool: RefCell<Vec<vk::Fence>>,
+    /// `ACK_FENCE_POOL=1` at open, or `set_fence_pool_enabled`. OFF by default
+    /// in the crate for the same reason `deferred_upload` is: the crate's
+    /// leak and poison suites pin "back to the baseline" after a submission,
+    /// which a held fence would turn into baseline + 1. The torch adapter sets
+    /// it before it opens.
+    fence_pool_enabled: Cell<bool>,
+    /// Staging pairs of COMPLETED transfers, kept mapped for the next transfer
+    /// of their kind and size class instead of destroyed (see `StagingPair`),
+    /// while `staging_pool_enabled`. Pooled pairs are LIVE objects, two each,
+    /// counted by `live_objects()` and by `pooled_objects()`.
+    staging_pool: RefCell<HashMap<(TransferKind, u64), Vec<StagingPair>>>,
+    /// `ACK_STAGING_POOL=1` at open, or `set_staging_pool_enabled`. OFF by
+    /// default in the crate for the reason `fence_pool_enabled` is; the torch
+    /// adapter turns it on.
+    staging_pool_enabled: Cell<bool>,
+    staging_pool_bytes: Cell<u64>,
+    /// `batch::STAGING_POOL_MAX_BYTES`, or `ACK_STAGING_POOL_MAX_BYTES`: a
+    /// return that would cross it destroys the pair instead.
+    staging_pool_max_bytes: Cell<u64>,
+    staging_hits: Cell<u64>,
+    staging_misses: Cell<u64>,
+    staging_returns: Cell<u64>,
+    staging_declined: Cell<u64>,
+    staging_evicted: Cell<u64>,
     /// Monotonic for the life of the context: the sequence number of the next
     /// recorded item, so a flush failure can name the items it covered.
     next_item_seq: Cell<u64>,
@@ -346,7 +589,8 @@ pub struct Context {
     /// at open, so every kernel of one context has the same arena size.
     sets_per_kernel_pool: u32,
     /// Freed buffers' Vulkan pairs, held for re-use instead of destroyed,
-    /// keyed by the size `raw_buffer` was called with (`bytes.next_multiple_of(4)`).
+    /// keyed by the size `raw_buffer` was called with: `Buffer::allocated`,
+    /// the request's size class (`pool_class`) while the pool is on.
     ///
     /// WHAT PUTS A PAIR IN HERE IS THE WHOLE SAFETY ARGUMENT. Only three
     /// places do, and every one of them is a point at which no command that
@@ -361,7 +605,10 @@ pub struct Context {
     /// destroy used to happen. Handing a pair back any earlier is a wrong
     /// answer and not a leak, and `PoolMode::Immediate` is the sabotage that
     /// shows it.
-    pool: RefCell<HashMap<u64, Vec<PooledBuffer>>>,
+    ///
+    /// ORDERED by allocated size (2026-10-01), so a request whose own class is
+    /// empty can take the smallest larger pair (`pool_pick`).
+    pool: RefCell<BTreeMap<u64, Vec<PooledBuffer>>>,
     /// Bytes the pool holds, against `pool_max_bytes`.
     pool_bytes: Cell<u64>,
     /// Ceiling on `pool_bytes`. A return that would cross it destroys the pair
@@ -375,6 +622,16 @@ pub struct Context {
     /// while other tests run in the same process, which an environment
     /// variable cannot give them.
     pool_enabled: Cell<bool>,
+    /// Whether `VK_EXT_memory_budget` is enabled, so a pool miss can read how much device-local memory the OS still
+    /// grants this process before it allocates (`device_local_room`).
+    memory_budget: bool,
+    /// Whether a request whose own size class is empty may take the smallest
+    /// pooled pair of a LARGER class, at most `POOL_REUSE_RATIO` times its
+    /// own (`ACK_BUFFER_POOL_LARGER`, on by default, or
+    /// `set_buffer_pool_reuse_larger`).
+    pool_reuse_larger: Cell<bool>,
+    /// Hits served by such a larger pair; they are counted in `pool_hits` too.
+    pool_hits_larger: Cell<u64>,
     /// A `Context::buffer` served from the pool.
     pool_hits: Cell<u64>,
     /// A `Context::buffer` that had to call `raw_buffer`.
@@ -440,6 +697,13 @@ pub struct Context {
     /// exceeded the query capacity. Reported explicitly so a partial figure
     /// cannot read as a complete one.
     ts_unresolved: Cell<u64>,
+    /// The dispatch tag a caller set (`set_dispatch_tag`), 0 when none: the
+    /// key the completion interval of each item recorded from then on is
+    /// charged to. Read once per item, and only with the timestamps on.
+    disp_tag: Cell<u32>,
+    /// The timed items' completion intervals, summed per dispatch tag
+    /// (2026-10-03). `dispatch_tag_times` says what they are and are not.
+    tag_times: RefCell<BTreeMap<u32, DispatchTagTime>>,
     #[cfg(feature = "pool-sabotage")]
     pool_mode: Cell<PoolMode>,
     #[cfg(feature = "batch-sabotage")]
@@ -475,6 +739,112 @@ struct PooledBuffer {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     allocated: u64,
+}
+
+/// Which transfer a staging pair serves. An upload's pair is `TRANSFER_SRC` in
+/// write-combined `HOST_VISIBLE | HOST_COHERENT` memory and a readback's is
+/// `TRANSFER_DST` in the cached type `readback_memory_preferences` picks, so a
+/// pooled pair never serves the other kind.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum TransferKind {
+    Upload,
+    Readback,
+}
+
+/// A host-visible staging pair, MAPPED from its creation to its destruction.
+///
+/// Measured on an NVIDIA L4 (driver 580.173.02) under the torch adapter, one
+/// A0 training update allocated and freed 612 of these, one per transfer:
+/// `vkFreeMemory` alone took 526 ms of host time (0.86 ms a call, each one an
+/// unmap and a driver round trip) and `vkAllocateMemory` most of 206 ms more.
+/// With the staging pool on, a pair whose transfer COMPLETED is kept for the
+/// next transfer of its kind and size class (see `staging_class`).
+///
+/// `capacity` is the pair's size: at least the bytes of any transfer it
+/// serves, and only the first `bytes` of it are ever copied or read. `ptr` is
+/// the address of the persistent mapping of the whole allocation.
+struct StagingPair {
+    kind: TransferKind,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    capacity: u64,
+    ptr: usize,
+    /// `HOST_COHERENT`: a readback through a mapping that is not coherent
+    /// invalidates it before the read
+    coherent: bool,
+}
+
+/// The size class a pooled staging pair is made in: the next power of two, at
+/// least a page. A pair is pooled only under its own class, so a transfer is
+/// always served by a pair at least its size, and at most twice it.
+fn staging_class(bytes: u64) -> u64 {
+    bytes.next_power_of_two().max(4096)
+}
+
+/// The most staging one readback uses: a larger download runs in chunks of
+/// this size through one pair (`Context::download_into`). It is the pool's
+/// largest pair, so with the pool on that pair is pooled like any other.
+pub const READBACK_CHUNK_BYTES: u64 = batch::STAGING_POOL_MAX_PAIR_BYTES;
+
+/// Device-buffer requests up to this size keep an exact (word-rounded) pool
+/// key: a class would round a few kilobytes and buy no reuse worth its memory.
+pub const POOL_CLASS_FLOOR: u64 = 64 * 1024;
+
+/// Size classes per power of two above `POOL_CLASS_FLOOR`: a class is at most
+/// 1/8 = 12.5% larger than any request it serves.
+pub const POOL_CLASSES_PER_OCTAVE: u64 = 8;
+
+/// The buffer pool's key, and the size a pooled pair is allocated at, for a
+/// word-rounded request of `allocated` bytes: exact up to `POOL_CLASS_FLOOR`,
+/// and above it rounded up to one of `POOL_CLASSES_PER_OCTAVE` steps of its
+/// power of two -- in (2^e, 2^(e+1)] the step is 2^(e-3). Never smaller than
+/// the request, a multiple of 4, monotonic, and clamped to `limit`
+/// (`maxStorageBufferRange`): a request the device can hold is never refused
+/// because its class is larger.
+pub fn pool_class(allocated: u64, limit: u64) -> u64 {
+    if allocated <= POOL_CLASS_FLOOR {
+        return allocated;
+    }
+    // (2^e, 2^(e+1)] holds `allocated`, and that octave's width 2^e is cut
+    // into POOL_CLASSES_PER_OCTAVE (a power of two) steps
+    let e = 63 - u64::from((allocated - 1).leading_zeros());
+    let step = 1u64 << (e - u64::from(POOL_CLASSES_PER_OCTAVE.trailing_zeros()));
+    let class = allocated.div_ceil(step).saturating_mul(step);
+    if class > limit {
+        allocated
+    } else {
+        class
+    }
+}
+
+/// How much larger than a request's own class a pooled pair may be and still
+/// serve it, when that class is empty (`ACK_BUFFER_POOL_LARGER`, 2026-10-01).
+/// MEASURED on 2026-09-30 (the stage-E step, RX 9070 XT): a pool miss costs
+/// about 0.77 ms, while the pool held about 3,700 idle pairs and missed about
+/// 220 times a step. A larger pair costs only the memory it holds for one
+/// tenant's life.
+pub const POOL_REUSE_RATIO: u64 = 2;
+
+/// Device-local bytes a pool miss keeps free under the OS budget (`Context::device_local_room`): retired buffers
+/// awaiting a flush and the driver's own allocations land there too.
+pub const POOL_BUDGET_MARGIN: u64 = 256 << 20;
+
+/// The pool key a request of `allocated` bytes (already its class) takes: its
+/// own class if the pool holds a pair of it, else -- when `larger` -- the
+/// smallest held class above it and at most `POOL_REUSE_RATIO` times it. At
+/// or below `POOL_CLASS_FLOOR` the key stays exact. The map never holds an
+/// empty list: every take and eviction removes the key it empties.
+fn pool_pick<V>(pool: &BTreeMap<u64, V>, allocated: u64, larger: bool) -> Option<u64> {
+    if pool.contains_key(&allocated) {
+        return Some(allocated);
+    }
+    if !larger || allocated <= POOL_CLASS_FLOOR {
+        return None;
+    }
+    let limit = allocated.saturating_mul(POOL_REUSE_RATIO);
+    pool.range((Bound::Excluded(allocated), Bound::Included(limit)))
+        .next()
+        .map(|(k, _)| *k)
 }
 
 /// A kernel's four Vulkan objects, destroyed by the caller while recorded work
@@ -522,10 +892,15 @@ struct Recorder {
     /// than accumulated short: a partial span that reads as a whole one is a
     /// wrong number, not a missing one.
     ts_overflow: bool,
+    /// The dispatch tag of every item recorded with the instrument on, in
+    /// recording order: `tags[i]` is the tag of the item whose completion is
+    /// stamp `i + 1` (an item past the query capacity keeps its tag here and
+    /// has no stamp). Empty when the instrument is off.
+    tags: Vec<u32>,
     /// Staging pairs of the uploads recorded into this batch (2026-09-10):
-    /// host-visible memory, destroyed when the batch's fence signals, never
-    /// pooled.
-    retired_staging: Vec<(vk::Buffer, vk::DeviceMemory)>,
+    /// host-visible memory, released when the batch's fence signals -- to the
+    /// staging pool when it is on and the wait succeeded, destroyed otherwise.
+    retired_staging: Vec<StagingPair>,
     /// A recorded upload's copy is the last command: the next item takes a
     /// barrier whether or not it is the batch's first dispatch.
     pending_transfer: bool,
@@ -545,10 +920,36 @@ struct Submitted {
     retired_kernels: Vec<RetiredKernel>,
     stamps: u32,
     ts_overflow: bool,
+    /// `Recorder::tags`, carried to the readback that charges each interval.
+    tags: Vec<u32>,
     timing_started: std::time::Instant,
     /// The descriptor bank its kernels' sets came from; the next batch takes the other.
     bank: usize,
-    retired_staging: Vec<(vk::Buffer, vk::DeviceMemory)>,
+    retired_staging: Vec<StagingPair>,
+}
+
+/// `raw_buffer`'s sharing-mode choice (R1). `Exclusive` is every buffer's
+/// mode before this change, and stays the mode for the private staging
+/// buffers `upload`, `upload_recorded` and `download` allocate for
+/// themselves: the transfer queue never touches them, so there is nothing to
+/// share. `Concurrent` is for a buffer the transfer queue may touch while the
+/// compute queue also reads or writes it -- `Context::buffer`'s device-local
+/// storage buffers (a possible `dst` of `copy_from_staging_async`) and
+/// `Context::staging`'s mapped areas (a possible `src`, and R3's bindable
+/// operand), both only when the device has a transfer queue; with none, they
+/// stay `Exclusive` too, since only one queue ever touches them.
+///
+/// CONCURRENT IS THE MEASURED TRADE THIS FIRST CUT ACCEPTS, NOT A FREE WIN:
+/// the spec for this tranche notes AMD's driver disables some buffer
+/// compression for a concurrently-shared allocation. The alternative --
+/// `EXCLUSIVE` plus an explicit queue-family-ownership-transfer barrier pair
+/// around every copy -- was left for a later cut; whether the compression
+/// this gives up costs more than the overlap the tranche buys back is for the
+/// probe to measure, not this comment to assert.
+#[derive(Clone, Copy)]
+enum BufferSharing<'a> {
+    Exclusive,
+    Concurrent(&'a [u32]),
 }
 
 /// One Vulkan object creation a `Context` method performs; the unit the
@@ -643,10 +1044,14 @@ pub enum Fault {
 }
 
 impl Context {
-    /// Open the first discrete GPU that advertises VK_KHR_cooperative_matrix
-    /// and VK_KHR_shader_bfloat16 (falling back to any device with cooperative
-    /// matrices, then to any compute-capable device), with the features the
-    /// kernels need enabled.
+    /// Open the device `ACK_DEVICE` chooses (`device_choice.rs`), with the
+    /// features the kernels need enabled. By default that is the best-ranked
+    /// GPU: a discrete GPU first, then one with VK_KHR_cooperative_matrix,
+    /// then one with VK_KHR_shader_bfloat16. A CPU implementation of Vulkan
+    /// (llvmpipe, SwiftShader) opens only when the caller asks for it
+    /// (`ACK_DEVICE=cpu` or `any`); a host with no GPU driver is refused by
+    /// name rather than run on a CPU emulating a GPU. `ACK_DEVICE=gpu:<n>`
+    /// takes the n-th GPU instead of the best-ranked one.
     pub fn open() -> Result<Self> {
         let entry = unsafe { ash::Entry::load() }.map_err(|e| AckError::Load(format!("{e}")))?;
         let app_name = c"alelyon-compute-kit";
@@ -683,8 +1088,10 @@ impl Context {
         }
         let coop_ext = ash::khr::cooperative_matrix::Instance::new(entry, &instance);
 
-        // Rank: discrete + coopmat + bf16 first.
-        let mut best: Option<(i32, vk::PhysicalDevice)> = None;
+        // Which device: ACK_DEVICE admits GPUs only unless the caller names a
+        // CPU implementation, and ranks what it admits (device_choice.rs).
+        let choice = device_choice::DeviceChoice::from_env().map_err(AckError::NoDevice)?;
+        let mut candidates = Vec::with_capacity(physicals.len());
         for &pd in &physicals {
             let props = unsafe { instance.get_physical_device_properties(pd) };
             let exts = unsafe { instance.enumerate_device_extension_properties(pd) }?;
@@ -695,29 +1102,22 @@ impl Context {
                         .unwrap_or(false)
                 })
             };
-            let mut score = 0;
-            if props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU {
-                score += 100;
-            }
-            if has("VK_KHR_cooperative_matrix") {
-                score += 10;
-            }
-            if has("VK_KHR_shader_bfloat16") {
-                score += 1;
-            }
             let families = unsafe { instance.get_physical_device_queue_family_properties(pd) };
-            if !families
-                .iter()
-                .any(|f| f.queue_flags.contains(vk::QueueFlags::COMPUTE))
-            {
-                continue;
-            }
-            if best.map(|(s, _)| score > s).unwrap_or(true) {
-                best = Some((score, pd));
-            }
+            candidates.push(device_choice::Candidate {
+                name: props
+                    .device_name_as_c_str()
+                    .map(|c| c.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                device_type: props.device_type,
+                compute: families
+                    .iter()
+                    .any(|f| f.queue_flags.contains(vk::QueueFlags::COMPUTE)),
+                cooperative_matrix: has("VK_KHR_cooperative_matrix"),
+                bfloat16: has("VK_KHR_shader_bfloat16"),
+            });
         }
-        let (_, physical) =
-            best.ok_or_else(|| AckError::NoDevice("no compute-capable device".into()))?;
+        let chosen = device_choice::choose(&candidates, choice).map_err(AckError::NoDevice)?;
+        let physical = physicals[chosen.index];
 
         let props = unsafe { instance.get_physical_device_properties(physical) };
         let exts = unsafe { instance.enumerate_device_extension_properties(physical) }?;
@@ -730,6 +1130,8 @@ impl Context {
         };
         let has_coopmat = has_ext("VK_KHR_cooperative_matrix");
         let has_bf16 = has_ext("VK_KHR_shader_bfloat16");
+        let has_external_memory_host = has_ext("VK_EXT_external_memory_host");
+        let has_memory_budget = has_ext("VK_EXT_memory_budget");
 
         // Query features so the report says what the driver said, not what we asked for.
         let mut bf16_q = ShaderBfloat16FeaturesKHR::default();
@@ -751,11 +1153,40 @@ impl Context {
         let mut subgroup_q = vk::PhysicalDeviceSubgroupProperties::default();
         let mut driver_q = vk::PhysicalDeviceDriverProperties::default();
         let mut id_q = vk::PhysicalDeviceIDProperties::default();
+        // The widths a pipeline may REQUIRE (core 1.3, like `v13_q` below):
+        // `kernel_with_subgroup` refuses any other, because a driver is not
+        // obliged to reject one and a kernel written for 64 lanes runs wrong,
+        // not slow, at 32 (kernels/coopmat_bf16_tiled_v4.comp).
+        let mut size_control_q = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+        // core 1.2: which rounding and denormal modes a module may declare (the
+        // fp16-output products' fp16_rounding_declarable and the report's
+        // f16_rounding_rte / f16_denorm_preserve both read it)
+        let mut float_controls_q = vk::PhysicalDeviceFloatControlsProperties::default();
+        // VK_EXT_external_memory_host's import alignment, read only when the
+        // driver reports the extension (chaining an unknown struct is invalid)
+        let mut external_host_q = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
         let mut p2_q = vk::PhysicalDeviceProperties2::default()
             .push_next(&mut subgroup_q)
             .push_next(&mut driver_q)
-            .push_next(&mut id_q);
+            .push_next(&mut id_q)
+            .push_next(&mut size_control_q)
+            .push_next(&mut float_controls_q);
+        if has_external_memory_host {
+            p2_q = p2_q.push_next(&mut external_host_q);
+        }
         unsafe { instance.get_physical_device_properties2(physical, &mut p2_q) };
+        let fp16_rounding_declarable = float_controls_q.shader_rounding_mode_rte_float16
+            == vk::TRUE
+            && float_controls_q.shader_rounding_mode_rte_float64 == vk::TRUE
+            && float_controls_q.shader_denorm_preserve_float16 == vk::TRUE
+            && float_controls_q.shader_denorm_preserve_float64 == vk::TRUE;
+        let subgroup_size_range = (
+            size_control_q.min_subgroup_size,
+            size_control_q.max_subgroup_size,
+        );
+        let required_subgroup_size_compute = size_control_q
+            .required_subgroup_size_stages
+            .contains(vk::ShaderStageFlags::COMPUTE);
 
         let coopmat_shapes = if has_coopmat {
             let rows =
@@ -787,7 +1218,18 @@ impl Context {
             .max()
             .unwrap_or(0);
 
+        // Queried here, ahead of `report`, so `DeviceReport` records what the
+        // driver said about shaderIntegerDotProduct (core 1.3 /
+        // VK_KHR_shader_integer_dot_product) whether or not anything below
+        // ever requests it. `v13_q` is reused below for subgroupSizeControl.
+        let mut v13_q = vk::PhysicalDeviceVulkan13Features::default();
+        let mut f2_13 = vk::PhysicalDeviceFeatures2::default().push_next(&mut v13_q);
+        unsafe { instance.get_physical_device_features2(physical, &mut f2_13) };
+
         let api = props.api_version;
+        let f16_cooperative_matrix = coopmat_shapes
+            .iter()
+            .any(|s| s.is_16x16x16_subgroup_to_f32("float16"));
         let report = DeviceReport {
             device_name: props
                 .device_name_as_c_str()
@@ -815,6 +1257,16 @@ impl Context {
             bf16_cooperative_matrix: bf16_q.shader_bfloat16_cooperative_matrix == vk::TRUE,
             cooperative_matrix: coop_q.cooperative_matrix == vk::TRUE,
             shader_int16,
+            integer_dot_product: v13_q.shader_integer_dot_product == vk::TRUE,
+            // enabled at device creation exactly when the driver has it (below)
+            shader_float16: v12_q.shader_float16 == vk::TRUE,
+            f16_rounding_rte: float_controls_q.shader_rounding_mode_rte_float16 == vk::TRUE,
+            f16_denorm_preserve: float_controls_q.shader_denorm_preserve_float16 == vk::TRUE,
+            f32_denorm_preserve: float_controls_q.shader_denorm_preserve_float32 == vk::TRUE,
+            f32_signed_zero_inf_nan_preserve: float_controls_q
+                .shader_signed_zero_inf_nan_preserve_float32
+                == vk::TRUE,
+            f16_cooperative_matrix,
             coopmat_shapes,
             device_local_bytes,
             vendor_id: props.vendor_id,
@@ -826,7 +1278,19 @@ impl Context {
             driver_uuid: id_q.driver_uuid,
             max_workgroup_invocations: props.limits.max_compute_work_group_invocations,
             max_workgroup_size: props.limits.max_compute_work_group_size,
+            // filled in below, once the queue families are inspected (R1/R2)
+            transfer_queue: false,
+            transfer_queue_family: None,
+            timeline_semaphores: v12_q.timeline_semaphore == vk::TRUE,
+            external_memory_host: has_external_memory_host,
+            min_imported_host_pointer_alignment: if has_external_memory_host {
+                external_host_q.min_imported_host_pointer_alignment
+            } else {
+                0
+            },
+            selection: chosen.selection,
         };
+        let mut report = report;
 
         // Queue family: prefer a compute-only family (async compute), else any compute.
         let families = unsafe { instance.get_physical_device_queue_family_properties(physical) };
@@ -847,6 +1311,23 @@ impl Context {
         }
         let queue_family =
             queue_family.ok_or_else(|| AckError::NoDevice("no compute queue family".into()))?;
+
+        // R1: a dedicated transfer (DMA) queue, if the device exposes one --
+        // TRANSFER support and NEITHER COMPUTE NOR GRAPHICS. `vulkaninfo` on
+        // the device this was measured against reports exactly one such
+        // family (index 2, `queueCount` 1). A device with no such family, or
+        // with only one family altogether (so the loop below simply finds
+        // nothing distinct from `queue_family`), carries on with the compute
+        // queue alone; `copy_from_staging_async`'s fallback (R2) is what
+        // makes that safe for a caller to not special-case.
+        let transfer_family = families.iter().enumerate().find_map(|(i, f)| {
+            let transfer = f.queue_flags.contains(vk::QueueFlags::TRANSFER);
+            let compute = f.queue_flags.contains(vk::QueueFlags::COMPUTE);
+            let graphics = f.queue_flags.contains(vk::QueueFlags::GRAPHICS);
+            (transfer && !compute && !graphics).then_some(i as u32)
+        });
+        report.transfer_queue = transfer_family.is_some();
+        report.transfer_queue_family = transfer_family;
         let timestamp_valid_bits = families[queue_family as usize].timestamp_valid_bits;
         if timestamp_valid_bits == 0 {
             return Err(AckError::Unsupported(
@@ -887,21 +1368,31 @@ impl Context {
         let mut v12_on = vk::PhysicalDeviceVulkan12Features::default()
             .shader_float16(v12_q.shader_float16 == vk::TRUE)
             .shader_int8(v12_q.shader_int8 == vk::TRUE)
+            // schema-4 pointwise bool storage: the u8 modules declare
+            // StorageBuffer8BitAccess and Int8, so both are enabled when the
+            // driver reports them and `bool_storage` says whether it did
+            .storage_buffer8_bit_access(v12_q.storage_buffer8_bit_access == vk::TRUE)
             .vulkan_memory_model(v12_q.vulkan_memory_model == vk::TRUE)
             .vulkan_memory_model_device_scope(v12_q.vulkan_memory_model_device_scope == vk::TRUE)
-            .host_query_reset(v12_q.host_query_reset == vk::TRUE);
+            .host_query_reset(v12_q.host_query_reset == vk::TRUE)
+            // R2: enabled whenever the driver reports it, whether or not this
+            // device also has a transfer queue -- `copy_from_staging_async`
+            // reads `report.timeline_semaphores` (not the transfer queue
+            // alone) to decide whether it can skip the synchronous fallback.
+            .timeline_semaphore(report.timeline_semaphores);
         let mut v11_on =
             vk::PhysicalDeviceVulkan11Features::default().storage_buffer16_bit_access(true);
         // Subgroup size control (core 1.3): tiled kernels are written for one
         // subgroup width and ask for it explicitly rather than trusting a heuristic.
-        let mut v13_q = vk::PhysicalDeviceVulkan13Features::default();
-        let mut f2_13 = vk::PhysicalDeviceFeatures2::default().push_next(&mut v13_q);
-        unsafe { instance.get_physical_device_features2(physical, &mut f2_13) };
+        // (`v13_q` was queried above, ahead of `report`.)
         let subgroup_size_control =
             v13_q.subgroup_size_control == vk::TRUE && v13_q.compute_full_subgroups == vk::TRUE;
+        let bool_storage =
+            v12_q.storage_buffer8_bit_access == vk::TRUE && v12_q.shader_int8 == vk::TRUE;
         let mut v13_on = vk::PhysicalDeviceVulkan13Features::default()
             .subgroup_size_control(subgroup_size_control)
-            .compute_full_subgroups(subgroup_size_control);
+            .compute_full_subgroups(subgroup_size_control)
+            .shader_integer_dot_product(v13_q.shader_integer_dot_product == vk::TRUE);
         let mut f2_on = vk::PhysicalDeviceFeatures2::default()
             .features(vk::PhysicalDeviceFeatures::default().shader_int16(true));
         if has_coopmat {
@@ -913,9 +1404,20 @@ impl Context {
             .push_next(&mut v11_on);
 
         let priorities = [1.0f32];
-        let qci = [vk::DeviceQueueCreateInfo::default()
+        let mut qci = vec![vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
             .queue_priorities(&priorities)];
+        // R1: a second queue, from the dedicated transfer family, requested
+        // alongside the compute one so the two can run concurrently. Distinct
+        // from `queue_family` by construction (the family search above
+        // excludes COMPUTE), so this can never duplicate the first entry.
+        if let Some(tf) = transfer_family {
+            qci.push(
+                vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(tf)
+                    .queue_priorities(&priorities),
+            );
+        }
         let mut ext_names: Vec<*const i8> = Vec::new();
         let coop_name = c"VK_KHR_cooperative_matrix";
         let bf16_name = c"VK_KHR_shader_bfloat16";
@@ -924,6 +1426,18 @@ impl Context {
         }
         if has_bf16 {
             ext_names.push(bf16_name.as_ptr());
+        }
+        // the streaming pipeline's zero-copy pinned ring (see
+        // `DeviceReport::external_memory_host`); enabling it changes nothing
+        // for a context that never imports host memory
+        let external_host_name = c"VK_EXT_external_memory_host";
+        if has_external_memory_host {
+            ext_names.push(external_host_name.as_ptr());
+        }
+        // the buffer pool's budget check (`device_local_room`)
+        let memory_budget_name = c"VK_EXT_memory_budget";
+        if has_memory_budget {
+            ext_names.push(memory_budget_name.as_ptr());
         }
         let device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
@@ -943,6 +1457,58 @@ impl Context {
             }
         };
 
+        // R1: the transfer queue's own command pool, bound to its family
+        // (a command pool is created for exactly one family; the compute
+        // pool above cannot record work for this queue). Created here,
+        // alongside `command_pool`, so it is one of "open's own objects" and
+        // outside `live_objects()`'s count -- exactly like `command_pool`
+        // itself (see `live_objects`'s doc comment).
+        let transfer_queue = transfer_family.map(|tf| unsafe { device.get_device_queue(tf, 0) });
+        let transfer_command_pool = match transfer_family {
+            Some(tf) => {
+                let tp_info = vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(tf)
+                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+                match unsafe { device.create_command_pool(&tp_info, None) } {
+                    Ok(pool) => Some(pool),
+                    Err(e) => {
+                        unsafe {
+                            device.destroy_command_pool(command_pool, None);
+                            device.destroy_device(None);
+                        }
+                        return Err(e.into());
+                    }
+                }
+            }
+            None => None,
+        };
+
+        // R2: one owned timeline semaphore, its counter starting at 0 (no
+        // copy has ever signalled it). `SemaphoreTypeCreateInfo` chains into
+        // the ordinary `SemaphoreCreateInfo` the same way every other
+        // extension struct in this file chains into its root.
+        let timeline = if report.timeline_semaphores {
+            let mut type_info = vk::SemaphoreTypeCreateInfo::default()
+                .semaphore_type(vk::SemaphoreType::TIMELINE)
+                .initial_value(0);
+            let sem_info = vk::SemaphoreCreateInfo::default().push_next(&mut type_info);
+            match unsafe { device.create_semaphore(&sem_info, None) } {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    unsafe {
+                        if let Some(tp) = transfer_command_pool {
+                            device.destroy_command_pool(tp, None);
+                        }
+                        device.destroy_command_pool(command_pool, None);
+                        device.destroy_device(None);
+                    }
+                    return Err(e.into());
+                }
+            }
+        } else {
+            None
+        };
+
         let device_local_bytes = report.device_local_bytes;
         Ok(Self {
             _entry: std::mem::ManuallyDrop::new(entry.clone()),
@@ -952,9 +1518,21 @@ impl Context {
             queue,
             queue_family,
             command_pool,
+            transfer_queue,
+            transfer_queue_family: transfer_family,
+            transfer_command_pool,
+            timeline,
+            timeline_value: Cell::new(0),
+            pending_transfer_wait: Cell::new(None),
+            pending_transfer_cbs: RefCell::new(Vec::new()),
+            pending_signals: RefCell::new(Vec::new()),
             memory,
             report,
             subgroup_size_control,
+            bool_storage,
+            subgroup_size_range,
+            required_subgroup_size_compute,
+            fp16_rounding_declarable,
             timestamp_valid_bits,
             max_storage_buffer_bytes: props.limits.max_storage_buffer_range as u64,
             max_workgroup_count: props.limits.max_compute_work_group_count,
@@ -971,12 +1549,27 @@ impl Context {
             recorder: RefCell::new(None),
             flushes: std::array::from_fn(|_| Cell::new(0)),
             batch_gen: Cell::new(1),
+            descriptor_reuse: Cell::new(batch::env_flag("ACK_DESCRIPTOR_REUSE", true)),
             bank: Cell::new(0),
             in_flight: RefCell::new(None),
             async_flush: Cell::new(batch::env_flag("ACK_ASYNC_FLUSH", true)),
             ramp: Cell::new(0),
             batch_ramp: Cell::new(batch::env_flag("ACK_BATCH_RAMP", true)),
             deferred_upload: Cell::new(batch::env_flag("ACK_DEFERRED_UPLOAD", false)),
+            fence_pool: RefCell::new(Vec::new()),
+            fence_pool_enabled: Cell::new(batch::env_flag("ACK_FENCE_POOL", false)),
+            staging_pool: RefCell::new(HashMap::new()),
+            staging_pool_enabled: Cell::new(batch::env_flag("ACK_STAGING_POOL", false)),
+            staging_pool_bytes: Cell::new(0),
+            staging_pool_max_bytes: Cell::new(batch::env_u64(
+                "ACK_STAGING_POOL_MAX_BYTES",
+                batch::STAGING_POOL_MAX_BYTES,
+            )),
+            staging_hits: Cell::new(0),
+            staging_misses: Cell::new(0),
+            staging_returns: Cell::new(0),
+            staging_declined: Cell::new(0),
+            staging_evicted: Cell::new(0),
             next_item_seq: Cell::new(0),
             max_recorded_items: Cell::new(batch::env_u32(
                 "ACK_MAX_RECORDED_ITEMS",
@@ -990,7 +1583,7 @@ impl Context {
                 "ACK_SETS_PER_KERNEL_POOL",
                 batch::SETS_PER_KERNEL_POOL,
             ),
-            pool: RefCell::new(HashMap::new()),
+            pool: RefCell::new(BTreeMap::new()),
             pool_bytes: Cell::new(0),
             // HALF the device-local heap, and the half is MEASURED rather
             // than chosen. A quarter (3.98 GiB on this card) was the first
@@ -1006,11 +1599,25 @@ impl Context {
             // that retry this constant would be a safety margin and would have
             // to stay low. UNMEASURED at any other geometry or on any other
             // card; `ACK_BUFFER_POOL_BYTES` overrides it.
+            //
+            // WITH `VK_EXT_memory_budget` THE CEILING IS THE WHOLE HEAP (2026-10-21): a pool miss then gives memory
+            // back before the OS budget is crossed (`device_local_room`), so the ceiling no longer has to leave room
+            // for live tensors. Measured on the RX 9070 XT, a 26M-parameter training step at microbatch 32 (live
+            // peak 12.3 GB): half the heap declined ~200 returns a step and ran 30-37k tokens/s with 13 s spikes; the
+            // whole heap ran a steady 52.5k, and microbatch 16 was unchanged (89-90k).
             pool_max_bytes: Cell::new(batch::env_u64(
                 "ACK_BUFFER_POOL_BYTES",
-                (device_local_bytes / 2).max(64 << 20),
+                if has_memory_budget && batch::env_flag("ACK_POOL_BUDGET", true) {
+                    device_local_bytes
+                } else {
+                    device_local_bytes / 2
+                }
+                .max(64 << 20),
             )),
             pool_enabled: Cell::new(batch::env_flag("ACK_BUFFER_POOL", true)),
+            memory_budget: has_memory_budget && batch::env_flag("ACK_POOL_BUDGET", true),
+            pool_reuse_larger: Cell::new(batch::env_flag("ACK_BUFFER_POOL_LARGER", true)),
+            pool_hits_larger: Cell::new(0),
             pool_hits: Cell::new(0),
             pool_misses: Cell::new(0),
             pool_returns: Cell::new(0),
@@ -1029,6 +1636,8 @@ impl Context {
             ts_min_item_ns: Cell::new(u64::MAX),
             ts_max_item_ns: Cell::new(0),
             ts_unresolved: Cell::new(0),
+            disp_tag: Cell::new(0),
+            tag_times: RefCell::new(BTreeMap::new()),
             #[cfg(feature = "pool-sabotage")]
             pool_mode: Cell::new(PoolMode::Retired),
             #[cfg(feature = "batch-sabotage")]
@@ -1110,6 +1719,13 @@ impl Context {
         self.pool_enabled.get()
     }
 
+    /// Let a request whose own size class is empty take the smallest pooled
+    /// pair of a larger class, at most `POOL_REUSE_RATIO` times its own
+    /// (`pool_pick`), or keep every request to its own class.
+    pub fn set_buffer_pool_reuse_larger(&self, on: bool) {
+        self.pool_reuse_larger.set(on);
+    }
+
     /// Ceiling on the bytes the pool holds; a return that would cross it
     /// destroys the pair instead (`pool_declined`).
     pub fn set_buffer_pool_max_bytes(&self, bytes: u64) {
@@ -1130,21 +1746,40 @@ impl Context {
     pub fn pool_stats(&self) -> PoolStats {
         PoolStats {
             hits: self.pool_hits.get(),
+            hits_larger: self.pool_hits_larger.get(),
             misses: self.pool_misses.get(),
             returns: self.pool_returns.get(),
             declined: self.pool_declined.get(),
             drained: self.pool_drained.get(),
             reclaims: self.pool_reclaims.get(),
-            held_objects: self.pooled_objects(),
+            held_objects: self.pooled_buffer_objects(),
             held_bytes: self.pool_bytes.get(),
         }
     }
 
-    /// Vulkan objects the pool holds (two per pair). They are LIVE objects and
-    /// `live_objects()` counts them, because they are: the pool is holding
-    /// them, not leaking them. A leak assertion that wants the un-pooled
-    /// quantity subtracts this, or runs on a context with the pool off.
+    /// Vulkan objects the pools hold: two per buffer pair, one per pooled
+    /// fence, two per pooled staging pair. They are LIVE objects and `live_objects()` counts them, because
+    /// they are: the pools are holding them, not leaking them. A leak assertion
+    /// that wants the un-pooled quantity subtracts this, or runs on a context
+    /// with the pools off.
     pub fn pooled_objects(&self) -> i64 {
+        self.pooled_buffer_objects() + self.pooled_fences() + 2 * self.pooled_staging()
+    }
+
+    /// Objects the dispatch timestamp instrument holds for the context's
+    /// lifetime: its query pool, created the first time the instrument is on
+    /// and destroyed with the context. Live, not pooled, and not a leak. At
+    /// quiescence the leak law of a context that used the instrument is
+    /// `live_objects() == pooled_objects() + instrument_objects()` (window
+    /// 18f0d9da's probes reported this one object as a leak).
+    pub fn instrument_objects(&self) -> i64 {
+        i64::from(self.ts_pool.get() != vk::QueryPool::null())
+    }
+
+    /// The buffer pool's share of `pooled_objects()`: the objects that hold
+    /// device memory, which is what the allocation retry and `pool_stats()`
+    /// are about.
+    fn pooled_buffer_objects(&self) -> i64 {
         self.pool
             .borrow()
             .values()
@@ -1152,16 +1787,24 @@ impl Context {
             .sum()
     }
 
-    /// Take a pair of the requested allocated size, if the pool holds one.
+    /// Take a pair for a request of `allocated` bytes (already its class):
+    /// one of its own class, or -- when larger-class reuse is on and its own
+    /// class is empty -- the smallest larger pair within `POOL_REUSE_RATIO`
+    /// (`pool_pick`). The pair keeps its own `allocated`, so it goes back to
+    /// its own class when it is freed.
     fn take_pooled(&self, allocated: u64) -> Option<PooledBuffer> {
         if !self.pool_enabled.get() {
             return None;
         }
         let mut pool = self.pool.borrow_mut();
-        let entry = pool.get_mut(&allocated)?;
+        let key = pool_pick(&pool, allocated, self.pool_reuse_larger.get())?;
+        let entry = pool.get_mut(&key)?;
         let p = entry.pop()?;
         if entry.is_empty() {
-            pool.remove(&allocated);
+            pool.remove(&key);
+        }
+        if key != allocated {
+            self.pool_hits_larger.set(self.pool_hits_larger.get() + 1);
         }
         self.pool_bytes.set(self.pool_bytes.get() - p.allocated);
         Some(p)
@@ -1199,11 +1842,9 @@ impl Context {
     /// Destroy every pair the pool holds. Called by teardown, by
     /// `set_buffer_pool_enabled(false)` and when the ceiling is lowered.
     fn clear_pool(&self) {
-        let held: Vec<PooledBuffer> = self
-            .pool
-            .borrow_mut()
-            .drain()
-            .flat_map(|(_, v)| v)
+        let held: Vec<PooledBuffer> = std::mem::take(&mut *self.pool.borrow_mut())
+            .into_values()
+            .flatten()
             .collect();
         for p in held {
             self.vk_destroy_buffer(p.buffer);
@@ -1211,6 +1852,62 @@ impl Context {
             self.pool_drained.set(self.pool_drained.get() + 1);
         }
         self.pool_bytes.set(0);
+    }
+
+    /// Destroy held pairs, the largest first, until at least `want` bytes are
+    /// freed or the pool is empty; returns the bytes freed. The allocation
+    /// retry's reclaim (`Context::buffer`): the largest pairs free the most
+    /// memory per destroy, and the small ones the next requests will take stay.
+    fn evict_largest(&self, want: u64) -> u64 {
+        let mut freed = 0u64;
+        while freed < want {
+            let taken = {
+                let mut pool = self.pool.borrow_mut();
+                let key = match pool.keys().next_back() {
+                    Some(k) => *k,
+                    None => break,
+                };
+                let entry = pool.get_mut(&key).expect("key just read");
+                let p = entry.pop();
+                if entry.is_empty() {
+                    pool.remove(&key);
+                }
+                p
+            };
+            let Some(p) = taken else { break };
+            self.pool_bytes
+                .set(self.pool_bytes.get().saturating_sub(p.allocated));
+            self.vk_destroy_buffer(p.buffer);
+            self.vk_free_memory(p.memory);
+            self.pool_drained.set(self.pool_drained.get() + 1);
+            freed += p.allocated;
+        }
+        freed
+    }
+
+    /// Device-local bytes the OS still grants this process on the largest DEVICE_LOCAL heap (`heapBudget -
+    /// heapUsage`, `VK_EXT_memory_budget`), or `None` without the extension (or with `ACK_POOL_BUDGET=0`).
+    fn device_local_room(&self) -> Option<u64> {
+        if !self.memory_budget {
+            return None;
+        }
+        let n = self.memory.memory_heap_count as usize;
+        let heap = (0..n)
+            .filter(|&i| {
+                self.memory.memory_heaps[i]
+                    .flags
+                    .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+            })
+            .max_by_key(|&i| self.memory.memory_heaps[i].size)?;
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        {
+            let mut props = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+            unsafe {
+                self.instance
+                    .get_physical_device_memory_properties2(self.physical, &mut props)
+            };
+        }
+        Some(budget.heap_budget[heap].saturating_sub(budget.heap_usage[heap]))
     }
 
     /// Destroy pairs until the pool is inside its ceiling.
@@ -1285,12 +1982,371 @@ impl Context {
         }
     }
 
+    /// Take the wait `await_transfer` armed, if any, pairing it with the
+    /// timeline semaphore itself (R2). `None` on a context with no timeline
+    /// semaphore, even if a value were somehow armed (`await_transfer`
+    /// refuses to arm one on such a context, so this is belt and braces, not
+    /// a path that fires). Consumes the armed value: only the caller's own
+    /// submission carries it.
+    fn take_pending_transfer_wait(&self) -> Option<(vk::Semaphore, u64)> {
+        let value = self.pending_transfer_wait.take()?;
+        self.timeline.map(|s| (s, value))
+    }
+
+    /// Make the next compute submission signal `semaphore` (a timeline) to
+    /// `value` when it completes. Crate-internal: COMPUTE_DONE.
+    pub(crate) fn arm_submission_signal(&self, semaphore: vk::Semaphore, value: u64) {
+        self.pending_signals.borrow_mut().push((semaphore, value));
+    }
+
+    /// Whether a signal is armed and not yet carried by a submission.
+    pub(crate) fn has_armed_signals(&self) -> bool {
+        !self.pending_signals.borrow().is_empty()
+    }
+
+    /// Drop every armed, not yet submitted signal of `semaphore`: its owner
+    /// is about to destroy it, and no later submission may name it.
+    pub(crate) fn disarm_signals(&self, semaphore: vk::Semaphore) {
+        self.pending_signals
+            .borrow_mut()
+            .retain(|&(s, _)| s != semaphore);
+    }
+
+    /// Everything the next compute submission waits on and signals: the
+    /// transfer-timeline wait `await_transfer` armed, and the signals
+    /// `arm_submission_signal` armed. Consumes both. With nothing armed, both
+    /// lists are empty and the submit info the callers build is the one they
+    /// built before this hook.
+    fn take_submission_sync(&self) -> (TimelineValues, TimelineValues) {
+        let waits: TimelineValues = self.take_pending_transfer_wait().into_iter().collect();
+        let signals = std::mem::take(&mut *self.pending_signals.borrow_mut());
+        (waits, signals)
+    }
+
+    /// A submission that carried `signals` failed before the queue accepted
+    /// it, so the device will never signal them. Signal them from the host,
+    /// best effort, so a queue waiting on one is released rather than hung.
+    /// That matters at `Drop`, whose `device_wait_idle` would otherwise wait
+    /// forever. A failure here (a lost device) is ignored: a lost device's
+    /// queues do not wait.
+    fn release_signals(&self, signals: &[(vk::Semaphore, u64)]) {
+        for &(semaphore, value) in signals {
+            let current =
+                unsafe { self.device.get_semaphore_counter_value(semaphore) }.unwrap_or(u64::MAX);
+            if current < value {
+                let info = vk::SemaphoreSignalInfo::default()
+                    .semaphore(semaphore)
+                    .value(value);
+                let _ = unsafe { self.device.signal_semaphore(&info) };
+            }
+        }
+    }
+
     /// Release a submission's fence and command buffer and count the release
     /// in the same place, so the count cannot say "released" when nothing was.
     fn release_submission(&self, fence: vk::Fence, free_cb: impl FnOnce()) {
         self.vk_destroy_fence(fence);
         free_cb();
         self.torn_down.set(self.torn_down.get() + 1);
+    }
+
+    /// Release a submission whose fence WAIT SUCCEEDED: the fence has
+    /// signalled, so nothing can still be using it, and with the fence pool on
+    /// it is reset and kept rather than destroyed. Every other release (a
+    /// failed wait, a lost device, a submission that never reached the queue)
+    /// takes `release_submission`, because only a completed wait establishes
+    /// that the fence is free to reset. A reset that fails, or a full pool,
+    /// destroys the fence as before.
+    fn release_completed_submission(&self, fence: vk::Fence, free_cb: impl FnOnce()) {
+        let pooled = self.fence_pool_enabled.get()
+            && self.fence_pool.borrow().len() < batch::FENCE_POOL_MAX
+            && unsafe { self.device.reset_fences(&[fence]) }.is_ok();
+        if !pooled {
+            self.release_submission(fence, free_cb);
+            return;
+        }
+        self.fence_pool.borrow_mut().push(fence);
+        free_cb();
+        self.torn_down.set(self.torn_down.get() + 1);
+    }
+
+    /// Whether completed submissions' fences are pooled (see `fence_pool`).
+    pub fn fence_pool_enabled(&self) -> bool {
+        self.fence_pool_enabled.get()
+    }
+
+    /// Turn the fence pool on or off, as `ACK_FENCE_POOL` does at open.
+    /// Turning it off destroys the fences it holds.
+    pub fn set_fence_pool_enabled(&self, on: bool) {
+        self.fence_pool_enabled.set(on);
+        if !on {
+            self.drain_fence_pool();
+        }
+    }
+
+    /// Fences the pool holds. They are live objects: `live_objects()` and
+    /// `pooled_objects()` both count them.
+    pub fn pooled_fences(&self) -> i64 {
+        self.fence_pool.borrow().len() as i64
+    }
+
+    fn drain_fence_pool(&self) {
+        let held: Vec<vk::Fence> = self.fence_pool.borrow_mut().drain(..).collect();
+        for fence in held {
+            self.vk_destroy_fence(fence);
+        }
+    }
+
+    /// Whether completed transfers' staging pairs are pooled (see `StagingPair`).
+    pub fn staging_pool_enabled(&self) -> bool {
+        self.staging_pool_enabled.get()
+    }
+
+    /// Turn the staging pool on or off, as `ACK_STAGING_POOL` does at open.
+    /// Turning it off destroys the pairs it holds.
+    pub fn set_staging_pool_enabled(&self, on: bool) {
+        self.staging_pool_enabled.set(on);
+        if !on {
+            self.drain_staging_pool();
+        }
+    }
+
+    /// Ceiling on the bytes the staging pool holds; the pairs above it are
+    /// destroyed at once.
+    pub fn set_staging_pool_max_bytes(&self, bytes: u64) {
+        self.staging_pool_max_bytes.set(bytes);
+        if self.staging_pool_bytes.get() > bytes {
+            self.drain_staging_pool();
+        }
+    }
+
+    /// Staging pairs the pool holds. Each is two live objects: `live_objects()`
+    /// counts them and `pooled_objects()` names them.
+    pub fn pooled_staging(&self) -> i64 {
+        self.staging_pool
+            .borrow()
+            .values()
+            .map(|v| v.len() as i64)
+            .sum()
+    }
+
+    /// Transfers served from the staging pool, transfers that had to create
+    /// their pair, pairs the pool took back, pairs it declined (its ceiling,
+    /// or a full class), and what it holds.
+    ///
+    /// ASSERT THESE ALONGSIDE THE BYTES, as for the buffer pool: a transfer
+    /// through a reused pair and one through a fresh pair return the same bytes.
+    pub fn staging_pool_stats(&self) -> StagingPoolStats {
+        StagingPoolStats {
+            hits: self.staging_hits.get(),
+            misses: self.staging_misses.get(),
+            returns: self.staging_returns.get(),
+            declined: self.staging_declined.get(),
+            evicted: self.staging_evicted.get(),
+            held_pairs: self.pooled_staging(),
+            held_bytes: self.staging_pool_bytes.get(),
+        }
+    }
+
+    fn drain_staging_pool(&self) {
+        let held: Vec<StagingPair> = self
+            .staging_pool
+            .borrow_mut()
+            .drain()
+            .flat_map(|(_, v)| v)
+            .collect();
+        self.staging_pool_bytes.set(0);
+        for pair in held {
+            self.destroy_staging_pair(pair);
+        }
+    }
+
+    /// A mapped staging pair of at least `bytes` for `kind`: from the pool when
+    /// it is on and holds one of the class, created otherwise -- in the class
+    /// size with the pool on, so it can be pooled when its transfer completes,
+    /// and in exactly `bytes` with it off, as before the pool existed.
+    fn take_staging(&self, kind: TransferKind, bytes: u64) -> Result<StagingPair> {
+        let pooling = self.staging_pool_enabled.get();
+        if pooling {
+            let class = staging_class(bytes);
+            let hit = self
+                .staging_pool
+                .borrow_mut()
+                .get_mut(&(kind, class))
+                .and_then(|v| v.pop());
+            if let Some(pair) = hit {
+                self.staging_pool_bytes
+                    .set(self.staging_pool_bytes.get() - pair.capacity);
+                self.staging_hits.set(self.staging_hits.get() + 1);
+                return Ok(pair);
+            }
+            self.staging_misses.set(self.staging_misses.get() + 1);
+        }
+        let capacity = if pooling { staging_class(bytes) } else { bytes };
+        match self.create_staging(kind, capacity) {
+            Ok(pair) => Ok(pair),
+            // THE POOL MUST NEVER BE THE REASON A TRANSFER COULD NOT BE STAGED:
+            // it holds host-visible memory nothing owns, so a failure with a
+            // non-empty pool gives that back and tries once more
+            Err(e) if self.pooled_staging() > 0 => {
+                let _ = e;
+                self.drain_staging_pool();
+                self.create_staging(kind, capacity)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Create and map a staging pair of `capacity` bytes for `kind`. Every
+    /// failure destroys what the call made (ACK-L0-05).
+    fn create_staging(&self, kind: TransferKind, capacity: u64) -> Result<StagingPair> {
+        let (buffer, memory, flags) = match kind {
+            // Exclusive, unconditionally: a staging pair is only ever named by
+            // the one transfer that holds it, on the compute queue
+            TransferKind::Upload => {
+                let flags =
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+                let (b, m) = self.raw_buffer(
+                    capacity,
+                    vk::BufferUsageFlags::TRANSFER_SRC,
+                    flags,
+                    BufferSharing::Exclusive,
+                )?;
+                (b, m, flags)
+            }
+            TransferKind::Readback => {
+                // Preference order, best first (see `readback_memory_preferences`)
+                let mut chosen = None;
+                let mut last_err = None;
+                for flags in Self::readback_memory_preferences() {
+                    match self.raw_buffer(
+                        capacity,
+                        vk::BufferUsageFlags::TRANSFER_DST,
+                        flags,
+                        BufferSharing::Exclusive,
+                    ) {
+                        Ok((b, m)) => {
+                            chosen = Some((b, m, flags));
+                            break;
+                        }
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+                match chosen {
+                    Some(t) => t,
+                    None => {
+                        return Err(last_err.unwrap_or_else(|| {
+                            AckError::Unsupported("no host-visible memory type for readback".into())
+                        }))
+                    }
+                }
+            }
+        };
+        let ptr = match unsafe {
+            self.device
+                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+        } {
+            Ok(p) => p as usize,
+            Err(e) => {
+                self.vk_destroy_buffer(buffer);
+                self.vk_free_memory(memory);
+                return Err(e.into());
+            }
+        };
+        Ok(StagingPair {
+            kind,
+            buffer,
+            memory,
+            capacity,
+            ptr,
+            coherent: flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT),
+        })
+    }
+
+    fn destroy_staging_pair(&self, pair: StagingPair) {
+        unsafe { self.device.unmap_memory(pair.memory) };
+        self.vk_destroy_buffer(pair.buffer);
+        self.vk_free_memory(pair.memory);
+    }
+
+    /// Hand back a staging pair NO SUBMISSION CAN STILL NAME: its transfer's
+    /// fence wait succeeded, or the command that named it was never submitted.
+    /// Pooled when the pool is on, the context is healthy, the pair is in its
+    /// own size class (a pair made with the pool off is exactly its transfer's
+    /// size and is not), it is at most `batch::STAGING_POOL_MAX_PAIR_BYTES`,
+    /// and its class holds fewer than `batch::STAGING_POOL_MAX_PER_CLASS`;
+    /// destroyed otherwise. Every other release -- a failed wait, a lost
+    /// device, a poisoned context -- goes through `release_staging` as before.
+    ///
+    /// A RETURN THAT WOULD CROSS THE BYTE CEILING EVICTS LARGER PAIRS FIRST.
+    /// Measured on an NVIDIA L4 through the torch adapter (2026-09-22): the
+    /// model's parameter upload at the start of a run returned megabyte-class
+    /// pairs until the ceiling was full, no training transfer ever took one of
+    /// those classes again, and every later return -- the 32 KiB index
+    /// readbacks, the few-KiB canonical images -- was DECLINED: 1,418 pairs
+    /// created and destroyed in a two-update run with the pool on, exactly as
+    /// with it off. A pool that holds what nothing asks for must give way to
+    /// what is asked for; a return larger than everything the pool holds is
+    /// still declined, so the small working set is never evicted for it.
+    fn recycle_staging(&self, pair: StagingPair) {
+        let class_len = |p: &StagingPair| {
+            self.staging_pool
+                .borrow()
+                .get(&(p.kind, p.capacity))
+                .map_or(0, |v| v.len())
+        };
+        let poolable = self.staging_pool_enabled.get()
+            && !self.is_poisoned()
+            && pair.capacity == staging_class(pair.capacity)
+            && pair.capacity <= batch::STAGING_POOL_MAX_PAIR_BYTES
+            && pair.capacity <= self.staging_pool_max_bytes.get()
+            && class_len(&pair) < batch::STAGING_POOL_MAX_PER_CLASS;
+        if poolable {
+            while self.staging_pool_bytes.get() + pair.capacity > self.staging_pool_max_bytes.get()
+                && self.evict_one_larger_staging(pair.capacity)
+            {}
+        }
+        let pooled = poolable
+            && self.staging_pool_bytes.get() + pair.capacity <= self.staging_pool_max_bytes.get();
+        if !pooled {
+            if self.staging_pool_enabled.get() {
+                self.staging_declined.set(self.staging_declined.get() + 1);
+            }
+            self.destroy_staging_pair(pair);
+            return;
+        }
+        self.staging_pool_bytes
+            .set(self.staging_pool_bytes.get() + pair.capacity);
+        self.staging_returns.set(self.staging_returns.get() + 1);
+        self.staging_pool
+            .borrow_mut()
+            .entry((pair.kind, pair.capacity))
+            .or_default()
+            .push(pair);
+    }
+
+    /// Destroy one pooled pair of the largest class above `than` bytes, if the
+    /// pool holds one: the eviction `recycle_staging` makes room with.
+    fn evict_one_larger_staging(&self, than: u64) -> bool {
+        let victim = {
+            let mut pool = self.staging_pool.borrow_mut();
+            let key = pool
+                .iter()
+                .filter(|(k, v)| k.1 > than && !v.is_empty())
+                .map(|(k, _)| *k)
+                .max_by_key(|k| k.1);
+            key.and_then(|k| pool.get_mut(&k).and_then(|v| v.pop()))
+        };
+        match victim {
+            Some(p) => {
+                self.staging_pool_bytes
+                    .set(self.staging_pool_bytes.get() - p.capacity);
+                self.staging_evicted.set(self.staging_evicted.get() + 1);
+                self.destroy_staging_pair(p);
+                true
+            }
+            None => false,
+        }
     }
 
     // ---- deferred submission (see `batch`) ------------------------------
@@ -1322,6 +2378,14 @@ impl Context {
 
     pub fn flushes_by_reason(&self) -> [u64; batch::FLUSH_REASON_COUNT] {
         std::array::from_fn(|i| self.flushes[i].get())
+    }
+
+    /// Whether a `BatchFull` or `DescriptorsExhausted` flush submits without
+    /// waiting: `ACK_ASYNC_FLUSH` at open (on by default) with the timestamps
+    /// instrument off. Every other flush waits for its batch either way; this is
+    /// `completes`'s rule, stated for a caller outside the crate.
+    pub fn flush_is_asynchronous(&self) -> bool {
+        self.async_flush.get() && !self.ts_enabled.get()
     }
 
     /// Every flush of this context, whatever the reason.
@@ -1507,6 +2571,7 @@ impl Context {
             retired_kernels: Vec::new(),
             stamps,
             ts_overflow: false,
+            tags: Vec::new(),
             retired_staging: Vec::new(),
             pending_transfer: false,
         });
@@ -1562,18 +2627,18 @@ impl Context {
 
     /// Destroy or leak a finished batch's retired buffers and kernels, through
     /// the one place that decides destroy-or-leak (`release_or_leak`).
-    /// The staging pairs of a finished batch's recorded uploads: destroyed
-    /// (host-visible memory is never pooled), or leaked and counted on a
-    /// poisoned context whose device state is unknown.
-    fn release_staging(&self, staging: Vec<(vk::Buffer, vk::DeviceMemory)>) {
+    /// The staging pairs of a batch whose wait FAILED, or that was lost:
+    /// destroyed, or leaked and counted on a poisoned context whose device
+    /// state is unknown. A batch whose wait succeeded recycles them instead
+    /// (`recycle_staging`).
+    fn release_staging(&self, staging: Vec<StagingPair>) {
         if staging.is_empty() {
             return;
         }
         let objects = staging.len() as u64 * 2;
         self.release_or_leak(objects, || {
-            for (b, m) in staging {
-                self.vk_destroy_buffer(b);
-                self.vk_free_memory(m);
+            for pair in staging {
+                self.destroy_staging_pair(pair);
             }
         });
     }
@@ -1722,6 +2787,10 @@ impl Context {
         if stamps > 1 {
             self.ts_unresolved.set(self.ts_unresolved.get() + 1);
         }
+        // The same rule per dispatch tag: every item this batch tagged is
+        // unresolved until its interval is read, so a lost batch stays visible
+        // in its tags' rows too.
+        self.tags_pending(&rec.tags);
 
         // (a) nothing is submitted yet: every failure frees what the batch
         //     created, as one_shot's pre-submission paths do. A DEVICE_LOST
@@ -1735,9 +2804,34 @@ impl Context {
         if let Err(e) = unsafe { self.device.reset_fences(&[fence]) } {
             return Err(self.lose_batch(rec, e, &what, "reset_fences"));
         }
-        let submit = [vk::SubmitInfo::default().command_buffers(&cbs)];
+        // R2 and the stream hooks: see `one_shot`'s identical block. With
+        // nothing armed (every flush before R2, and any after it with nothing
+        // armed) the submit info is exactly the line above.
+        let (waits, signals) = self.take_submission_sync();
+        let wait_semaphores: Vec<vk::Semaphore> = waits.iter().map(|w| w.0).collect();
+        let wait_values: Vec<u64> = waits.iter().map(|w| w.1).collect();
+        let wait_stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; waits.len()];
+        let signal_semaphores: Vec<vk::Semaphore> = signals.iter().map(|s| s.0).collect();
+        let signal_values: Vec<u64> = signals.iter().map(|s| s.1).collect();
+        let mut timeline_info = vk::TimelineSemaphoreSubmitInfo::default()
+            .wait_semaphore_values(&wait_values)
+            .signal_semaphore_values(&signal_values);
+        let mut submit_info = vk::SubmitInfo::default().command_buffers(&cbs);
+        if !waits.is_empty() {
+            submit_info = submit_info
+                .wait_semaphores(&wait_semaphores)
+                .wait_dst_stage_mask(&wait_stages);
+        }
+        if !signals.is_empty() {
+            submit_info = submit_info.signal_semaphores(&signal_semaphores);
+        }
+        if !waits.is_empty() || !signals.is_empty() {
+            submit_info = submit_info.push_next(&mut timeline_info);
+        }
+        let submit = [submit_info];
         let timing_started = std::time::Instant::now();
         if let Err(e) = unsafe { self.device.queue_submit(self.queue, &submit, fence) } {
+            self.release_signals(&signals);
             return Err(self.lose_batch(rec, e, &what, "queue_submit"));
         }
 
@@ -1749,6 +2843,7 @@ impl Context {
             retired_kernels: rec.retired_kernels,
             stamps,
             ts_overflow,
+            tags: rec.tags,
             timing_started,
             bank: self.bank.get(),
             retired_staging: rec.retired_staging,
@@ -1845,6 +2940,7 @@ impl Context {
             retired_kernels,
             stamps,
             ts_overflow,
+            tags,
             timing_started,
             retired_staging,
             ..
@@ -1889,12 +2985,15 @@ impl Context {
         // the fence has signalled, so every stamp this batch wrote is in the
         // pool; read them before the queries are reset by the next batch
         let host_elapsed_ns = timing_started.elapsed().as_nanos() as f64;
-        if stamps > 1 && !ts_overflow && self.accumulate_timestamps(stamps, host_elapsed_ns) {
+        if stamps > 1 && !ts_overflow && self.accumulate_timestamps(stamps, host_elapsed_ns, &tags)
+        {
             self.ts_unresolved.set(self.ts_unresolved.get() - 1);
         }
         self.release_retired(retired, retired_kernels);
-        self.release_staging(retired_staging);
-        self.release_submission(fence, free_cb);
+        for pair in retired_staging {
+            self.recycle_staging(pair);
+        }
+        self.release_completed_submission(fence, free_cb);
         Ok(())
     }
 
@@ -1917,7 +3016,13 @@ impl Context {
     /// A FAILED READBACK IS COUNTED, NOT SWALLOWED: `ts_unresolved` moves and
     /// nothing is added, so a run whose device time is partly unreadable
     /// cannot report a short span as a complete one.
-    fn accumulate_timestamps(&self, stamps: u32, host_elapsed_ns: f64) -> bool {
+    ///
+    /// PER TAG (2026-10-03): interval `i` is charged to `tags[i]`, the tag its
+    /// item was recorded under, and leaves that tag's unresolved count. The
+    /// per-tag sums therefore partition `device_ns` exactly. Tags of a length
+    /// other than the intervals' (which the recorder never produces) are left
+    /// unresolved rather than charged by position to the wrong items.
+    fn accumulate_timestamps(&self, stamps: u32, host_elapsed_ns: f64, tags: &[u32]) -> bool {
         let qp = self.ts_pool.get();
         let mut ticks = vec![0u64; stamps as usize];
         let read = unsafe {
@@ -1931,7 +3036,7 @@ impl Context {
         if read.is_err() {
             return false;
         }
-        let Ok((sum_ns, min_ns, max_ns)) = summarize_dispatch_timestamps(
+        let Ok(intervals) = dispatch_intervals(
             &ticks,
             self.timestamp_valid_bits,
             f64::from(self.report.timestamp_period_ns),
@@ -1939,6 +3044,10 @@ impl Context {
         ) else {
             return false;
         };
+        let (sum_ns, min_ns, max_ns) = summarize_intervals(&intervals);
+        if tags.len() == intervals.len() {
+            self.tags_resolved(tags, &intervals);
+        }
         self.ts_flushes.set(self.ts_flushes.get() + 1);
         self.ts_items
             .set(self.ts_items.get() + (ticks.len() as u64 - 1));
@@ -1992,6 +3101,60 @@ impl Context {
             unresolved_flushes: self.ts_unresolved.get(),
             timestamps_enabled: self.ts_enabled.get(),
         }
+    }
+
+    /// Charge the completion interval of every item recorded from now on to
+    /// `tag`, until the next call. 0 means untagged, and a context opens with
+    /// it. The caller names its tags (`ack_torch.DeviceTimeByOp` gives each
+    /// aten operation one); the kit keeps only the number.
+    ///
+    /// NOT REFUSED WITH A BATCH OPEN, unlike `set_dispatch_timestamps`: a tag
+    /// is read per item when the item is recorded, so one batch can hold items
+    /// of several tags. With the timestamps off nothing is recorded per tag.
+    pub fn set_dispatch_tag(&self, tag: u32) {
+        self.disp_tag.set(tag);
+    }
+
+    /// The tag `set_dispatch_tag` set last; 0 when none.
+    pub fn dispatch_tag(&self) -> u32 {
+        self.disp_tag.get()
+    }
+
+    /// The timed items' completion intervals, summed per dispatch tag, in tag
+    /// order. Empty until a batch recorded with the timestamps on is flushed.
+    ///
+    /// THE ROWS PARTITION THE INSTRUMENT. Each interval read back is charged
+    /// to exactly one tag, so the rows' `device_ns` sum to
+    /// `dispatch_stats().device_ns` and their `items` to its `timed_items`.
+    ///
+    /// WHAT AN INTERVAL IS: the one `device_ns` sums, the ordered completion
+    /// interval between an item's bottom-of-pipe stamp and the stamp before it
+    /// (the batch origin for a batch's first item). Under R1's barrier between
+    /// adjacent items, that is the item's barrier drain, launch, arithmetic and
+    /// memory traffic. A transfer recorded between two items (an upload) falls
+    /// in the next item's interval. It is not an occupancy figure. And with the
+    /// timestamps on every flush completes (`completes`), so the batches under
+    /// the instrument are not the batches without it.
+    ///
+    /// `unresolved_items` counts a tag's items whose interval was not read:
+    /// their batch overflowed the query pool, failed, or had an ambiguous
+    /// wrap. Nonzero means that tag's `device_ns` covers less than its work.
+    pub fn dispatch_tag_times(&self) -> Vec<DispatchTagTime> {
+        self.tag_times.borrow().values().copied().collect()
+    }
+
+    /// Every item a flushed batch tagged starts unresolved; `tags_resolved`
+    /// moves it to its tag's totals once its interval is read.
+    fn tags_pending(&self, tags: &[u32]) {
+        if !tags.is_empty() {
+            tag_rows_pending(&mut self.tag_times.borrow_mut(), tags);
+        }
+    }
+
+    /// Interval `i`, read for an item recorded under `tags[i]`: charged to
+    /// that tag, and no longer unresolved.
+    fn tags_resolved(&self, tags: &[u32], intervals: &[u64]) {
+        tag_rows_resolved(&mut self.tag_times.borrow_mut(), tags, intervals);
     }
 
     /// A flush that failed at or before `vkQueueSubmit`: the batch is gone.
@@ -2101,9 +3264,8 @@ impl Context {
                 self.vk_destroy_descriptor_set_layout(k.dsl);
             }
             // the copies that read them were never submitted
-            for (b, m) in rec.retired_staging {
-                self.vk_destroy_buffer(b);
-                self.vk_free_memory(m);
+            for pair in rec.retired_staging {
+                self.recycle_staging(pair);
             }
             self.vk_destroy_fence(rec.fence);
             self.vk_free_command_buffer(rec.cb);
@@ -2365,6 +3527,20 @@ impl Context {
     }
 
     fn vk_create_fence(&self) -> std::result::Result<vk::Fence, vk::Result> {
+        if self.fence_pool_enabled.get() {
+            let pooled = self.fence_pool.borrow_mut().pop();
+            if let Some(f) = pooled {
+                // Already a live, counted object and unsignalled (reset when it
+                // was pooled). The fault injector still fires at this step, so a
+                // pool hit cannot leave an armed `CreateStep::Fence` fault
+                // unconsumed and turn a cleanup-path test into a test of nothing.
+                if let Some(r) = self.take_create_fault(CreateStep::Fence) {
+                    self.fence_pool.borrow_mut().push(f);
+                    return Err(r);
+                }
+                return Ok(f);
+            }
+        }
         let f = unsafe {
             self.device
                 .create_fence(&vk::FenceCreateInfo::default(), None)
@@ -2398,6 +3574,40 @@ impl Context {
 
     fn vk_free_command_buffer(&self, cb: vk::CommandBuffer) {
         unsafe { self.device.free_command_buffers(self.command_pool, &[cb]) };
+        self.track(-1);
+    }
+
+    /// R1/R2: the transfer queue's own command buffer, from
+    /// `transfer_command_pool` rather than `command_pool`. Same counting and
+    /// same fault (`CreateStep::CommandBuffer` does not distinguish which
+    /// pool a command buffer came from -- it is one creation either way).
+    /// Panics if called with no transfer command pool; every caller checks
+    /// `self.transfer_queue`/`self.timeline` first and takes R2's fallback
+    /// instead when either is absent.
+    fn vk_allocate_transfer_command_buffer(
+        &self,
+    ) -> std::result::Result<vk::CommandBuffer, vk::Result> {
+        let pool = self
+            .transfer_command_pool
+            .expect("vk_allocate_transfer_command_buffer: no transfer command pool");
+        let alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cb = unsafe { self.device.allocate_command_buffers(&alloc) }?[0];
+        self.track(1);
+        if let Some(r) = self.take_create_fault(CreateStep::CommandBuffer) {
+            self.vk_free_transfer_command_buffer(cb);
+            return Err(r);
+        }
+        Ok(cb)
+    }
+
+    fn vk_free_transfer_command_buffer(&self, cb: vk::CommandBuffer) {
+        let pool = self
+            .transfer_command_pool
+            .expect("vk_free_transfer_command_buffer: no transfer command pool");
+        unsafe { self.device.free_command_buffers(pool, &[cb]) };
         self.track(-1);
     }
 
@@ -2464,16 +3674,27 @@ impl Context {
         )))
     }
 
+    /// The two families a `Context::buffer` or `Context::staging` allocation
+    /// shares across (R1), when this device has a transfer queue; `None`
+    /// when it does not, which callers turn into `BufferSharing::Exclusive`.
+    fn transfer_shared_families(&self) -> Option<[u32; 2]> {
+        self.transfer_queue_family.map(|tf| [self.queue_family, tf])
+    }
+
     fn raw_buffer(
         &self,
         bytes: u64,
         usage: vk::BufferUsageFlags,
         flags: vk::MemoryPropertyFlags,
+        sharing: BufferSharing,
     ) -> Result<(vk::Buffer, vk::DeviceMemory)> {
-        let info = vk::BufferCreateInfo::default()
-            .size(bytes)
-            .usage(usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let mut info = vk::BufferCreateInfo::default().size(bytes).usage(usage);
+        info = match sharing {
+            BufferSharing::Exclusive => info.sharing_mode(vk::SharingMode::EXCLUSIVE),
+            BufferSharing::Concurrent(families) => info
+                .sharing_mode(vk::SharingMode::CONCURRENT)
+                .queue_family_indices(families),
+        };
         let buffer = self.vk_create_buffer(&info)?;
         let req = unsafe { self.device.get_buffer_memory_requirements(buffer) };
         // ACK-L0-05: a failure after the buffer exists destroys it; a failure
@@ -2538,38 +3759,101 @@ impl Context {
         // check and dispatch against the new owner's tensor, reporting ACK_OK.
         // `next_buffer` is monotonic for the life of the context and this does
         // not change that.
-        let (buffer, memory) = match self.take_pooled(allocated) {
+        //
+        // WITH THE POOL ON, THE PAIR IS ALLOCATED AT THE REQUEST'S SIZE CLASS
+        // (`pool_class`), and the pool keys on it. Measured 2026-09-29 on the
+        // realistic stage-E step: the MoE bmm and fp16 mul requests take
+        // per-expert sizes that change every step, so an exact-size key missed
+        // 1.2-1.6k times a step under either eviction policy. A class holds
+        // every request within 12.5% below it, so those requests share pairs;
+        // the price is at most that much device memory per buffer. Below
+        // `POOL_CLASS_FLOOR` the key stays exact, where the rounding would buy
+        // nothing. The refusal above is on the request, so a request the device
+        // can hold is never refused because its class is larger
+        // (`pool_class` clamps at the limit).
+        let allocated = if self.pool_enabled.get() {
+            pool_class(allocated, self.max_storage_buffer_bytes)
+        } else {
+            allocated
+        };
+        // A hit's Buffer records the PAIR's allocated size, which is larger than
+        // the request's class when `pool_pick` took a larger pair (2026-10-01).
+        let (buffer, memory, allocated) = match self.take_pooled(allocated) {
             Some(p) => {
                 self.pool_hits.set(self.pool_hits.get() + 1);
-                (p.buffer, p.memory)
+                (p.buffer, p.memory, p.allocated)
             }
             None => {
                 self.pool_misses.set(self.pool_misses.get() + 1);
+                // GIVE MEMORY BACK BEFORE THE BUDGET, NOT ONLY AFTER A FAILURE. On Windows (WDDM) an allocation past
+                // the device-local budget does not fail: the OS places it in system memory, and every dispatch that
+                // touches it then crosses the bus. Measured 2026-10-21 (RX 9070 XT, a 26M-parameter training step at
+                // microbatch 32): torch's live peak 12.3 GB plus a pool of up to half the heap ran 13x slower than
+                // microbatch 16, with no allocation ever failing, so the retry below never ran. When the OS reports
+                // less room than this request plus `POOL_BUDGET_MARGIN`, the largest pooled pairs go first.
+                if let Some(room) = self.device_local_room() {
+                    let need = allocated.saturating_add(POOL_BUDGET_MARGIN);
+                    if room < need && self.pooled_buffer_objects() > 0 {
+                        self.pool_reclaims.set(self.pool_reclaims.get() + 1);
+                        self.evict_largest(need - room);
+                    }
+                }
                 let usage = vk::BufferUsageFlags::STORAGE_BUFFER
                     | vk::BufferUsageFlags::TRANSFER_SRC
                     | vk::BufferUsageFlags::TRANSFER_DST;
                 let flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
-                match self.raw_buffer(allocated, usage, flags) {
+                // R1: shared across both queue families so a later
+                // `copy_from_staging_async` can hand this buffer to the
+                // transfer queue as `dst` while the compute queue also binds
+                // it; `Exclusive` on a device with no transfer queue, which
+                // is the pre-R1 behaviour exactly.
+                let shared = self.transfer_shared_families();
+                let sharing = match &shared {
+                    Some(f) => BufferSharing::Concurrent(f),
+                    None => BufferSharing::Exclusive,
+                };
+                let (b, m) = match self.raw_buffer(allocated, usage, flags, sharing) {
                     Ok(pair) => pair,
                     Err(e) => {
                         // THE POOL MUST NEVER BE THE REASON AN ALLOCATION
                         // FAILED. It is holding device memory that nothing
                         // owns, so an allocation failure with a non-empty pool
                         // is the one case where the right answer is certain:
-                        // give the memory back and try once more. Without this
-                        // the ceiling is a SAFETY mechanism and has to be set
-                        // low; with it the ceiling is a pure tuning knob, and
-                        // that is what lets the default be raised. The retry
-                        // is once, not a loop: a second failure after the pool
-                        // is empty is a real out-of-memory and is returned.
-                        if self.pooled_objects() == 0 {
+                        // give memory back and try again. Without this the
+                        // ceiling is a SAFETY mechanism and has to be set low;
+                        // with it the ceiling is a pure tuning knob, and that
+                        // is what lets the default be raised.
+                        //
+                        // GIVE BACK WHAT THE REQUEST NEEDS, NOT EVERYTHING.
+                        // This drained the whole pool at the first failure.
+                        // Measured 2026-09-29 on the realistic stage-E step
+                        // (window 5 attribution, then window 6's timed steps):
+                        // 2 such drains in one attributed run, each destroying
+                        // ~8.5 GB of pooled pairs, and the steps after them
+                        // allocated from nothing -- the old pool's step times
+                        // were 8.9 / 14.2 / 8.6 / 7.9 / 7.1 s, spiking where the
+                        // pool refilled. Now the largest held pairs go first,
+                        // at least the request's size, doubling after each
+                        // failed retry, so a failure costs O(log) retries and
+                        // keeps what the next requests will take. A failure
+                        // with the pool empty is a real out-of-memory and is
+                        // returned.
+                        if self.pooled_buffer_objects() == 0 {
                             return Err(e);
                         }
-                        self.clear_pool();
                         self.pool_reclaims.set(self.pool_reclaims.get() + 1);
-                        self.raw_buffer(allocated, usage, flags)?
+                        let mut want = allocated;
+                        loop {
+                            let freed = self.evict_largest(want);
+                            match self.raw_buffer(allocated, usage, flags, sharing) {
+                                Ok(pair) => break pair,
+                                Err(again) if freed == 0 => return Err(again),
+                                Err(_) => want = want.saturating_mul(2),
+                            }
+                        }
                     }
-                }
+                };
+                (b, m, allocated)
             }
         };
         let id = self.next_buffer.get();
@@ -2579,6 +3863,7 @@ impl Context {
             buffer,
             memory,
             bytes,
+            allocated,
             ctx_id: self.id,
             id,
         })
@@ -2596,6 +3881,10 @@ impl Context {
     /// `download`'s and `dispatch_timed`'s; a recorded batch is submitted by
     /// `flush`, which repeats this ladder with "the call's objects" widened to
     /// "the batch's objects".
+    ///
+    /// R2: both this and `flush` consult `take_pending_transfer_wait` at
+    /// their own `queue_submit`, so "the next submission's wait list"
+    /// (`await_transfer`'s doc comment) means the next call to either.
     fn one_shot<F: FnOnce(vk::CommandBuffer)>(&self, record: F) -> Result<()> {
         self.check_live()?;
         let cb = self.vk_allocate_command_buffer()?;
@@ -2619,8 +3908,39 @@ impl Context {
                 return Err(e.into());
             }
         };
-        let submit = [vk::SubmitInfo::default().command_buffers(&cbs)];
+        // R2: when `await_transfer` armed a wait, THIS submission (the next
+        // one on the compute queue, whichever call reaches `queue_submit`
+        // first) carries it and consumes it; with nothing armed (every call
+        // before R2, and every call after it that never used
+        // `copy_from_staging_async`/`await_transfer`) `wait` is `None` and
+        // the submit info below is byte-identical to before R2.
+        //
+        // The stream hook (`arm_submission_signal`) adds signals the same
+        // way; with none armed it adds nothing either.
+        let (waits, signals) = self.take_submission_sync();
+        let wait_semaphores: Vec<vk::Semaphore> = waits.iter().map(|w| w.0).collect();
+        let wait_values: Vec<u64> = waits.iter().map(|w| w.1).collect();
+        let wait_stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; waits.len()];
+        let signal_semaphores: Vec<vk::Semaphore> = signals.iter().map(|s| s.0).collect();
+        let signal_values: Vec<u64> = signals.iter().map(|s| s.1).collect();
+        let mut timeline_info = vk::TimelineSemaphoreSubmitInfo::default()
+            .wait_semaphore_values(&wait_values)
+            .signal_semaphore_values(&signal_values);
+        let mut submit_info = vk::SubmitInfo::default().command_buffers(&cbs);
+        if !waits.is_empty() {
+            submit_info = submit_info
+                .wait_semaphores(&wait_semaphores)
+                .wait_dst_stage_mask(&wait_stages);
+        }
+        if !signals.is_empty() {
+            submit_info = submit_info.signal_semaphores(&signal_semaphores);
+        }
+        if !waits.is_empty() || !signals.is_empty() {
+            submit_info = submit_info.push_next(&mut timeline_info);
+        }
+        let submit = [submit_info];
         if let Err(e) = unsafe { self.device.queue_submit(self.queue, &submit, fence) } {
+            self.release_signals(&signals);
             self.vk_destroy_fence(fence);
             free_cb();
             return Err(e.into());
@@ -2657,7 +3977,7 @@ impl Context {
                 }
             };
         }
-        self.release_submission(fence, free_cb);
+        self.release_completed_submission(fence, free_cb);
         Ok(())
     }
 
@@ -2682,44 +4002,41 @@ impl Context {
                 dst.bytes
             )));
         }
+        let clock = transfer_clock_on().then(std::time::Instant::now);
         if self.deferred_upload() {
-            return self.upload_recorded(dst, data);
+            let recorded = self.upload_recorded(dst, data);
+            if let (Some(t0), Ok(())) = (clock, &recorded) {
+                // a recorded upload: no flush, so its whole time is the rest
+                transfer_clock_add(3, 0, clock_ns(t0, std::time::Instant::now()));
+                TRANSFER_CLOCK[6].fetch_add(1, Ordering::Relaxed);
+            }
+            return recorded;
         }
         // after every named refusal, before any object of this call exists
         self.flush(batch::FlushReason::Upload)?;
-        let (staging, memory) = self.raw_buffer(
-            bytes,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
-        let release = || {
-            self.vk_destroy_buffer(staging);
-            self.vk_free_memory(memory);
-        };
+        let flushed = clock.map(|_| std::time::Instant::now());
+        // this call's own staging pair (pooled or fresh, mapped either way;
+        // the transfer queue never touches it: R1 leaves `upload` unchanged)
+        let pair = self.take_staging(TransferKind::Upload, bytes)?;
         unsafe {
-            let p = match self
-                .device
-                .map_memory(memory, 0, bytes, vk::MemoryMapFlags::empty())
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    // nothing was submitted: the staging pair is safe to destroy
-                    release();
-                    return Err(e.into());
-                }
-            };
-            std::ptr::copy_nonoverlapping(data.as_ptr(), p.cast::<u8>(), data.len());
-            self.device.unmap_memory(memory);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), pair.ptr as *mut u8, data.len());
         }
+        let staging = pair.buffer;
         let submitted = self.one_shot(|cb| unsafe {
             let region = [vk::BufferCopy::default().size(bytes)];
             self.device
                 .cmd_copy_buffer(cb, staging, dst.buffer, &region);
         });
-        // the staging pair is this method's: released when the device is
-        // quiesced or lost, left allocated and counted when the context is
-        // poisoned with the device state unknown
-        self.release_or_leak(2, release);
+        match submitted {
+            // the copy completed: nothing names the pair any more
+            Ok(()) => self.recycle_staging(pair),
+            // released when the device is quiesced or lost, left allocated and
+            // counted when the context is poisoned with the device state unknown
+            Err(_) => self.release_or_leak(2, || self.destroy_staging_pair(pair)),
+        }
+        if let (Some(t0), Some(t1), Ok(())) = (clock, flushed, &submitted) {
+            transfer_clock_add(3, clock_ns(t0, t1), clock_ns(t1, std::time::Instant::now()));
+        }
         submitted
     }
 
@@ -2735,32 +4052,15 @@ impl Context {
     /// after it whether or not it is the batch's first.
     fn upload_recorded(&self, dst: &Buffer, data: &[u8]) -> Result<()> {
         let bytes = data.len() as u64;
-        let (staging, memory) = self.raw_buffer(
-            bytes,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
-        let release = || {
-            self.vk_destroy_buffer(staging);
-            self.vk_free_memory(memory);
-        };
+        // the same staging as `upload`'s own, pooled or fresh
+        let pair = self.take_staging(TransferKind::Upload, bytes)?;
         unsafe {
-            let p = match self
-                .device
-                .map_memory(memory, 0, bytes, vk::MemoryMapFlags::empty())
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    // nothing was recorded: the staging pair is safe to destroy
-                    release();
-                    return Err(e.into());
-                }
-            };
-            std::ptr::copy_nonoverlapping(data.as_ptr(), p.cast::<u8>(), data.len());
-            self.device.unmap_memory(memory);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), pair.ptr as *mut u8, data.len());
         }
+        let staging = pair.buffer;
         if let Err(e) = self.open_batch() {
-            release();
+            // nothing was recorded: nothing names the pair
+            self.recycle_staging(pair);
             return Err(e);
         }
         let due = {
@@ -2783,13 +4083,628 @@ impl Context {
                     .cmd_copy_buffer(cb, staging, dst.buffer, &region);
             }
             rec.pending_transfer = true;
-            rec.retired_staging.push((staging, memory));
+            rec.retired_staging.push(pair);
             rec.plan.due()
         };
         if let Some(reason) = due {
             self.flush(reason)?;
         }
         Ok(())
+    }
+
+    /// A persistent, mapped staging area of `bytes`, allocated with `kind`'s
+    /// memory flags and mapped once for the CALLER's lifetime, rather than
+    /// re-created on every call the way `upload`'s own staging buffer is. For
+    /// a caller that will land bytes in device-visible memory more than
+    /// once -- a memcpy, an unbuffered file read straight into the mapping
+    /// (`FILE_FLAG_NO_BUFFERING`), or, for `DeviceLocalHostVisible`, a write
+    /// straight into VRAM over the BAR -- this pays the allocation and the
+    /// map once and lets the caller reuse both. See
+    /// `docs/audits/2026-09-14-split-k-gemv-wave32-and-delivery.md`, Gate 1:
+    /// `upload` delivers 5 GB/s on a 37-54 GB/s link because it allocates a
+    /// fresh `HOST_VISIBLE | HOST_COHERENT` buffer, memcpys into that
+    /// write-combined memory and fences, per call.
+    ///
+    /// NOT POOLED, NOT RECORDED, AND NO CHANGE TO `upload`: this is a second,
+    /// explicit path next to it for a caller that wants to own the staging
+    /// memory's lifetime itself, not a replacement for the eager one-shot
+    /// path `upload` and `upload_recorded` still take.
+    ///
+    /// `check_live`, then `raw_buffer(bytes, STORAGE_BUFFER | TRANSFER_SRC,
+    /// flags)` with flags chosen by `kind`. A memory type that does not carry
+    /// them is refused by name (`AckError::Unsupported`, naming `kind`)
+    /// before any object exists: `raw_buffer` itself destroys the `VkBuffer`
+    /// it tried before returning that error (ACK-L0-05), so this only renames
+    /// it. A failure to map the pair once it exists destroys it the same way
+    /// before returning (ACK-L0-05, as `upload`'s own staging creation does).
+    /// Every kind's memory is `HOST_COHERENT`, so the mapping needs no flush
+    /// or invalidate on either side of a copy.
+    ///
+    /// R3: `STORAGE_BUFFER` is new alongside the `TRANSFER_SRC` this always
+    /// had, so the returned area can be bound as a kernel operand
+    /// (`Staging::as_operand`) with no intervening `copy_from_staging`. If
+    /// adding `STORAGE_BUFFER` costs a `kind` its only memory type on this
+    /// device, `raw_buffer`'s `memory_type` lookup fails and the `kind`-named
+    /// refusal below fires exactly as it already does for any other
+    /// unsupported kind -- nothing here silently drops back to a kind the
+    /// caller did not ask for.
+    ///
+    /// R1: shared across both queue families exactly like `Context::buffer`'s
+    /// device-local buffers, and for the same reason -- a `Staging` area can
+    /// be `copy_from_staging_async`'s `src` on the transfer queue while the
+    /// compute queue binds it as an operand (R3) or reads the destination
+    /// buffer the copy fills. `Exclusive` on a device with no transfer queue.
+    pub fn staging(&self, bytes: u64, kind: StagingKind) -> Result<Staging> {
+        self.staging_with(bytes, kind, false)
+    }
+
+    /// A persistent, mapped READBACK area: `staging(bytes, HostCached)`
+    /// whose buffer is also a transfer destination, so `record_readback` can
+    /// copy device bytes into it inside a batch. Cached, because the host
+    /// READS this memory (see `readback_memory_preferences`). Destroyed by
+    /// `destroy_staging` like any other `Staging`.
+    pub fn readback_area(&self, bytes: u64) -> Result<Staging> {
+        self.staging_with(bytes, StagingKind::HostCached, true)
+    }
+
+    fn staging_with(&self, bytes: u64, kind: StagingKind, readback: bool) -> Result<Staging> {
+        self.check_live()?;
+        let flags = match kind {
+            StagingKind::HostCoherent => {
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
+            }
+            StagingKind::HostCached => {
+                vk::MemoryPropertyFlags::HOST_VISIBLE
+                    | vk::MemoryPropertyFlags::HOST_COHERENT
+                    | vk::MemoryPropertyFlags::HOST_CACHED
+            }
+            StagingKind::DeviceLocalHostVisible => {
+                vk::MemoryPropertyFlags::DEVICE_LOCAL
+                    | vk::MemoryPropertyFlags::HOST_VISIBLE
+                    | vk::MemoryPropertyFlags::HOST_COHERENT
+            }
+        };
+        let mut usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC;
+        if readback {
+            usage |= vk::BufferUsageFlags::TRANSFER_DST;
+        }
+        let shared = self.transfer_shared_families();
+        let sharing = match &shared {
+            Some(f) => BufferSharing::Concurrent(f),
+            None => BufferSharing::Exclusive,
+        };
+        let (buffer, memory) = match self.raw_buffer(bytes, usage, flags, sharing) {
+            Ok(pair) => pair,
+            Err(AckError::Unsupported(msg)) => {
+                return Err(AckError::Unsupported(format!(
+                    "staging kind {kind:?}: {msg}"
+                )));
+            }
+            Err(e) => return Err(e),
+        };
+        let release = || {
+            self.vk_destroy_buffer(buffer);
+            self.vk_free_memory(memory);
+        };
+        let ptr = unsafe {
+            match self
+                .device
+                .map_memory(memory, 0, bytes, vk::MemoryMapFlags::empty())
+            {
+                Ok(p) => p.cast::<u8>(),
+                Err(e) => {
+                    // nothing was submitted: the pair is safe to destroy (ACK-L0-05)
+                    release();
+                    return Err(e.into());
+                }
+            }
+        };
+        Ok(Staging {
+            buffer,
+            memory,
+            ptr,
+            bytes,
+            kind,
+            readback,
+        })
+    }
+
+    /// Copy `bytes` from `src` (a `Staging` area, at `src_offset`) into `dst`
+    /// (at `dst_offset`). EAGER, like `upload`: `check_live`, `check_buffer`
+    /// on `dst`, then a zero-length or an out-of-range copy on either side is
+    /// refused by name before any Vulkan call (review finding ACK-L0-01).
+    /// Otherwise this flushes the recorded batch first (`FlushReason::Upload`
+    /// -- the same reason `upload` flushes for, since this is another way of
+    /// landing bytes in a device buffer) and then records and waits for one
+    /// `cmd_copy_buffer`, exactly as `upload`'s own copy does.
+    ///
+    /// `src` is the caller's: this neither destroys nor unmaps it, and the
+    /// same `Staging` can be copied from again, at the same or a different
+    /// offset, as soon as this returns.
+    pub fn copy_from_staging(
+        &self,
+        src: &Staging,
+        src_offset: u64,
+        dst: &Buffer,
+        dst_offset: u64,
+        bytes: u64,
+    ) -> Result<()> {
+        self.check_live()?;
+        self.check_buffer(dst)?;
+        let in_range = match (src_offset.checked_add(bytes), dst_offset.checked_add(bytes)) {
+            (Some(src_end), Some(dst_end)) => src_end <= src.bytes && dst_end <= dst.bytes,
+            _ => false,
+        };
+        if bytes == 0 || !in_range {
+            return Err(AckError::Unsupported(format!(
+                "copy_from_staging of {bytes} bytes: staging offset {src_offset} of {} bytes, buffer offset {dst_offset} of {} bytes",
+                src.bytes, dst.bytes
+            )));
+        }
+        self.flush(batch::FlushReason::Upload)?;
+        self.one_shot(|cb| unsafe {
+            let region = [vk::BufferCopy::default()
+                .src_offset(src_offset)
+                .dst_offset(dst_offset)
+                .size(bytes)];
+            self.device
+                .cmd_copy_buffer(cb, src.buffer, dst.buffer, &region);
+        })
+    }
+
+    /// `copy_from_staging` for many regions in ONE submission: each `(src, src_offset, dst, dst_offset, bytes)`
+    /// is checked as `copy_from_staging` checks its one, the batch is flushed once, and one command buffer records
+    /// every copy and is waited for once. Regions run in the order given; an empty list does nothing.
+    pub fn copy_from_stagings(&self, regions: &[(&Staging, u64, &Buffer, u64, u64)]) -> Result<()> {
+        self.check_live()?;
+        if regions.is_empty() {
+            return Ok(());
+        }
+        for (i, &(src, src_offset, dst, dst_offset, bytes)) in regions.iter().enumerate() {
+            self.check_buffer(dst)?;
+            let in_range = match (src_offset.checked_add(bytes), dst_offset.checked_add(bytes)) {
+                (Some(src_end), Some(dst_end)) => src_end <= src.bytes && dst_end <= dst.bytes,
+                _ => false,
+            };
+            if bytes == 0 || !in_range {
+                return Err(AckError::Unsupported(format!(
+                    "copy_from_stagings region {i} of {bytes} bytes: staging offset {src_offset} of {} bytes, buffer offset {dst_offset} of {} bytes",
+                    src.bytes, dst.bytes
+                )));
+            }
+        }
+        self.flush(batch::FlushReason::Upload)?;
+        self.one_shot(|cb| unsafe {
+            for &(src, src_offset, dst, dst_offset, bytes) in regions {
+                let region = [vk::BufferCopy::default()
+                    .src_offset(src_offset)
+                    .dst_offset(dst_offset)
+                    .size(bytes)];
+                self.device
+                    .cmd_copy_buffer(cb, src.buffer, dst.buffer, &region);
+            }
+        })
+    }
+
+    /// RECORDED device-to-device copies, in the open batch: each region's
+    /// `bytes` from `src` at `src_offset` into `dst` at `dst_offset`. Nothing
+    /// is flushed or waited for, and the bytes are copied as they are (a
+    /// transfer, not a shader: no float instruction sees them).
+    ///
+    /// ORDERING. The copies run where they are recorded. One barrier precedes
+    /// the group when an item since the last barrier wrote a source or
+    /// touched a destination, or when another recorded transfer is pending;
+    /// the next dispatch takes a barrier after them (`upload_recorded`'s
+    /// rule). Refused by name, before anything is recorded: an empty or
+    /// out-of-range region, a region whose source and destination are one
+    /// buffer, destinations that overlap one another, and a buffer that is a
+    /// source of one region and a destination of another, so the group needs
+    /// no barrier inside it.
+    pub fn record_buffer_copies(&self, regions: &[BufferCopy<'_>]) -> Result<()> {
+        self.check_live()?;
+        for (i, r) in regions.iter().enumerate() {
+            self.check_buffer(r.src)?;
+            self.check_buffer(r.dst)?;
+            let in_range = match (
+                r.src_offset.checked_add(r.bytes),
+                r.dst_offset.checked_add(r.bytes),
+            ) {
+                (Some(src_end), Some(dst_end)) => src_end <= r.src.bytes && dst_end <= r.dst.bytes,
+                _ => false,
+            };
+            if r.bytes == 0 || !in_range || r.src.id == r.dst.id {
+                return Err(AckError::Unsupported(format!(
+                    "record_buffer_copies region {i} of {} bytes: source offset {} of {} bytes, destination offset {} of {} bytes, one buffer: {}",
+                    r.bytes,
+                    r.src_offset,
+                    r.src.bytes,
+                    r.dst_offset,
+                    r.dst.bytes,
+                    r.src.id == r.dst.id
+                )));
+            }
+            if let Some(j) = regions[..i].iter().position(|o| {
+                (o.dst.id == r.dst.id
+                    && o.dst_offset < r.dst_offset + r.bytes
+                    && r.dst_offset < o.dst_offset + o.bytes)
+                    || o.dst.id == r.src.id
+                    || o.src.id == r.dst.id
+            }) {
+                return Err(AckError::Unsupported(format!(
+                    "record_buffer_copies: regions {j} and {i} overlap, or one reads what the other writes"
+                )));
+            }
+        }
+        if regions.is_empty() {
+            return Ok(());
+        }
+        self.open_batch()?;
+        let mut slot = self.recorder.borrow_mut();
+        let rec = slot
+            .as_mut()
+            .expect("open_batch installed the recorder or returned an error");
+        let reads: Vec<u64> = regions.iter().map(|r| r.src.id).collect();
+        let writes: Vec<u64> = regions.iter().map(|r| r.dst.id).collect();
+        if (rec.plan.record_transfer_group(&reads, &writes) || rec.pending_transfer)
+            && self.barriers_enabled()
+        {
+            self.record_barrier(rec.cb);
+        }
+        for r in regions {
+            let region = [vk::BufferCopy::default()
+                .src_offset(r.src_offset)
+                .dst_offset(r.dst_offset)
+                .size(r.bytes)];
+            unsafe {
+                self.device
+                    .cmd_copy_buffer(rec.cb, r.src.buffer, r.dst.buffer, &region)
+            };
+        }
+        rec.pending_transfer = true;
+        Ok(())
+    }
+
+    /// RECORDED copies out of a persistent `Staging` area into device
+    /// buffers, in the open batch. Nothing is flushed or waited for, and no
+    /// staging of the kit's own is taken: this is `upload_recorded` for a
+    /// caller that owns its staging memory, for several destinations at once.
+    ///
+    /// ORDERING. The copies run where they are recorded: after every item
+    /// recorded before them, before every item recorded after them. One
+    /// barrier precedes the group when an item since the last barrier
+    /// touched a destination, or when another recorded transfer is pending.
+    /// The next dispatch takes a barrier after them, whatever its place in
+    /// the batch (`upload_recorded`'s rule). Destinations that overlap one
+    /// another are refused by name, so the group needs no barrier inside it.
+    ///
+    /// THE CALLER OWNS THE BYTES' LIFETIME. The device reads the area when
+    /// the batch executes, not when this returns, so a region must not be
+    /// rewritten until the batch carrying its copy has completed. Under the
+    /// timestamp instrument the copies' time falls in the next item's
+    /// interval.
+    pub fn record_copies_from_staging(
+        &self,
+        src: &Staging,
+        regions: &[StagingCopy<'_>],
+    ) -> Result<()> {
+        self.check_live()?;
+        for (i, r) in regions.iter().enumerate() {
+            self.check_buffer(r.dst)?;
+            let in_range = match (
+                r.staging_offset.checked_add(r.bytes),
+                r.dst_offset.checked_add(r.bytes),
+            ) {
+                (Some(src_end), Some(dst_end)) => src_end <= src.bytes && dst_end <= r.dst.bytes,
+                _ => false,
+            };
+            if r.bytes == 0 || !in_range {
+                return Err(AckError::Unsupported(format!(
+                    "record_copies_from_staging region {i} of {} bytes: staging offset {} of {} bytes, buffer offset {} of {} bytes",
+                    r.bytes, r.staging_offset, src.bytes, r.dst_offset, r.dst.bytes
+                )));
+            }
+            if let Some(j) = regions[..i].iter().position(|o| {
+                o.dst.id == r.dst.id
+                    && o.dst_offset < r.dst_offset + r.bytes
+                    && r.dst_offset < o.dst_offset + o.bytes
+            }) {
+                return Err(AckError::Unsupported(format!(
+                    "record_copies_from_staging: regions {j} and {i} overlap in their destination"
+                )));
+            }
+        }
+        if regions.is_empty() {
+            return Ok(());
+        }
+        self.open_batch()?;
+        let mut slot = self.recorder.borrow_mut();
+        let rec = slot
+            .as_mut()
+            .expect("open_batch installed the recorder or returned an error");
+        let ids: Vec<u64> = regions.iter().map(|r| r.dst.id).collect();
+        if (rec.plan.record_transfer_writes(&ids) || rec.pending_transfer)
+            && self.barriers_enabled()
+        {
+            self.record_barrier(rec.cb);
+        }
+        for r in regions {
+            let region = [vk::BufferCopy::default()
+                .src_offset(r.staging_offset)
+                .dst_offset(r.dst_offset)
+                .size(r.bytes)];
+            unsafe {
+                self.device
+                    .cmd_copy_buffer(rec.cb, src.buffer, r.dst.buffer, &region)
+            };
+        }
+        rec.pending_transfer = true;
+        Ok(())
+    }
+
+    /// A RECORDED copy of `bytes` from a device buffer into a readback area
+    /// (`readback_area`), in the open batch, followed by a transfer-to-host
+    /// memory barrier. Nothing is flushed or waited for. The bytes are in
+    /// `dst.as_slice()` once the batch carrying the copy has completed: a
+    /// fence the kit waited on, or a timeline value that batch signalled
+    /// (`arm_submission_signal`) and the host has waited past.
+    ///
+    /// ORDERING. One barrier precedes the copy when an item since the last
+    /// barrier wrote `src` (read after write), or when another recorded
+    /// transfer is pending. The read is tracked, so a later item that writes
+    /// `src` waits for it. Refused by name: an area that is not a readback
+    /// area, and an empty or out-of-range copy.
+    pub fn record_readback(
+        &self,
+        src: &Buffer,
+        src_offset: u64,
+        dst: &Staging,
+        dst_offset: u64,
+        bytes: u64,
+    ) -> Result<()> {
+        self.check_live()?;
+        self.check_buffer(src)?;
+        if !dst.readback {
+            return Err(AckError::Unsupported(
+                "record_readback into a staging area that is not a transfer destination: make it with Context::readback_area".into(),
+            ));
+        }
+        let in_range = match (src_offset.checked_add(bytes), dst_offset.checked_add(bytes)) {
+            (Some(src_end), Some(dst_end)) => src_end <= src.bytes && dst_end <= dst.bytes,
+            _ => false,
+        };
+        if bytes == 0 || !in_range {
+            return Err(AckError::Unsupported(format!(
+                "record_readback of {bytes} bytes: buffer offset {src_offset} of {} bytes, area offset {dst_offset} of {} bytes",
+                src.bytes, dst.bytes
+            )));
+        }
+        self.open_batch()?;
+        let mut slot = self.recorder.borrow_mut();
+        let rec = slot
+            .as_mut()
+            .expect("open_batch installed the recorder or returned an error");
+        if (rec.plan.record_transfer_read(src.id) || rec.pending_transfer)
+            && self.barriers_enabled()
+        {
+            self.record_barrier(rec.cb);
+        }
+        let region = [vk::BufferCopy::default()
+            .src_offset(src_offset)
+            .dst_offset(dst_offset)
+            .size(bytes)];
+        // the device -> host domain operation a host read of device-written
+        // memory needs, whatever a fence or semaphore wait adds on this driver
+        let to_host = [vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ)];
+        unsafe {
+            self.device
+                .cmd_copy_buffer(rec.cb, src.buffer, dst.buffer, &region);
+            self.device.cmd_pipeline_barrier(
+                rec.cb,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &to_host,
+                &[],
+                &[],
+            );
+        }
+        rec.pending_transfer = true;
+        Ok(())
+    }
+
+    /// The next value this context's timeline semaphore will be signalled to.
+    fn next_timeline_value(&self) -> u64 {
+        let v = self.timeline_value.get() + 1;
+        self.timeline_value.set(v);
+        v
+    }
+
+    /// Free every async transfer command buffer (R2) whose ticket value the
+    /// timeline has already reached, so the small outstanding list does not
+    /// grow across a pipeline's steady state. Called opportunistically from
+    /// `copy_from_staging_async` (before recording the next one) and from
+    /// `wait_transfer`; `Drop` reaps every remaining entry unconditionally,
+    /// after a `device_wait_idle` that makes every one of them safe to free
+    /// whatever its value.
+    fn reap_transfer_command_buffers(&self) {
+        let Some(timeline) = self.timeline else {
+            return;
+        };
+        let current = unsafe { self.device.get_semaphore_counter_value(timeline) }.unwrap_or(0);
+        let mut pending = self.pending_transfer_cbs.borrow_mut();
+        let mut i = 0;
+        while i < pending.len() {
+            if pending[i].0 <= current {
+                let (_, cb) = pending.remove(i);
+                self.vk_free_transfer_command_buffer(cb);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// R2: a copy recorded on the TRANSFER queue (R1), returning immediately
+    /// without waiting for it. The returned ticket signals this context's
+    /// timeline semaphore at a value only this copy sets; `await_transfer`
+    /// and `wait_transfer` are how a caller orders later work after it.
+    ///
+    /// THE FALLBACK IS NOT A DIFFERENT CONTRACT, IT IS THE SAME ONE. If this
+    /// device has no transfer queue (`report.transfer_queue`) or no timeline
+    /// semaphore (`report.timeline_semaphores`), this does the ordinary
+    /// synchronous `copy_from_staging` on the compute queue right here and
+    /// returns a ticket that is already satisfied: `await_transfer` and
+    /// `wait_transfer` both special-case a timeline-less context to a no-op,
+    /// so a caller never branches on which arm it got -- it just calls
+    /// `copy_from_staging_async`, then (eventually) `await_transfer` or
+    /// `wait_transfer`, on every device.
+    ///
+    /// Refusals mirror `copy_from_staging`'s exactly (same bounds check, same
+    /// message), checked before either arm touches Vulkan.
+    pub fn copy_from_staging_async(
+        &self,
+        src: &Staging,
+        src_offset: u64,
+        dst: &Buffer,
+        dst_offset: u64,
+        bytes: u64,
+    ) -> Result<TransferTicket> {
+        self.check_live()?;
+        self.check_buffer(dst)?;
+        let in_range = match (src_offset.checked_add(bytes), dst_offset.checked_add(bytes)) {
+            (Some(src_end), Some(dst_end)) => src_end <= src.bytes && dst_end <= dst.bytes,
+            _ => false,
+        };
+        if bytes == 0 || !in_range {
+            return Err(AckError::Unsupported(format!(
+                "copy_from_staging_async of {bytes} bytes: staging offset {src_offset} of {} bytes, buffer offset {dst_offset} of {} bytes",
+                src.bytes, dst.bytes
+            )));
+        }
+        let (transfer_queue, timeline) = match (self.transfer_queue, self.timeline) {
+            (Some(q), Some(t)) => (q, t),
+            _ => {
+                // R2's fallback: no transfer queue, or no timeline semaphore.
+                // `value: 0` is never compared to anything -- `await_transfer`
+                // and `wait_transfer` both return at once on a context with
+                // no timeline, which this context, by construction, is.
+                self.copy_from_staging(src, src_offset, dst, dst_offset, bytes)?;
+                return Ok(TransferTicket { value: 0 });
+            }
+        };
+        self.reap_transfer_command_buffers();
+        let cb = self.vk_allocate_transfer_command_buffer()?;
+        let free_cb = || self.vk_free_transfer_command_buffer(cb);
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        if let Err(e) = unsafe { self.device.begin_command_buffer(cb, &begin) } {
+            free_cb();
+            return Err(e.into());
+        }
+        unsafe {
+            let region = [vk::BufferCopy::default()
+                .src_offset(src_offset)
+                .dst_offset(dst_offset)
+                .size(bytes)];
+            self.device
+                .cmd_copy_buffer(cb, src.buffer, dst.buffer, &region);
+        }
+        if let Err(e) = unsafe { self.device.end_command_buffer(cb) } {
+            free_cb();
+            return Err(e.into());
+        }
+        let value = self.next_timeline_value();
+        let cbs = [cb];
+        let signal_semaphores = [timeline];
+        let signal_values = [value];
+        let mut timeline_signal =
+            vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&signal_values);
+        let submit = [vk::SubmitInfo::default()
+            .command_buffers(&cbs)
+            .signal_semaphores(&signal_semaphores)
+            .push_next(&mut timeline_signal)];
+        // KNOWN SIMPLIFICATION (deviation, see the report): unlike `one_shot`
+        // and `flush`, a failed submission here does not poison the context.
+        // Nothing was recorded on the compute queue, and `queue_submit`'s own
+        // guarantee about an unaffected queue on failure is the same limited
+        // one `lose_batch` documents; extending ACK-L0-03's poison ladder to
+        // a second queue is left for a follow-up rather than done in haste
+        // here. The command buffer is freed and the error returned either way.
+        if let Err(e) = unsafe {
+            self.device
+                .queue_submit(transfer_queue, &submit, vk::Fence::null())
+        } {
+            free_cb();
+            return Err(e.into());
+        }
+        self.pending_transfer_cbs.borrow_mut().push((value, cb));
+        Ok(TransferTicket { value })
+    }
+
+    /// R2: make every dispatch recorded after this call wait on `ticket`
+    /// before it reads whatever the copy behind `ticket` wrote. Implemented
+    /// as a wait on the timeline at `ticket`'s value in the NEXT submission's
+    /// wait list (`one_shot` or `flush`, whichever the caller's next call
+    /// reaches first) -- NOT as a host-side block. A single queue processes
+    /// its submissions in the order they were made, so once one submission
+    /// has waited past `ticket`'s value, every later submission to the same
+    /// queue is already ordered after it and needs no wait of its own; that
+    /// is why consuming the armed value once, at the very next submission,
+    /// is enough (see `pending_transfer_wait`'s doc comment for the case of
+    /// more than one outstanding `await_transfer`).
+    ///
+    /// A no-op on a context with no timeline semaphore: R2's fallback already
+    /// ran the copy synchronously before handing back the ticket, so there is
+    /// nothing left to order.
+    pub fn await_transfer(&self, ticket: &TransferTicket) -> Result<()> {
+        self.check_live()?;
+        if self.timeline.is_none() {
+            return Ok(());
+        }
+        let merged = match self.pending_transfer_wait.get() {
+            Some(v) => v.max(ticket.value),
+            None => ticket.value,
+        };
+        self.pending_transfer_wait.set(Some(merged));
+        Ok(())
+    }
+
+    /// R2: host-side block until `ticket`'s copy has completed. For the
+    /// probe's teardown and for tests, where a real wait (not just an
+    /// ordering against the next dispatch) is what is wanted. Returns at once
+    /// if `ticket` is already signalled -- `vkWaitSemaphores` does that on
+    /// its own, and this adds nothing on top -- and at once, unconditionally,
+    /// on a context with no timeline semaphore (R2's fallback: the copy
+    /// already ran synchronously).
+    pub fn wait_transfer(&self, ticket: &TransferTicket) -> Result<()> {
+        self.check_live()?;
+        let Some(timeline) = self.timeline else {
+            return Ok(());
+        };
+        let semaphores = [timeline];
+        let values = [ticket.value];
+        let wait_info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&semaphores)
+            .values(&values);
+        unsafe { self.device.wait_semaphores(&wait_info, u64::MAX) }?;
+        self.reap_transfer_command_buffers();
+        Ok(())
+    }
+
+    /// Destroy a staging area this context created: unmap, then free and
+    /// destroy its buffer and memory through the same release-or-leak
+    /// accounting `destroy_buffer` uses (`release_or_leak(2, ..)`). Not
+    /// pooled and never retired into a batch. A recorded copy
+    /// (`record_copies_from_staging`, `record_readback`) names its area
+    /// until that batch completes, so a caller that recorded one syncs
+    /// before this; nothing else records a `Staging`.
+    pub fn destroy_staging(&self, s: Staging) {
+        unsafe { self.device.unmap_memory(s.memory) };
+        self.release_or_leak(2, || {
+            self.vk_destroy_buffer(s.buffer);
+            self.vk_free_memory(s.memory);
+        });
     }
 
     /// Host-visible memory property flags for READBACK staging, best first.
@@ -2846,88 +4761,124 @@ impl Context {
     pub fn download(&self, src: &Buffer) -> Result<Vec<u8>> {
         self.check_live()?;
         self.check_buffer(src)?;
+        let mut out = vec![0u8; src.bytes as usize];
+        self.download_into(src, &mut out)?;
+        Ok(out)
+    }
+
+    /// `download`, into the caller's own bytes; `dst` must be exactly `src`'s
+    /// size. The C ABI's `ack_download` reads through this, so a readback
+    /// makes one host copy (staging to `dst`) where it made three: a zeroed
+    /// `Vec` of the whole size, the copy into it, and the ABI's copy out.
+    ///
+    /// ABOVE `READBACK_CHUNK_BYTES` THE COPY RUNS IN CHUNKS through ONE
+    /// staging pair of that size, reused chunk after chunk, so no call stages
+    /// more host memory than one chunk. It used to stage the whole buffer in a
+    /// pair the pool never keeps (it only keeps pairs up to
+    /// `STAGING_POOL_MAX_PAIR_BYTES`), and a fresh host-visible allocation
+    /// that size was paid on every call. On NVIDIA that allocation pins pages.
+    /// MEASURED on a Kaggle T4 (driver 580.159.04, 2026-09-27): `ack_download`
+    /// read 0.46/0.69/0.80/0.68 GB/s at 1/4/16/64 MiB with the pool off, the
+    /// crate's default. The torch adapter, pool on, read 1.8/2.5/0.43/0.44 GB/s,
+    /// collapsing above the pooled size. CUDA on the same GPU read 10-13 GB/s
+    /// into pinned memory and 2.8-4.2 GB/s into pageable memory, with the PCIe
+    /// link at Gen3 throughout.
+    ///
+    /// A size refusal writes nothing. After a failure past it, the chunks
+    /// already copied are in `dst` and the rest is unchanged: the caller
+    /// treats all of `dst` as unspecified.
+    pub fn download_into(&self, src: &Buffer, dst: &mut [u8]) -> Result<()> {
+        self.check_live()?;
+        self.check_buffer(src)?;
+        if dst.len() as u64 != src.bytes {
+            return Err(AckError::Unsupported(format!(
+                "download of a {}-byte buffer into {} bytes",
+                src.bytes,
+                dst.len()
+            )));
+        }
         // after every named refusal, before any object of this call exists
+        let clock = transfer_clock_on().then(std::time::Instant::now);
         self.flush(batch::FlushReason::Readback)?;
-        let bytes = src.bytes;
-        // Preference order, best first. `HOST_CACHED` is what makes the read
-        // fast; `HOST_COHERENT` alongside it saves an invalidate. The last entry
-        // is the pre-2026-09-08 behaviour, kept as a fallback so a device
-        // exposing no cached host-visible type still works — slowly, and
-        // correctly, rather than not at all.
-        let preferences = Self::readback_memory_preferences();
-        let mut chosen: Option<(vk::Buffer, vk::DeviceMemory, vk::MemoryPropertyFlags)> = None;
-        let mut last_err = None;
-        for flags in preferences {
-            match self.raw_buffer(bytes, vk::BufferUsageFlags::TRANSFER_DST, flags) {
-                Ok((b, m)) => {
-                    chosen = Some((b, m, flags));
-                    break;
-                }
-                Err(e) => last_err = Some(e),
+        let flushed = clock.map(|_| std::time::Instant::now());
+        let total = src.bytes;
+        let chunk = total.min(READBACK_CHUNK_BYTES);
+        // this call's own readback staging (pooled or fresh, mapped either
+        // way), in the memory type `readback_memory_preferences` picks: cached
+        // is what makes the read fast. The transfer queue never touches it (R1
+        // leaves `download` unchanged).
+        let pair = self.take_staging(TransferKind::Readback, chunk)?;
+        let staging = pair.buffer;
+        let mut done = 0u64;
+        while done < total {
+            let size = (total - done).min(chunk);
+            let submitted = self.one_shot(|cb| unsafe {
+                let region = [vk::BufferCopy::default()
+                    .src_offset(done)
+                    .dst_offset(0)
+                    .size(size)];
+                self.device
+                    .cmd_copy_buffer(cb, src.buffer, staging, &region);
+            });
+            if let Err(e) = submitted {
+                // as in upload: destroy when quiesced or lost, leak and count when poisoned
+                self.release_or_leak(2, || self.destroy_staging_pair(pair));
+                return Err(e);
             }
-        }
-        let (staging, memory, staging_flags) = match chosen {
-            Some(t) => t,
-            None => {
-                return Err(last_err.unwrap_or_else(|| {
-                    AckError::Unsupported("no host-visible memory type for readback".into())
-                }))
-            }
-        };
-        let coherent = staging_flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT);
-        let release = || {
-            self.vk_destroy_buffer(staging);
-            self.vk_free_memory(memory);
-        };
-        let submitted = self.one_shot(|cb| unsafe {
-            let region = [vk::BufferCopy::default().size(bytes)];
-            self.device
-                .cmd_copy_buffer(cb, src.buffer, staging, &region);
-        });
-        if let Err(e) = submitted {
-            // as in upload: destroy when quiesced or lost, leak and count when poisoned
-            self.release_or_leak(2, release);
-            return Err(e);
-        }
-        let mut out = vec![0u8; bytes as usize];
-        unsafe {
-            // the submission completed: the staging pair is safe to destroy on every path below
-            let p = match self
-                .device
-                .map_memory(memory, 0, bytes, vk::MemoryMapFlags::empty())
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    release();
-                    return Err(e.into());
-                }
-            };
-            // A non-coherent cached mapping must be invalidated before the read,
-            // or the CPU may serve it from stale cache lines. WHOLE_SIZE is used
-            // rather than `bytes` because a non-whole range must be aligned to
-            // nonCoherentAtomSize and WHOLE_SIZE carries no such requirement.
-            if !coherent {
+            // the submission completed: nothing names the pair until the next
+            // chunk's copy is recorded.
+            // A non-coherent cached mapping must be invalidated before the
+            // read, or the CPU may serve it from stale cache lines -- including
+            // the previous chunk's, or a previous tenant's when the pair came
+            // from the pool. WHOLE_SIZE is used rather than `size` because a
+            // non-whole range must be aligned to nonCoherentAtomSize and
+            // WHOLE_SIZE carries no such requirement.
+            if !pair.coherent {
                 let range = [vk::MappedMemoryRange::default()
-                    .memory(memory)
+                    .memory(pair.memory)
                     .offset(0)
                     .size(vk::WHOLE_SIZE)];
-                if let Err(e) = self.device.invalidate_mapped_memory_ranges(&range) {
-                    self.device.unmap_memory(memory);
-                    release();
+                if let Err(e) = unsafe { self.device.invalidate_mapped_memory_ranges(&range) } {
+                    self.destroy_staging_pair(pair);
                     return Err(e.into());
                 }
             }
-            std::ptr::copy_nonoverlapping(p.cast::<u8>(), out.as_mut_ptr(), out.len());
-            self.device.unmap_memory(memory);
+            // only the first `size` bytes of the pair: a pooled pair can be
+            // larger than the chunk, and the rest is a previous tenant's
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    pair.ptr as *const u8,
+                    dst.as_mut_ptr().add(done as usize),
+                    size as usize,
+                );
+            }
+            done += size;
         }
-        release();
-        Ok(out)
+        self.recycle_staging(pair);
+        if let (Some(t0), Some(t1)) = (clock, flushed) {
+            transfer_clock_add(0, clock_ns(t0, t1), clock_ns(t1, std::time::Instant::now()));
+        }
+        Ok(())
     }
 
     /// Build a compute pipeline from SPIR-V with `storage_buffers` storage-buffer
     /// bindings (set 0, bindings 0..n) and `push_bytes` of push constants.
     pub fn kernel(&self, spirv: &[u8], storage_buffers: u32, push_bytes: u32) -> Result<Kernel> {
         self.kernel_with_subgroup(spirv, storage_buffers, push_bytes, None)
+    }
+
+    /// Whether a compute pipeline may require `size` invocations per subgroup:
+    /// subgroup size control is enabled, COMPUTE is among the
+    /// requiredSubgroupSizeStages, and `size` is a power of two in
+    /// [minSubgroupSize, maxSubgroupSize] (the valid-usage rules of
+    /// VkPipelineShaderStageRequiredSubgroupSizeCreateInfo).
+    pub fn can_require_subgroup_size(&self, size: u32) -> bool {
+        let (min, max) = self.subgroup_size_range;
+        self.subgroup_size_control
+            && self.required_subgroup_size_compute
+            && size.is_power_of_two()
+            && min <= size
+            && size <= max
     }
 
     /// As `kernel`, but the pipeline is created with a required subgroup size
@@ -2953,6 +4904,24 @@ impl Context {
                 "kernel requires a fixed subgroup size but the device has no subgroupSizeControl"
                     .into(),
             ));
+        }
+        if let Some(size) = required_subgroup_size {
+            // Refused, not passed through: a size outside the device's range is
+            // invalid usage that a driver need not reject. NVIDIA 580.173.02
+            // on an L4 (range [32, 32]) accepted 64, and the 64-lane matmul
+            // then returned wrong products with no error (2026-09-22).
+            if !self.can_require_subgroup_size(size) {
+                let (min, max) = self.subgroup_size_range;
+                return Err(AckError::Unsupported(format!(
+                    "kernel requires a subgroup size of {size}, which this device cannot guarantee \
+                     (range [{min}, {max}], compute stage {})",
+                    if self.required_subgroup_size_compute {
+                        "admitted"
+                    } else {
+                        "not admitted"
+                    }
+                )));
+            }
         }
         let words = ash::util::read_spv(&mut Cursor::new(spirv))
             .map_err(|e| AckError::Io(format!("{e}")))?;
@@ -3044,7 +5013,9 @@ impl Context {
             push_bytes: push_bytes.max(4),
             ctx_id: self.id,
             bound: RefCell::new(Vec::new()),
+            bound_kinds: RefCell::new(Vec::new()),
             pending: RefCell::new(Vec::new()),
+            reuse: Cell::new(None),
         })
     }
 
@@ -3072,6 +5043,7 @@ impl Context {
                 buffers.len()
             )));
         }
+        kernel.reuse.set(None);
         *kernel.pending.borrow_mut() = buffers
             .iter()
             .map(|b| {
@@ -3082,6 +5054,93 @@ impl Context {
             })
             .collect();
         *kernel.bound.borrow_mut() = buffers.iter().map(|b| b.id).collect();
+        // `bind` never writes `bound_kinds`; `check_dispatch` reads an empty
+        // (or short) `bound_kinds` as "every slot is a `Buffer`", which is
+        // `bind`'s only possible meaning and exactly its behaviour before R3.
+        // Clearing it here (rather than leaving a longer, stale vector from
+        // an earlier `bind_operand` call on the same kernel) keeps that
+        // reading correct after a kernel is rebound with plain `bind`.
+        kernel.bound_kinds.borrow_mut().clear();
+        Ok(())
+    }
+
+    /// Bind buffers OR staging areas (R3) to the kernel's storage bindings in
+    /// order: `Buffer::as_operand()` and `Staging::as_operand()` both produce
+    /// the `BufferRef` this takes. Same validation as `bind`, generalised
+    /// over `BufferRef` -- a tracked (`Buffer`-backed) operand is checked
+    /// exactly as `bind` checks its `&Buffer` slice (`AckError::Foreign`,
+    /// `AckError::Freed`); an untracked (`Staging`-backed) operand is
+    /// trusted, the same way `copy_from_staging`'s `src: &Staging` already is.
+    ///
+    /// WHY A NEW METHOD RATHER THAN A NEW OVERLOAD OF `bind` (deviation from
+    /// the spec's literal "`Context::bind` accepts a `Staging` wherever it
+    /// accepts a `Buffer`", which the spec's own comment leaves room for --
+    /// "or whatever the existing bind path takes"). `bind`'s signature,
+    /// `&[&Buffer]`, is called at roughly twenty sites across this crate
+    /// outside `src/lib.rs` and `src/ffi.rs` (kernels, probes, tests, the
+    /// torch backend) that this job may not touch. Widening `bind` itself to
+    /// take a trait-object or generic slice would compile at call sites that
+    /// build the slice as a literal argument (`&[a, b]`, which coerces
+    /// element-wise from the expected parameter type) but silently FAIL to
+    /// compile at any call site that first names the slice's type some other
+    /// way (`let xs = [a, b]; f(&xs)`, which infers `[&Buffer; N]` with no
+    /// coercion left to apply) -- and there was no way to audit which of the
+    /// twenty is which without editing files this job is scoped away from.
+    /// `bind_operand` is additive and carries zero risk to any of them:
+    /// `bind` keeps its exact signature and exact behaviour, unreached by
+    /// anything below.
+    ///
+    /// A kernel bound with `bind_operand` and later re-bound with plain
+    /// `bind` reverts to `bind`'s ordinary meaning (see `bind`'s own doc
+    /// comment on `bound_kinds`).
+    pub fn bind_operand(&self, kernel: &Kernel, operands: &[BufferRef]) -> Result<()> {
+        self.check_live()?;
+        self.check_kernel(kernel)?;
+        for o in operands {
+            if let Some((ctx_id, id)) = o.tracked {
+                if ctx_id != self.id {
+                    return Err(AckError::Foreign(format!(
+                        "buffer {id} belongs to context {ctx_id}, not context {}",
+                        self.id
+                    )));
+                }
+                if !self.live_buffers.borrow().contains(&id) {
+                    return Err(AckError::Freed(format!(
+                        "buffer {id} of context {} was destroyed",
+                        self.id
+                    )));
+                }
+            }
+        }
+        if operands.len() as u32 != kernel.storage_buffers {
+            return Err(AckError::Unsupported(format!(
+                "kernel expects {} buffers, got {}",
+                kernel.storage_buffers,
+                operands.len()
+            )));
+        }
+        kernel.reuse.set(None);
+        *kernel.pending.borrow_mut() = operands
+            .iter()
+            .map(|o| {
+                vk::DescriptorBufferInfo::default()
+                    .buffer(o.buffer)
+                    .offset(0)
+                    .range(o.bytes)
+            })
+            .collect();
+        // A `Staging` operand's slot gets the sentinel id 0 (`Context::buffer`
+        // ids start at 1, so this can never collide with a real one) --
+        // `bound_kinds` marks it so `check_dispatch` never looks 0 up in
+        // `live_buffers`. If a caller later records this kernel's dispatch on
+        // the batched `dispatch` path (rather than `dispatch_timed`), its
+        // `Access` declaration for that slot is `Access::read(0)` /
+        // `Access::write(0)`, matching the sentinel.
+        *kernel.bound.borrow_mut() = operands
+            .iter()
+            .map(|o| o.tracked.map(|(_, id)| id).unwrap_or(0))
+            .collect();
+        *kernel.bound_kinds.borrow_mut() = operands.iter().map(|o| o.tracked.is_none()).collect();
         Ok(())
     }
 
@@ -3107,6 +5166,12 @@ impl Context {
     }
 
     /// Sets of `kernel` handed out since the last flush.
+    /// Turn descriptor-set reuse on or off for this context (tests; the
+    /// default comes from `ACK_DESCRIPTOR_REUSE`).
+    pub fn set_descriptor_reuse(&self, on: bool) {
+        self.descriptor_reuse.set(on);
+    }
+
     pub fn descriptor_watermark(&self, kernel: &Kernel) -> u32 {
         if kernel.set_gen.get() != self.batch_gen.get() {
             return 0;
@@ -3157,7 +5222,20 @@ impl Context {
                 ));
             }
             let live = self.live_buffers.borrow();
-            if let Some(id) = bound.iter().find(|id| !live.contains(id)) {
+            // R3: `bound_kinds[i]` is `true` exactly for a slot `bind_operand`
+            // bound from a `Staging` (an untracked operand -- see
+            // `BufferRef::tracked`'s doc comment for why it has no liveness
+            // set of its own to check against). Every kernel bound only ever
+            // through plain `bind` has an empty `bound_kinds`, so
+            // `kinds.get(i)` is always `None` there and this loop is
+            // byte-for-byte the pre-R3 one: `!live.contains(id)`, same order,
+            // same message.
+            let kinds = kernel.bound_kinds.borrow();
+            if let Some((_, id)) = bound
+                .iter()
+                .enumerate()
+                .find(|&(i, id)| !kinds.get(i).copied().unwrap_or(false) && !live.contains(id))
+            {
                 return Err(AckError::Freed(format!(
                     "buffer {id} bound to the kernel was destroyed before dispatch"
                 )));
@@ -3223,23 +5301,45 @@ impl Context {
         }
         // the arena, with one flush and exactly one retry; a second failure is
         // an error, never a loop
-        let set = match self.acquire_set(kernel) {
-            Some(s) => s,
+        // a kernel whose bindings are unchanged since a set of THIS batch
+        // generation was written reuses that set: the write would be identical
+        let cached = match kernel.reuse.get() {
+            Some((generation, set))
+                if self.descriptor_reuse.get()
+                    && self.arena_enabled()
+                    && generation == self.batch_gen.get() =>
+            {
+                Some(set)
+            }
+            _ => None,
+        };
+        let set = match cached {
+            Some(set) => {
+                self.open_batch()?;
+                set
+            }
             None => {
-                self.flush(batch::FlushReason::DescriptorsExhausted)?;
-                match self.acquire_set(kernel) {
+                let set = match self.acquire_set(kernel) {
                     Some(s) => s,
                     None => {
-                        return Err(AckError::Unsupported(format!(
-                            "the kernel's descriptor arena of {} set(s) is exhausted after a flush",
-                            kernel.sets.len() / 2
-                        )))
+                        self.flush(batch::FlushReason::DescriptorsExhausted)?;
+                        match self.acquire_set(kernel) {
+                            Some(s) => s,
+                            None => {
+                                return Err(AckError::Unsupported(format!(
+                                    "the kernel's descriptor arena of {} set(s) is exhausted after a flush",
+                                    kernel.sets.len() / 2
+                                )))
+                            }
+                        }
                     }
-                }
+                };
+                self.open_batch()?;
+                self.write_set(kernel, set);
+                kernel.reuse.set(Some((self.batch_gen.get(), set)));
+                set
             }
         };
-        self.open_batch()?;
-        self.write_set(kernel, set);
         {
             let mut slot = self.recorder.borrow_mut();
             let rec = slot
@@ -3321,6 +5421,9 @@ impl Context {
                     + u64::from(repeats.saturating_sub(1)),
             );
             if self.ts_enabled.get() && rec.stamps > 0 {
+                // the item's tag, stamped or not: an item past the capacity
+                // is counted unresolved under its tag, not lost from it
+                rec.tags.push(self.disp_tag.get());
                 if rec.stamps < self.ts_capacity.get() {
                     unsafe {
                         self.device.cmd_write_timestamp(
@@ -3503,7 +5606,9 @@ impl Context {
             self.id
         );
         self.live_buffers.borrow_mut().remove(&b.id);
-        let allocated = b.bytes.next_multiple_of(4);
+        // the size the pair HAS (its class, if the pool was on when it was
+        // made), never one re-derived from `bytes`: see `Buffer::allocated`
+        let allocated = b.allocated;
         // `PoolMode::Immediate` is a SABOTAGE and this is where it applies: it
         // takes the pair back while a batch that may name it is still open and
         // unsubmitted. Nothing else in the function changes.
@@ -3701,31 +5806,62 @@ pub fn resolve_timestamps(
     Ok((delta & (period_ticks - 1)) as f64 * period_ns)
 }
 
-/// Completion intervals are accepted together. The host bound covers the
-/// whole submission; a possible extra counter wrap makes its entire span
-/// unresolved, even when every modulo interval happens to look small.
-fn summarize_dispatch_timestamps(
+/// A batch's completion intervals in nanoseconds, one per item: interval `i`
+/// runs from stamp `i` to stamp `i + 1`. They are accepted together. The host
+/// bound covers the whole submission; a possible extra counter wrap makes its
+/// entire span unresolved, even when every modulo interval happens to look
+/// small.
+fn dispatch_intervals(
     ticks: &[u64],
     valid_bits: u32,
     period_ns: f64,
     host_elapsed_ns: f64,
-) -> Result<(u64, u64, u64)> {
-    let mut sum = 0u64;
-    let mut min = u64::MAX;
-    let mut max = 0;
-    for interval in ticks.windows(2) {
-        let ns = resolve_timestamps(
-            interval[0],
-            interval[1],
-            valid_bits,
-            period_ns,
-            host_elapsed_ns,
-        )? as u64;
-        sum = sum.saturating_add(ns);
-        min = min.min(ns);
-        max = max.max(ns);
+) -> Result<Vec<u64>> {
+    ticks
+        .windows(2)
+        .map(|pair| {
+            resolve_timestamps(pair[0], pair[1], valid_bits, period_ns, host_elapsed_ns)
+                .map(|ns| ns as u64)
+        })
+        .collect()
+}
+
+/// The sum, shortest and longest of a batch's intervals (`u64::MAX` and 0 for
+/// none), as the instrument's totals fold them.
+fn summarize_intervals(intervals: &[u64]) -> (u64, u64, u64) {
+    intervals
+        .iter()
+        .fold((0u64, u64::MAX, 0u64), |(sum, min, max), &ns| {
+            (sum.saturating_add(ns), min.min(ns), max.max(ns))
+        })
+}
+
+/// `Context::tags_pending` on the rows alone: one unresolved item per tag
+/// occurrence.
+fn tag_rows_pending(rows: &mut BTreeMap<u32, DispatchTagTime>, tags: &[u32]) {
+    for &tag in tags {
+        rows.entry(tag)
+            .or_insert(DispatchTagTime {
+                tag,
+                ..DispatchTagTime::default()
+            })
+            .unresolved_items += 1;
     }
-    Ok((sum, min, max))
+}
+
+/// `Context::tags_resolved` on the rows alone: interval `i` is charged to
+/// `tags[i]` and leaves its unresolved count.
+fn tag_rows_resolved(rows: &mut BTreeMap<u32, DispatchTagTime>, tags: &[u32], intervals: &[u64]) {
+    for (&tag, &ns) in tags.iter().zip(intervals) {
+        let row = rows.entry(tag).or_insert(DispatchTagTime {
+            tag,
+            ..DispatchTagTime::default()
+        });
+        row.unresolved_items = row.unresolved_items.saturating_sub(1);
+        row.items += 1;
+        row.device_ns = row.device_ns.saturating_add(ns);
+        row.max_item_ns = row.max_item_ns.max(ns);
+    }
 }
 
 /// The objects a kernel build has created so far; dropping it destroys them
@@ -3796,6 +5932,13 @@ impl Drop for Context {
         // first (it covers work that WAS submitted), then the abandon frees
         // the batch's fence, command buffer and retired buffers, so nothing of
         // it outlives the pool.
+        //
+        // A signal armed for a submission that never came would leave a queue
+        // that waits on it (the streaming pipeline's transfer queue) waiting
+        // forever, and the idle below with it: signal those values from the
+        // host first.
+        let armed = std::mem::take(&mut *self.pending_signals.borrow_mut());
+        self.release_signals(&armed);
         unsafe {
             let _ = self.device.device_wait_idle();
         }
@@ -3805,6 +5948,11 @@ impl Drop for Context {
         // validation layer reports them at `vkDestroyDevice` under the
         // signature this crate assigns to a caller contract violation
         self.clear_pool();
+        // and the fence pool's fences and the staging pool's pairs, for the
+        // same reason (the abandon above releases the batch it may have been
+        // holding, so this is the last)
+        self.drain_fence_pool();
+        self.drain_staging_pool();
         // the instrument's query pool, if it was ever created: after the idle
         // above, so no submitted batch can still be writing into it
         let qp = self.ts_pool.get();
@@ -3812,7 +5960,21 @@ impl Drop for Context {
             self.vk_destroy_query_pool(qp);
             self.ts_pool.set(vk::QueryPool::null());
         }
+        // R1/R2: any async transfer command buffer this context has not yet
+        // reaped. The `device_wait_idle` above is the same `VkDevice` and
+        // therefore covers the transfer queue too, so every one of these has
+        // completed and freeing it here is safe; `vk_free_transfer_command_buffer`
+        // keeps `live_objects()` consistent (it is what tracked them as live).
+        for (_, cb) in self.pending_transfer_cbs.borrow_mut().drain(..) {
+            self.vk_free_transfer_command_buffer(cb);
+        }
         unsafe {
+            if let Some(sem) = self.timeline {
+                self.device.destroy_semaphore(sem, None);
+            }
+            if let Some(pool) = self.transfer_command_pool {
+                self.device.destroy_command_pool(pool, None);
+            }
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
@@ -3875,11 +6037,59 @@ pub struct DispatchStats {
     pub timestamps_enabled: bool,
 }
 
+/// One dispatch tag's share of the timestamp instrument, read through
+/// `Context::dispatch_tag_times` and the C entry `ack_dispatch_tag_times`
+/// (2026-10-03).
+///
+/// WHY IT EXISTS. `DispatchStats::device_ns` says how long the device spent
+/// on a step's items, and not on WHICH work. On 2026-10-02 a training step on
+/// the RX 9070 XT was about 0.57 s of device time in a 0.62-0.66 s step, so
+/// the next lever is kernel time, and choosing it needs that time split by
+/// the operation that issued it. Splitting it before meant running every item
+/// eagerly, one item per batch (`ACK_MAX_RECORDED_ITEMS=1`) and reading this
+/// instrument around each operation, which is not the batching a real step
+/// runs. A tag splits the batched span itself.
+///
+/// The rows partition the instrument: summed over tags, `items` is
+/// `DispatchStats::timed_items` and `device_ns` is `DispatchStats::device_ns`.
+/// An interval is what `device_ns` sums (see `Context::dispatch_tag_times`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DispatchTagTime {
+    /// The caller's tag; 0 holds the items recorded with no tag set.
+    pub tag: u32,
+    /// Items recorded under this tag whose completion interval was read back.
+    pub items: u64,
+    /// Those intervals summed, in nanoseconds.
+    pub device_ns: u64,
+    /// The longest of them.
+    pub max_item_ns: u64,
+    /// Items recorded under this tag with the timestamps on whose interval was
+    /// NOT read: their batch overflowed the query pool, failed, or had an
+    /// ambiguous wrap. Nonzero means `device_ns` covers less than the tag's work.
+    pub unresolved_items: u64,
+}
+
+/// The staging pool's counters (`Context::staging_pool_stats`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StagingPoolStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub returns: u64,
+    pub declined: u64,
+    /// Pooled pairs destroyed to make room for a SMALLER one (see
+    /// `recycle_staging`).
+    pub evicted: u64,
+    pub held_pairs: i64,
+    pub held_bytes: u64,
+}
+
 /// What the buffer pool has done, read through `Context::pool_stats`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PoolStats {
     /// `Context::buffer` calls served without a Vulkan allocation.
     pub hits: u64,
+    /// Of `hits`, those served by a pair of a LARGER class (`pool_pick`).
+    pub hits_larger: u64,
     /// `Context::buffer` calls that allocated.
     pub misses: u64,
     /// Freed pairs the pool took back.
@@ -3897,11 +6107,71 @@ pub struct PoolStats {
     pub held_bytes: u64,
 }
 
+/// R2: a copy `Context::copy_from_staging_async` recorded on the transfer
+/// queue (or, on a device with no transfer queue or no timeline semaphore,
+/// ran synchronously on the compute queue before returning). Opaque outside
+/// this crate; the only public thing to do with one is name it to
+/// `Context::await_transfer` or `Context::wait_transfer`, or read its raw
+/// timeline value for the C ABI's ticket-as-`u64` convention (R4).
+#[derive(Debug, Clone, Copy)]
+pub struct TransferTicket {
+    value: u64,
+}
+
+impl TransferTicket {
+    /// This ticket's timeline value. On a context with no timeline semaphore
+    /// this is `0` and means nothing on its own -- `await_transfer` and
+    /// `wait_transfer` never compare it to the (nonexistent) timeline on such
+    /// a context. The C ABI (R4) hands this back as the ticket's `u64` and
+    /// reconstructs a `TransferTicket` from it the same way.
+    pub fn value(&self) -> u64 {
+        self.value
+    }
+
+    /// Rebuild a ticket from a raw value, for the C ABI's ticket-as-`u64`
+    /// convention (R4): `ack_copy_from_staging_async` hands the caller
+    /// `value()`, and `ack_await_transfer`/`ack_wait_transfer` rebuild a
+    /// `TransferTicket` from it with this to call the safe API underneath.
+    pub(crate) fn from_raw(value: u64) -> Self {
+        Self { value }
+    }
+}
+
+/// One kernel operand `Context::bind_operand` (R3) can bind: everything
+/// `bind`'s own validation and descriptor write need, common to a `Buffer`
+/// and to a `Staging` bound directly. Built by `Buffer::as_operand` or
+/// `Staging::as_operand`; opaque otherwise.
+///
+/// `bind` ITSELF IS UNCHANGED -- see `Context::bind_operand`'s doc comment
+/// for why binding a `Staging` is a new method rather than a new overload of
+/// `bind`, and for the deviation that choice is from the spec's literal
+/// wording.
+#[derive(Clone, Copy)]
+pub struct BufferRef {
+    buffer: vk::Buffer,
+    bytes: u64,
+    /// `Some((ctx_id, id))` for a `Buffer` operand: checked exactly as `bind`
+    /// checks its `&Buffer` slice (`AckError::Foreign`, `AckError::Freed`).
+    /// `None` for a `Staging` operand -- `Staging` has never been tracked by
+    /// the ownership contract (`copy_from_staging`'s `src: &Staging` is
+    /// trusted the same way, with no Foreign or Freed check of its own), and
+    /// `bind_operand` extends that existing precedent rather than inventing
+    /// liveness tracking `Staging` has never had.
+    tracked: Option<(u64, u64)>,
+}
+
 /// A device-local storage buffer; it knows which context made it.
 pub struct Buffer {
     pub buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     pub bytes: u64,
+    /// The size `raw_buffer` created the `VkBuffer` with: `bytes` rounded up
+    /// to a whole word and, with the pool on, to its size class
+    /// (`pool_class`). Carried rather than re-derived from `bytes` at the free,
+    /// because the class depends on whether the pool was on at the ALLOCATION,
+    /// and the pool keys on this: a pair filed under a larger size than it has
+    /// would serve a request its memory cannot hold.
+    allocated: u64,
     ctx_id: u64,
     id: u64,
 }
@@ -3912,10 +6182,159 @@ impl Buffer {
         self.ctx_id
     }
 
+    /// The bytes of device memory behind this buffer: `bytes` rounded up to a
+    /// whole word and, with the buffer pool on, to its size class. Descriptors
+    /// still bind `bytes`, so no shader sees the difference.
+    pub fn allocated_bytes(&self) -> u64 {
+        self.allocated
+    }
+
     /// This buffer's id within its context (the C ABI's sequence number is
     /// separate; this one is the safe runtime's).
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// This buffer as a kernel operand, for `Context::bind_operand`'s mixed
+    /// slots (R3) -- a plain `Buffer`-only kernel still uses `bind`, which is
+    /// unchanged and does not need this.
+    pub fn as_operand(&self) -> BufferRef {
+        BufferRef {
+            buffer: self.buffer,
+            bytes: self.bytes,
+            tracked: Some((self.ctx_id, self.id)),
+        }
+    }
+}
+
+/// Which memory a `Context::staging` area is allocated from. All three are
+/// `HOST_COHERENT`; what differs is whether a CPU write, a CPU read, or a
+/// device dispatch is the fast side, and whether the device exposes the type
+/// at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagingKind {
+    /// `HOST_VISIBLE | HOST_COHERENT`: the type `upload` itself uses for its
+    /// own, per-call staging buffer. Every Vulkan implementation has one.
+    HostCoherent,
+    /// `HOST_VISIBLE | HOST_COHERENT | HOST_CACHED`: a CPU read from this
+    /// mapping goes through cache, the way `download`'s readback staging
+    /// prefers (`readback_memory_preferences`). A CPU *write* does not need
+    /// this, but a caller that will also read back what it just staged, or
+    /// hand the mapping to an unbuffered file read, benefits from it.
+    HostCached,
+    /// `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT`: the resizable-BAR type
+    /// this driver exposes on the device heap itself, so a CPU write (or an
+    /// unbuffered file read) lands directly in VRAM with no separate
+    /// device-local copy needed afterward. Not every device exposes it.
+    DeviceLocalHostVisible,
+}
+
+/// A persistent, mapped staging area: memory the caller lands bytes into
+/// once and reuses, rather than the fresh staging buffer `upload` allocates,
+/// maps and frees on every call. See `Context::staging`.
+///
+/// NOT POOLED, AND NOT A CHANGE TO `upload`: a `Staging` is created by
+/// `Context::staging` or `Context::readback_area` and destroyed by
+/// `Context::destroy_staging`, and nothing in this file hands one out of a
+/// pool. A recorded copy may name one (`record_copies_from_staging`,
+/// `record_readback`), but nothing retires one into a batch. The caller owns
+/// its lifetime and keeps it alive until every batch that copies it has
+/// completed.
+pub struct Staging {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    ptr: *mut u8,
+    bytes: u64,
+    kind: StagingKind,
+    /// A transfer destination too (`Context::readback_area`).
+    readback: bool,
+}
+
+/// One region of `Context::record_copies_from_staging`: `bytes` from the
+/// area at `staging_offset` into `dst` at `dst_offset`.
+#[derive(Clone, Copy)]
+pub struct StagingCopy<'a> {
+    pub staging_offset: u64,
+    pub dst: &'a Buffer,
+    pub dst_offset: u64,
+    pub bytes: u64,
+}
+
+/// One region of `Context::record_buffer_copies`: `bytes` from `src` at
+/// `src_offset` into `dst` at `dst_offset`.
+#[derive(Clone, Copy)]
+pub struct BufferCopy<'a> {
+    pub src: &'a Buffer,
+    pub src_offset: u64,
+    pub dst: &'a Buffer,
+    pub dst_offset: u64,
+    pub bytes: u64,
+}
+
+// R4: `ptr` is a raw pointer, so `Staging` is not auto-`Send` -- and the C
+// ABI's `Inner` (src/ffi.rs) now holds a `HashMap<u32, Staging>` behind the
+// same per-device `Mutex` that already guards its `Context` and its
+// `HashMap<u32, Buffer>`, which requires `Inner: Send` for `Mutex<Inner>` to
+// be `Sync`. This is sound for the same reason `Vec<T>`'s or `Box<T>`'s own
+// raw pointer does not stop THEM being `Send`: a `Send` bound is about moving
+// exclusive ownership across a thread boundary, not about concurrent shared
+// access (that is `Sync`, deliberately not implemented here), and Rust's
+// ownership rules mean at most one thread ever holds a given `Staging` at a
+// time. `ptr` points into Vulkan-mapped, `HOST_COHERENT` memory that is valid
+// for as long as the `Staging` exists on whichever thread currently owns it;
+// nothing about crossing threads changes that.
+unsafe impl Send for Staging {}
+
+impl Staging {
+    /// The mapping's size in bytes, as given to `Context::staging`.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Which memory this area was allocated from.
+    pub fn kind(&self) -> StagingKind {
+        self.kind
+    }
+
+    /// The whole mapping, writable. Every kind `Context::staging` produces is
+    /// `HOST_COHERENT`, so a write here needs no flush before
+    /// `Context::copy_from_staging` reads it.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.bytes as usize) }
+    }
+
+    /// The whole mapping, for reading. A `readback_area` holds what
+    /// `Context::record_readback` copied once the batch that carried the copy
+    /// has completed. The memory is `HOST_COHERENT`, so no invalidate is needed.
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.bytes as usize) }
+    }
+
+    /// Whether `Context::record_readback` may copy into this area.
+    pub fn is_readback(&self) -> bool {
+        self.readback
+    }
+
+    /// The whole mapping's address, for a caller that needs the raw pointer
+    /// rather than a slice -- an unbuffered file read
+    /// (`FILE_FLAG_NO_BUFFERING`) landing straight into it, for one.
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    /// This staging area as a kernel operand (R3): `Context::staging` now
+    /// allocates `STORAGE_BUFFER | TRANSFER_SRC`, so the mapped area's
+    /// `vk::Buffer` is a legal descriptor target, and a caller with the
+    /// `DeviceLocalHostVisible` kind can bind the mapping itself and dispatch
+    /// against it with no `copy_from_staging` in between at all. Pass the
+    /// result to `Context::bind_operand` wherever `bind` would otherwise take
+    /// a `&Buffer`.
+    pub fn as_operand(&self) -> BufferRef {
+        BufferRef {
+            buffer: self.buffer,
+            bytes: self.bytes,
+            tracked: None,
+        }
     }
 }
 
@@ -3944,10 +6363,22 @@ pub struct Kernel {
     push_bytes: u32,
     ctx_id: u64,
     bound: RefCell<Vec<u64>>,
+    /// R3: which of `bound`'s ids came from a `Staging` bound directly through
+    /// `Context::bind_operand`, rather than a `Buffer` bound through either
+    /// method -- `true` at index i means `check_dispatch` must not look
+    /// `bound[i]` up in `Context::live_buffers` (an untracked operand; see
+    /// `BufferRef::tracked`). Left empty by `bind` (and cleared by it, if a
+    /// kernel was previously bound through `bind_operand`), which is why
+    /// `bind` needed no change: an empty or short `bound_kinds` reads as
+    /// "every slot is a `Buffer`", `bind`'s only possible meaning.
+    bound_kinds: RefCell<Vec<bool>>,
     /// What `bind` recorded: the descriptor writes a dispatch applies to the
     /// set it takes. `bind` makes no Vulkan call, so the write happens at the
     /// dispatch, against that dispatch's own set.
     pending: RefCell<Vec<vk::DescriptorBufferInfo>>,
+    /// The batch generation and set `pending` was last written into; cleared
+    /// by every `bind`/`bind_operand`, so a hit always holds the current bindings.
+    reuse: Cell<Option<(u64, vk::DescriptorSet)>>,
 }
 
 impl Kernel {
@@ -3982,18 +6413,141 @@ pub fn bf16_to_f32(h: u16) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use super::{pool_class, POOL_CLASSES_PER_OCTAVE, POOL_CLASS_FLOOR};
+
+    #[test]
+    fn a_pool_class_holds_its_request_within_an_eighth_and_is_monotonic() {
+        assert!(POOL_CLASSES_PER_OCTAVE.is_power_of_two());
+        let limit = u64::MAX;
+        // exact at and below the floor: the word-rounded request itself
+        for a in [4, 4096, 8192, POOL_CLASS_FLOOR - 4, POOL_CLASS_FLOOR] {
+            assert_eq!(pool_class(a, limit), a, "{a}");
+        }
+        // above it: never smaller, a multiple of 4, under 1/8 larger, and
+        // never smaller than the class of any smaller request
+        let mut previous = pool_class(POOL_CLASS_FLOOR, limit);
+        let mut a = POOL_CLASS_FLOOR + 4;
+        while a < (1u64 << 34) {
+            let c = pool_class(a, limit);
+            assert!(c >= a, "{a} -> {c}");
+            assert_eq!(c % 4, 0, "{a} -> {c}");
+            assert!(
+                (c - a) * POOL_CLASSES_PER_OCTAVE < a,
+                "{a} -> {c}: more than 1/8"
+            );
+            assert!(c >= previous, "{a} -> {c} after {previous}");
+            previous = c;
+            // every size near an octave edge and a spread of sizes between
+            a = if a < POOL_CLASS_FLOOR * 4 {
+                a + 4
+            } else {
+                a + a / 997 + 4
+            };
+        }
+        // the classes of one octave, 64 KiB..128 KiB: 8 KiB steps
+        assert_eq!(pool_class(POOL_CLASS_FLOOR + 4, limit), 72 * 1024);
+        assert_eq!(pool_class(1_000_000, limit), 1_048_576);
+        assert_eq!(pool_class(1_040_000, limit), 1_048_576);
+        assert_eq!(pool_class(1_048_580, limit), 1_179_648);
+    }
+
+    #[test]
+    fn a_pool_class_never_crosses_the_device_limit() {
+        // a request the device can hold is served at its own size rather than
+        // refused because its class would not fit
+        let limit = 1_000_000;
+        assert_eq!(pool_class(999_996, limit), 999_996);
+        assert_eq!(pool_class(900_000, limit), 917_504);
+    }
+
+    #[test]
+    fn a_request_takes_its_own_class_first_then_the_smallest_larger_within_the_ratio() {
+        use super::{pool_pick, POOL_REUSE_RATIO};
+        use std::collections::BTreeMap;
+        assert_eq!(POOL_REUSE_RATIO, 2);
+        let mib = 1u64 << 20;
+        let pool: BTreeMap<u64, ()> = [mib, 3 * mib / 2, 3 * mib, 48 * 1024]
+            .into_iter()
+            .map(|k| (k, ()))
+            .collect();
+        // its own class, whenever the pool holds one
+        assert_eq!(pool_pick(&pool, mib, true), Some(mib));
+        assert_eq!(pool_pick(&pool, 3 * mib, false), Some(3 * mib));
+        // else the SMALLEST larger class, the ratio included
+        assert_eq!(pool_pick(&pool, 5 * mib / 4, true), Some(3 * mib / 2));
+        assert_eq!(pool_pick(&pool, mib / 2, true), Some(mib));
+        assert_eq!(pool_pick(&pool, 3 * mib / 4, true), Some(mib));
+        // never beyond the ratio, never a smaller class, never with reuse off
+        assert_eq!(pool_pick(&pool, 3 * mib / 8, true), None);
+        assert_eq!(pool_pick(&pool, 4 * mib, true), None);
+        assert_eq!(pool_pick(&pool, 3 * mib / 4, false), None);
+        // at or below the floor the key stays exact
+        assert_eq!(pool_pick(&pool, 32 * 1024, true), None);
+        assert_eq!(pool_pick(&pool, 48 * 1024, true), Some(48 * 1024));
+        assert_eq!(pool_pick(&BTreeMap::<u64, ()>::new(), mib, true), None);
+    }
+
     #[test]
     fn dispatch_timing_resolves_one_wrap_but_refuses_an_ambiguous_batch() {
         // An 8-bit clock at 2 ns/tick: these completion stamps cross zero.
+        let intervals = super::dispatch_intervals(&[250, 3, 10], 8, 2.0, 100.0).unwrap();
         assert_eq!(
-            super::summarize_dispatch_timestamps(&[250, 3, 10], 8, 2.0, 100.0).unwrap(),
-            (32, 14, 18)
+            intervals,
+            vec![18, 14],
+            "one interval per item, in item order"
         );
+        assert_eq!(super::summarize_intervals(&intervals), (32, 14, 18));
         // Identical stamps cannot reveal an additional period of execution.
         assert!(matches!(
-            super::summarize_dispatch_timestamps(&[250, 3, 10], 8, 2.0, 512.0),
+            super::dispatch_intervals(&[250, 3, 10], 8, 2.0, 512.0),
             Err(super::AckError::AmbiguousTiming(_))
         ));
+        // a batch of no item has no interval and folds to the instrument's
+        // "nothing timed" sentinel
+        assert_eq!(super::summarize_intervals(&[]), (0, u64::MAX, 0));
+    }
+
+    #[test]
+    fn each_interval_is_charged_to_its_own_items_tag_and_the_rows_partition_the_sum() {
+        use super::{tag_rows_pending, tag_rows_resolved, DispatchTagTime};
+        use std::collections::BTreeMap;
+        let mut rows = BTreeMap::new();
+        // a batch of five items: two tagged 7, one 3, one untagged, one 7
+        let tags = [7u32, 7, 3, 0, 7];
+        let intervals = [10u64, 25, 4, 6, 40];
+        tag_rows_pending(&mut rows, &tags);
+        assert_eq!(
+            rows[&7].unresolved_items, 3,
+            "every tagged item starts unresolved"
+        );
+        tag_rows_resolved(&mut rows, &tags, &intervals);
+        assert_eq!(
+            rows[&7],
+            DispatchTagTime {
+                tag: 7,
+                items: 3,
+                device_ns: 75,
+                max_item_ns: 40,
+                unresolved_items: 0
+            },
+            "the 1st, 2nd and 5th intervals, not the first three"
+        );
+        assert_eq!(rows[&3].device_ns, 4);
+        assert_eq!(
+            rows[&0].device_ns, 6,
+            "untagged work keeps its own row, tag 0"
+        );
+        let total: u64 = rows.values().map(|r| r.device_ns).sum();
+        assert_eq!(
+            total,
+            super::summarize_intervals(&intervals).0,
+            "the rows partition the batch's span"
+        );
+        // a second batch that never resolves (its readback failed): its items
+        // stay visible as unresolved, and the read rows do not move
+        tag_rows_pending(&mut rows, &[3, 3]);
+        assert_eq!(rows[&3].unresolved_items, 2);
+        assert_eq!((rows[&3].items, rows[&3].device_ns), (1, 4));
     }
 
     #[test]

@@ -7,10 +7,12 @@
 //! as does a two-pass sum and mean through a partials buffer. The host-only
 //! checks need no device; the operations need one and print UNMEASURED
 //! without it unless ACK_REQUIRE_DEVICE is set. Fixed-fixture evidence only.
+//! Schema 4 (2026-09-29) adds the float64 sum, held BIT FOR BIT to a host
+//! emulation of v1's fixed order in binary64, one pass and two.
 use alelyon_compute_kit::ffi;
 use alelyon_compute_kit::reduce_ops::{
-    Finish, ReduceKernel, ReduceOp, ReducePlan, ReduceView, CHUNK, FLAG_IN_BF16, FLAG_OUT_BF16,
-    MAX_RANK, PUSH_BYTES, REQUEST_BYTES,
+    Finish, ReduceKernel, ReduceOp, ReducePlan, ReduceView, CHUNK, FLAG_F64, FLAG_IN_BF16,
+    FLAG_OUT_BF16, MAX_RANK, PUSH_BYTES, REQUEST_BYTES,
 };
 use std::ffi::{c_char, CStr};
 
@@ -123,7 +125,7 @@ fn a_null_short_or_malformed_request_is_refused_before_any_device_lookup() {
     );
     let good = request(ReduceOp::Sum, Finish::None, &[4], &[1], 0, 1, 1.0);
     for (word, value, name) in [
-        (0usize, 3u32, "reduce-operation-out-of-range"),
+        (0usize, 4u32, "reduce-operation-out-of-range"), // 3 is AbsMax since 2026-09-27
         (1, 3, "reduce-finish-out-of-range"),
         (2, 7, "reduce-rank-out-of-range"),
         (17, 1, "reduce-reserved-word-nonzero"),
@@ -342,8 +344,11 @@ fn the_four_operations_and_a_two_pass_plan_match_the_reference_and_refusals_are_
         want[0]
     );
 
-    // 5. a two-pass sum and mean: [3, 70,000] over the second dimension needs
-    //    two splits of 65,536, so a partials buffer of 3 x 2 elements
+    // 5. a two-pass sum and mean: [3, 70,000] over the second dimension is
+    //    two passes (since 2026-09-26 a contiguous span of 70,000 splits into
+    //    35 chunks of 2,048 on reduce-f32/v3, so 3 x 35 partials). The caller's
+    //    6-element partials buffer is the one CHUNK's law (65,536) asked for;
+    //    it is now too small, and the kit allocates its own for the call.
     let wide = [3u32, 70_000];
     let wide_stride = [70_000u32, 1];
     let m = 210_000usize;
@@ -364,7 +369,8 @@ fn the_four_operations_and_a_two_pass_plan_match_the_reference_and_refusals_are_
         1.0,
         m as u64,
     );
-    assert_eq!(two.splits(), 2, "the fixture needs two passes");
+    assert!(two.second().is_some(), "the fixture needs two passes");
+    assert_eq!(two.splits(), 35, "70,000 in chunks of 2,048");
     let want = two.reference(&y).unwrap();
     let scale_abs = sum_abs(&wide, &wide_stride, 0, 0b10, &y);
     poison(b3, 3);
@@ -414,24 +420,35 @@ fn the_four_operations_and_a_two_pass_plan_match_the_reference_and_refusals_are_
         .collect();
     assert_within("two-pass mean", &download(b3, 3), &want, &scaled);
 
+    // Since 2026-09-26 a two-pass plan without a partials buffer, or with one
+    // smaller than its split law asks, is not refused: the kit allocates its own
+    // scratch for the call and retires it. The result is the same, and the
+    // caller's short buffer is never written (it stays poisoned).
+    poison(b3, 3);
+    let rc = unsafe { ffi::ack_reduce(dev, by, none, b3, block.as_ptr(), block.len(), &mut ms) };
+    assert_eq!(rc, ffi::ACK_OK, "{}", last_error());
+    assert_within(
+        "two-pass mean, the kit's scratch",
+        &download(b3, 3),
+        &want,
+        &scaled,
+    );
+    poison(b3, 3);
+    poison(b5, 5);
+    let rc = unsafe { ffi::ack_reduce(dev, by, b5, b3, block.as_ptr(), block.len(), &mut ms) };
+    assert_eq!(rc, ffi::ACK_OK, "{}", last_error());
+    assert_within(
+        "two-pass mean, a short caller scratch",
+        &download(b3, 3),
+        &want,
+        &scaled,
+    );
+    assert!(
+        download(b5, 5).iter().all(|v| v.is_nan()),
+        "a caller scratch too small for the plan is not written"
+    );
     // refusals by name, nothing dispatched: the previous results survive each one
     let before = download(b3, 3);
-    // a two-pass plan without a partials buffer
-    let rc = unsafe { ffi::ack_reduce(dev, by, none, b3, block.as_ptr(), block.len(), &mut ms) };
-    assert_eq!(rc, ffi::ACK_ERR_NULL, "{}", last_error());
-    assert!(
-        last_error().contains("needs a partials buffer"),
-        "{}",
-        last_error()
-    );
-    // a partials buffer too small for the six partials (a 5-element buffer)
-    let rc = unsafe { ffi::ack_reduce(dev, by, b5, b3, block.as_ptr(), block.len(), &mut ms) };
-    assert_eq!(rc, ffi::ACK_ERR_SIZE, "{}", last_error());
-    assert!(
-        last_error().contains("reduce-partials-too-small"),
-        "{}",
-        last_error()
-    );
     // an output buffer too small for the kept count (the [3,5,7] sum over dim 2 into 3 elements)
     let sum_block = request(ReduceOp::Sum, Finish::None, &shape, &stride, 0, 0b100, 1.0);
     let rc = unsafe {
@@ -625,7 +642,10 @@ fn the_reductions_the_registered_pass_issues_run_on_v2_and_match_the_reference()
         assert_eq!(rc, ffi::ACK_OK, "{}", last_error());
         out
     };
-    // (name, shape, stride, capacity, mask, the kernel the plan must select)
+    // (name, shape, stride, capacity, mask, the kernel the plan must select
+    // for its first pass, whether the plan is two passes). Since 2026-09-26 the
+    // leading-dims gamma sum splits its 1,024 rows for occupancy and hands its
+    // partials to a v3 second pass; the kit supplies that scratch itself.
     type Spec = (
         &'static str,
         &'static [u32],
@@ -633,6 +653,7 @@ fn the_reductions_the_registered_pass_issues_run_on_v2_and_match_the_reference()
         usize,
         u32,
         ReduceKernel,
+        bool,
     );
     let specs: [Spec; 5] = [
         (
@@ -642,6 +663,7 @@ fn the_reductions_the_registered_pass_issues_run_on_v2_and_match_the_reference()
             524_288,
             0b011,
             ReduceKernel::V2,
+            true,
         ),
         (
             "GQA repeat dim of [1, 4, 2, 1024, 64]",
@@ -650,6 +672,7 @@ fn the_reductions_the_registered_pass_issues_run_on_v2_and_match_the_reference()
             524_288,
             0b00100,
             ReduceKernel::V2,
+            false,
         ),
         (
             "GQA repeat dim of a transposed [1, 4, 2, 1024, 48]",
@@ -658,6 +681,7 @@ fn the_reductions_the_registered_pass_issues_run_on_v2_and_match_the_reference()
             393_216,
             0b00100,
             ReduceKernel::V2,
+            false,
         ),
         (
             "the probe's repeat extent of 3",
@@ -666,19 +690,21 @@ fn the_reductions_the_registered_pass_issues_run_on_v2_and_match_the_reference()
             98_304,
             0b00100,
             ReduceKernel::V2,
+            false,
         ),
         (
-            "leading dims keeping 48 columns stays on v1",
+            "leading dims keeping 48 columns stays on v1, split for occupancy",
             &[1, 1024, 8, 48],
             &[393_216, 48, 49_152, 1],
             393_216,
             0b0111,
             ReduceKernel::V1,
+            true,
         ),
     ];
     let mut ms = 0f64;
     let none = std::ptr::null();
-    for (name, shape, stride, capacity, mask, expected_kernel) in specs {
+    for (name, shape, stride, capacity, mask, expected_kernel, two_pass) in specs {
         let x: Vec<f32> = (0..capacity)
             .map(|i| ((i.wrapping_mul(7919) % 97) as f32) / 13.0 - 3.5)
             .collect();
@@ -697,7 +723,18 @@ fn the_reductions_the_registered_pass_issues_run_on_v2_and_match_the_reference()
             expected_kernel,
             "{name}: the plan's kernel"
         );
-        assert!(p.second().is_none(), "{name}: one pass");
+        assert_eq!(
+            p.second().is_some(),
+            two_pass,
+            "{name}: the number of passes"
+        );
+        if let Some(second) = p.second() {
+            assert_eq!(
+                second.kernel(),
+                ReduceKernel::V3,
+                "{name}: partials as rows"
+            );
+        }
         let kept = p.output_len();
         // the output buffer carries two extra poisoned elements past the kept
         // count, so a kernel writing past its output is caught
@@ -968,6 +1005,469 @@ fn bf16_storage_matches_the_f32_path_bitwise_in_every_combination() {
                 last_error()
             );
         }
+    }
+    assert_eq!(ffi::ack_close(dev), ffi::ACK_OK, "{}", last_error());
+}
+
+/// `ReduceOp::AbsMax` (2026-09-27): `linalg_vector_norm` with `ord=inf`, the
+/// quantiser's max-abs, which the stage-E step on the kit sent to the host 182
+/// times a step. Every output must be the exact largest |x| of its reduced
+/// range: bitwise the plan's FP64 reference, sign bit clear, and the magnitude
+/// of some input. A NaN anywhere in the range propagates. The cases cover
+/// every first-pass kernel the plan can pick (v1, v2, v3) and two-pass plans,
+/// and the test asserts that coverage rather than assuming it. The values
+/// plant a negative extreme, -inf, NaN, rows of negative subnormals (which a
+/// float abs may flush to zero) and rows of signed zeros (whose largest
+/// magnitude is +0).
+#[test]
+fn abs_max_is_the_exact_largest_magnitude_on_every_kernel_and_propagates_nan() {
+    let dev = ffi::ack_open();
+    if dev.is_null() {
+        if std::env::var_os("ACK_REQUIRE_DEVICE").is_some() {
+            panic!(
+                "reduce AbsMax: ACK_REQUIRE_DEVICE is set and ack_open failed: {}",
+                last_error()
+            );
+        }
+        eprintln!("UNMEASURED here (reduce AbsMax): {}", last_error());
+        return;
+    }
+    type Case = (&'static str, Vec<u32>, Vec<u32>, u32);
+    let cases: Vec<Case> = vec![
+        (
+            "a whole vector (the quantiser's scale)",
+            vec![2048],
+            vec![1],
+            0b1,
+        ),
+        (
+            "rows of a [128, 2048] router (dim -1)",
+            vec![128, 2048],
+            vec![2048, 1],
+            0b10,
+        ),
+        (
+            "the middle dim of [3, 5, 7]",
+            vec![3, 5, 7],
+            vec![35, 7, 1],
+            0b010,
+        ),
+        (
+            "leading dims of [1, 1024, 512]",
+            vec![1, 1024, 512],
+            vec![524_288, 512, 1],
+            0b011,
+        ),
+        (
+            "leading dims keeping 48 columns",
+            vec![1, 1024, 8, 48],
+            vec![393_216, 48, 49_152, 1],
+            0b0111,
+        ),
+        (
+            "rows of [2, 70000], two passes",
+            vec![2, 70_000],
+            vec![70_000, 1],
+            0b10,
+        ),
+        (
+            "rows of subnormals and signed zeros",
+            vec![4, 64],
+            vec![64, 1],
+            0b10,
+        ),
+    ];
+    let mut kernels_seen = std::collections::BTreeSet::new();
+    let mut two_pass_seen = false;
+    for (name, shape, stride, mask) in &cases {
+        let view = ReduceView::new(shape, stride, 0).unwrap();
+        let n = view.last_address() as usize + 1;
+        let mut x: Vec<f32> = (0..n)
+            .map(|i| ((i * 7919 + 13) % 997) as f32 / 125.0 - 3.99)
+            .collect();
+        if name.starts_with("rows of subnormals") {
+            for (i, v) in x.iter_mut().enumerate() {
+                let row = i / 64;
+                let k = (i % 64) as u32 + 1;
+                *v = match row {
+                    0 => -f32::from_bits(k * 1009), // negative subnormals only
+                    1 => {
+                        if k % 2 == 0 {
+                            -0.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    2 => -0.0,
+                    _ => f32::from_bits(k) * if k % 3 == 0 { -1.0 } else { 1.0 },
+                };
+            }
+        } else {
+            // a negative extreme, -inf and NaN, each at an index the case owns
+            x[n / 3] = -1000.5;
+            if n > 4096 {
+                x[n / 2 + 7] = f32::NEG_INFINITY;
+                x[n - 5] = f32::NAN;
+            } else if n > 16 {
+                x[n - 2] = f32::NAN;
+            }
+        }
+        let plan =
+            ReducePlan::new(view, *mask, ReduceOp::AbsMax, Finish::None, 1.0, n as u64).unwrap();
+        kernels_seen.insert(format!("{:?}", plan.first().kernel()));
+        two_pass_seen |= plan.second().is_some();
+        let want = plan.reference(&x).unwrap();
+        let outputs = want.len();
+        let bx = ffi::ack_buffer_alloc(dev, (n * 4) as u64);
+        let bo = ffi::ack_buffer_alloc(dev, (outputs * 4) as u64);
+        assert!(!bx.is_null() && !bo.is_null(), "{}", last_error());
+        let rc = unsafe { ffi::ack_upload(dev, bx, x.as_ptr().cast::<u8>(), n * 4) };
+        assert_eq!(rc, ffi::ACK_OK, "{}", last_error());
+        let poison = vec![f32::from_bits(0x7fa0_0bad); outputs];
+        let rc = unsafe { ffi::ack_upload(dev, bo, poison.as_ptr().cast::<u8>(), outputs * 4) };
+        assert_eq!(rc, ffi::ACK_OK, "{}", last_error());
+        let block = request(ReduceOp::AbsMax, Finish::None, shape, stride, 0, *mask, 1.0);
+        let mut ms = 0f64;
+        let rc = unsafe {
+            ffi::ack_reduce(
+                dev,
+                bx,
+                std::ptr::null(),
+                bo,
+                block.as_ptr(),
+                block.len(),
+                &mut ms,
+            )
+        };
+        assert_eq!(rc, ffi::ACK_OK, "{name}: {}", last_error());
+        let mut got = vec![0f32; outputs];
+        let rc = unsafe { ffi::ack_download(dev, bo, got.as_mut_ptr().cast::<u8>(), outputs * 4) };
+        assert_eq!(rc, ffi::ACK_OK, "{}", last_error());
+        let magnitudes: std::collections::HashSet<u32> =
+            x.iter().map(|v| v.to_bits() & 0x7fff_ffff).collect();
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            if w.is_nan() {
+                assert!(g.is_nan(), "{name}[{i}]: the NaN propagates, got {g}");
+                continue;
+            }
+            assert_eq!(
+                g.to_bits(),
+                (*w as f32).to_bits(),
+                "{name}[{i}]: got {g:e}, want {w:e}"
+            );
+            assert_eq!(g.to_bits() >> 31, 0, "{name}[{i}]: the sign bit is clear");
+            assert!(
+                magnitudes.contains(&g.to_bits()),
+                "{name}[{i}] = {g:e} is no input's magnitude"
+            );
+        }
+        if name.starts_with("rows of subnormals") {
+            assert!(
+                got[0] > 0.0 && got[0] < f32::MIN_POSITIVE,
+                "negative subnormals keep their magnitude, not a flushed zero: {:e}",
+                got[0]
+            );
+            assert_eq!(got[1].to_bits(), 0, "signed zeros give +0");
+            assert_eq!(got[2].to_bits(), 0, "only -0 gives +0");
+        }
+        for buf in [bx, bo] {
+            assert_eq!(ffi::ack_buffer_free(dev, buf), ffi::ACK_OK);
+        }
+    }
+    for k in ["V1", "V2", "V3"] {
+        assert!(
+            kernels_seen.contains(k),
+            "the cases reach every first-pass kernel; saw {kernels_seen:?}"
+        );
+    }
+    assert!(two_pass_seen, "the cases include a two-pass plan");
+    assert_eq!(ffi::ack_close(dev), ffi::ACK_OK, "{}", last_error());
+}
+
+// ---- schema 4: the float64 sum (2026-09-29) ------------------------------------------
+
+/// One v1 pass over float64 values exactly as `kernels/reduce_f64.comp` runs
+/// it: output (kept, split) sums its chunk lane by lane -- lane l takes the
+/// reduced indices start + l, + 256, ... from +0 -- and then a 256-way tree.
+/// With the host's IEEE binary64 add and no NaN in the input, these are the
+/// device's bits.
+fn emulate_v1_f64(
+    shape: &[u32],
+    stride: &[u32],
+    offset: u32,
+    mask: u32,
+    splits: u64,
+    chunk: u64,
+    x: &[f64],
+) -> Vec<f64> {
+    let ndim = shape.len();
+    let reduced = |d: usize| mask & (1 << d) != 0;
+    let kept_count: u64 = (0..ndim)
+        .filter(|&d| !reduced(d))
+        .map(|d| u64::from(shape[d]))
+        .product();
+    let reduced_count: u64 = (0..ndim)
+        .filter(|&d| reduced(d))
+        .map(|d| u64::from(shape[d]))
+        .product();
+    let mut out = vec![0.0f64; (kept_count * splits) as usize];
+    for (group, slot) in out.iter_mut().enumerate() {
+        let group = group as u64;
+        let (kept, split) = (group / splits, group % splits);
+        let mut kept_base = u64::from(offset);
+        let mut rem = kept;
+        for d in (0..ndim).rev().filter(|&d| !reduced(d)) {
+            let e = u64::from(shape[d]);
+            kept_base += (rem % e) * u64::from(stride[d]);
+            rem /= e;
+        }
+        let start = split * chunk;
+        let stop = (start + chunk).min(reduced_count);
+        let mut partial = [0.0f64; 256];
+        for (lane, acc) in partial.iter_mut().enumerate() {
+            let mut r = start + lane as u64;
+            while r < stop {
+                let mut address = kept_base;
+                let mut q = r;
+                for d in (0..ndim).rev().filter(|&d| reduced(d)) {
+                    let e = u64::from(shape[d]);
+                    address += (q % e) * u64::from(stride[d]);
+                    q /= e;
+                }
+                *acc = std::hint::black_box(*acc) + x[address as usize];
+                r += 256;
+            }
+        }
+        let mut s = 128;
+        while s > 0 {
+            for lane in 0..s {
+                partial[lane] = std::hint::black_box(partial[lane]) + partial[lane + s];
+            }
+            s >>= 1;
+        }
+        *slot = partial[0];
+    }
+    out
+}
+
+#[test]
+fn a_float64_sum_is_v1s_fixed_order_in_binary64_bit_for_bit() {
+    let dev = ffi::ack_open();
+    if dev.is_null() {
+        if std::env::var_os("ACK_REQUIRE_DEVICE").is_some() {
+            panic!(
+                "reduce f64: ACK_REQUIRE_DEVICE is set and ack_open failed: {}",
+                last_error()
+            );
+        }
+        eprintln!("UNMEASURED here (reduce f64): {}", last_error());
+        return;
+    }
+    let alloc = |bytes: u64| {
+        let b = ffi::ack_buffer_alloc(dev, bytes);
+        assert!(!b.is_null(), "{}", last_error());
+        b
+    };
+    let up = |buf, data: &[f64]| {
+        let rc = unsafe { ffi::ack_upload(dev, buf, data.as_ptr().cast::<u8>(), data.len() * 8) };
+        assert_eq!(rc, ffi::ACK_OK, "{}", last_error());
+    };
+    let down = |buf, elements: usize| {
+        let mut out = vec![0f64; elements];
+        let rc =
+            unsafe { ffi::ack_download(dev, buf, out.as_mut_ptr().cast::<u8>(), out.len() * 8) };
+        assert_eq!(rc, ffi::ACK_OK, "{}", last_error());
+        out
+    };
+    let f64_request = |block: &[u8; PUSH_BYTES]| {
+        let mut request = [0u8; REQUEST_BYTES];
+        request[..PUSH_BYTES].copy_from_slice(block);
+        request[PUSH_BYTES..].copy_from_slice(&FLAG_F64.to_le_bytes());
+        request
+    };
+    // values of every magnitude, so each add rounds: signs, zeros of both
+    // signs, subnormals, and exponents from 2^-1000 to 2^1000 (no two of the
+    // largest can overflow a sum of these counts)
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let mut value = move || -> f64 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let r = state;
+        match r % 16 {
+            0 => 0.0,
+            1 => -0.0,
+            2 => {
+                f64::from_bits((r >> 12) & 0x000F_FFFF_FFFF_FFFF)
+                    * if r & 1 == 0 { 1.0 } else { -1.0 }
+            }
+            3 => f64::from_bits(
+                ((1023 + (r >> 20) % 2000 - 1000) << 52) | (r >> 12 & 0xF_FFFF_FFFF_FFFF),
+            ),
+            _ => {
+                ((r >> 11) as f64 / (1u64 << 53) as f64 - 0.5)
+                    * 2f64.powi(((r >> 4) % 40) as i32 - 20)
+            }
+        }
+    };
+    // (shape, stride, mask): one pass along the last dim; two passes (the
+    // reduced count past CHUNK); a transposed view reduced along its first
+    // dim; and every dimension of a 3-D view
+    let cases: [(&[u32], &[u32], u32); 4] = [
+        (&[3, 1000], &[1000, 1], 0b10),
+        (&[2, 70_000], &[70_000, 1], 0b10),
+        (&[5, 7], &[1, 5], 0b01),
+        (&[4, 6, 3], &[18, 3, 1], 0b111),
+    ];
+    for (shape, stride, mask) in cases {
+        let n: usize = shape.iter().map(|&s| s as usize).product();
+        let x: Vec<f64> = (0..n).map(|_| value()).collect();
+        let view = ReduceView::new(shape, stride, 0).unwrap();
+        let plan = ReducePlan::with_storage(
+            view,
+            mask,
+            ReduceOp::Sum,
+            Finish::None,
+            1.0,
+            n as u64,
+            true,
+            FLAG_F64,
+        )
+        .unwrap();
+        let kept = plan.kept_count() as usize;
+        let splits = u64::from(plan.splits());
+        let chunk = if splits == 1 {
+            plan.reduced_count()
+        } else {
+            u64::from(CHUNK)
+        };
+        let mut want = emulate_v1_f64(shape, stride, 0, mask, splits, chunk, &x);
+        if splits > 1 {
+            want = emulate_v1_f64(
+                &[kept as u32, splits as u32],
+                &[splits as u32, 1],
+                0,
+                0b10,
+                1,
+                splits,
+                &want,
+            );
+        }
+        let bx = alloc(n as u64 * 8);
+        let bout = alloc(kept as u64 * 8);
+        up(bx, &x);
+        up(bout, &vec![f64::NAN; kept]);
+        let block = f64_request(&request(
+            ReduceOp::Sum,
+            Finish::None,
+            shape,
+            stride,
+            0,
+            mask,
+            1.0,
+        ));
+        let mut ms = 0f64;
+        let rc = unsafe {
+            ffi::ack_reduce(
+                dev,
+                bx,
+                std::ptr::null(),
+                bout,
+                block.as_ptr(),
+                block.len(),
+                &mut ms,
+            )
+        };
+        assert_eq!(rc, ffi::ACK_OK, "{shape:?}: {}", last_error());
+        let got = down(bout, kept);
+        for (k, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "{shape:?} mask {mask:#b} output {k}: got {g:e}, want {w:e}"
+            );
+            assert!(g.is_finite(), "{shape:?} output {k}: {g}");
+        }
+        for b in [bx, bout] {
+            assert_eq!(
+                ffi::ack_buffer_free(dev, b),
+                ffi::ACK_OK,
+                "{}",
+                last_error()
+            );
+        }
+    }
+    // a NaN anywhere makes the sum a NaN
+    let bx = alloc(8 * 8);
+    let bout = alloc(8);
+    let mut x = vec![1.5f64; 8];
+    x[5] = f64::NAN;
+    up(bx, &x);
+    let block = f64_request(&request(
+        ReduceOp::Sum,
+        Finish::None,
+        &[8],
+        &[1],
+        0,
+        0b1,
+        1.0,
+    ));
+    let mut ms = 0f64;
+    let rc = unsafe {
+        ffi::ack_reduce(
+            dev,
+            bx,
+            std::ptr::null(),
+            bout,
+            block.as_ptr(),
+            block.len(),
+            &mut ms,
+        )
+    };
+    assert_eq!(rc, ffi::ACK_OK, "{}", last_error());
+    assert!(down(bout, 1)[0].is_nan());
+    // the entry refuses by name what the float64 module does not do
+    for (op, finish, flags) in [
+        (ReduceOp::Amax, Finish::None, FLAG_F64),
+        (ReduceOp::Sum, Finish::Scale, FLAG_F64),
+        (ReduceOp::Sum, Finish::None, FLAG_F64 | FLAG_IN_BF16),
+    ] {
+        let mut request_block = [0u8; REQUEST_BYTES];
+        request_block[..PUSH_BYTES].copy_from_slice(&request(
+            op,
+            finish,
+            &[8],
+            &[1],
+            0,
+            0b1,
+            0.125,
+        ));
+        request_block[PUSH_BYTES..].copy_from_slice(&flags.to_le_bytes());
+        let rc = unsafe {
+            ffi::ack_reduce(
+                dev,
+                bx,
+                std::ptr::null(),
+                bout,
+                request_block.as_ptr(),
+                request_block.len(),
+                &mut ms,
+            )
+        };
+        assert_eq!(rc, ffi::ACK_ERR_SHAPE, "{op:?} {finish:?} {flags:#b}");
+        assert!(
+            last_error().ends_with("reduce-f64-unsupported"),
+            "{}",
+            last_error()
+        );
+    }
+    for b in [bx, bout] {
+        assert_eq!(
+            ffi::ack_buffer_free(dev, b),
+            ffi::ACK_OK,
+            "{}",
+            last_error()
+        );
     }
     assert_eq!(ffi::ack_close(dev), ffi::ACK_OK, "{}", last_error());
 }

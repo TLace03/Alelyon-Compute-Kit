@@ -14,6 +14,25 @@
 // took before. The aligned variants require za and zb to be multiples of 8
 // (their operands are read as uvec4) and kz a multiple of BK; the edge
 // variants gather element-wise and need neither.
+// WORKGROUP ORDER (RAST, 2026-10-01; the aligned modules only). By default
+// workgroup (x, y) computes tile column x of tile row y, and the device starts
+// workgroups in x-fastest order, so consecutive workgroups walk ONE tile row
+// across every column: each reuses that row's band of A, while all of B streams
+// past once per tile row. When B is wide that is B read M/BM times from memory.
+// -DRAST=G walks G tile rows down one tile column before the next column, so a
+// panel of B is reused G times while it is in the cache. Only the map from
+// workgroup to tile changes; every tile stages the same K tiles in the same
+// order, so every element of C is the same sum, bit for bit, and the registers,
+// shared memory and scratch are the aligned module's. Built as SEPARATE module
+// sets, so the row-order modules keep their exact bytes; the host takes a
+// RAST set only for a grid at least 64 tile columns wide. MEASURED on an RX
+// 9070 XT with G = 4 against the row-order module, bf16, device time
+// (src/bin/gemm_bench.rs, 2026-10-01, each pair in both orders): f32 C at 2048 x
+// 32768 x 1024 1.68-1.94x in all four layouts (nt 51.0 -> 99.1 TFLOPS) and at
+// 8192^3 1.22-1.59x; bf16 C 1.08-1.36x (nn and nt); at 32 tile columns 1.02x,
+// and an earlier sweep of the same bytes 0.91-1.01x at 32 or fewer, which is
+// why the host keeps the row order there. tests/matmul_order_abi.rs times every
+// entry and layout on the device.
 // LEADING DIMENSIONS (2026-09-09): lda and ldb are the STORED row pitch of A
 // and of B in elements (A_T=0: the pitch of A's M rows of K; A_T=1: of its K
 // stored rows of M; B_T=0: B's K rows of N; B_T=1: its N rows of K), or 0
@@ -25,7 +44,25 @@
 //   grad in   dA     = dC[M,N]     . B[K,N]^T      (A_T=0, B_T=1: B stored N x K)
 //   grad w    dW     = A[M,K]^T    . dC[M,N]       (A_T=1, B_T=0: A stored K x M)
 // Requirements: M % BM == 0, N % BN == 0, K % BK == 0, every leading
-// dimension % 8 == 0, subgroup size 64 (required by the pipeline).
+// dimension % 8 == 0, and a subgroup of exactly SGW invocations (required by
+// the pipeline).
+//
+// SUBGROUP WIDTH (2026-09-22). The workgroup is NSG subgroups of SGW
+// invocations, and main() places each subgroup's tile by gl_SubgroupID on the
+// assumption that there are exactly NSG of them. The same module run at any
+// other width has a different number of subgroups per workgroup: at 32 lanes a
+// 256-invocation workgroup is 8 subgroups, subgroups 4..7 compute tiles outside
+// the 2x2 grid, and the product is wrong with no error. That was measured on an
+// NVIDIA L4 (driver 580.173.02, minSubgroupSize = maxSubgroupSize = 32), whose
+// driver accepted a pipeline that required 64 and returned a maximum relative
+// error of 0.85-1.27 on every aligned variant. So each module is compiled for
+// one width and the pipeline requires it; the host picks the set the device's
+// subgroup-size range admits. SGW=64 is the default, and those modules keep
+// the bytes they had before this define existed. SGW=32 is the set for a
+// device whose range excludes 64, built with an SG_ROWS x SG_COLS = 2 x 4
+// grid (kernels/build.py says why and what it measured). The interior
+// arithmetic is the same: a coopmat fragment belongs to one subgroup whatever
+// its width, and every loop below strides by WG or by gl_SubgroupSize.
 //
 // EDGE=1 lifts every one of those shape requirements except the subgroup size,
 // and is compiled as a SEPARATE set of variants so the aligned modules keep
@@ -33,15 +70,24 @@
 // the shared-memory geometry, the PAD skew and the coopMatLoad/coopMatMulAdd
 // sequence are untouched:
 //
-//   1. Staging gathers through a `uint` view of A and B instead of a `uvec4`
-//      one, so a leading dimension is an element count rather than a count of
-//      8-element groups. The uvec4 view is what quantised the leading dimension
-//      to a multiple of 8: `a[i]` addresses bytes [16i, 16i+16), so a row pitch
-//      that is not a multiple of 8 is not addressable at all, and an explicit
-//      stride push constant would NOT have made it addressable. Elements
-//      outside the operand are staged as exact zero, which covers the M, N and
-//      K tails in one rule. Zero-filling BOTH operands in the K tail is what
-//      keeps 0*Inf out of a kept accumulator position.
+//   1. Staging gathers eight bf16 starting at ANY element, so a leading
+//      dimension or a z offset is an element count rather than a count of
+//      8-element groups. The aligned modules' uvec4 view is what quantises
+//      those to a multiple of 8: `a[i]` addresses bytes [16i, 16i+16), so a
+//      row that starts inside a uvec4 cannot be read with one load. The edge
+//      gather reads a group that starts a uvec4 with one load, a group that
+//      starts on an even element with four 32-bit loads through a SECOND view
+//      of the same binding typed `uint`, and a group that starts on an odd
+//      element as the two uvec4 it straddles, funnelling out the 128 bits it
+//      needs; the uint view also serves a tail of fewer than eight and an odd
+//      group that ends inside the final partial uvec4. (2026-09-23: the first
+//      edge modules gathered an odd start element by element; the funnel took
+//      a 4096 x 512 x 1607 product from 21.2 to 26.7 TFLOPS on an NVIDIA L4,
+//      and an even start was 3-4% faster as four words than as a funnel.)
+//      Elements outside the
+//      operand are staged as exact zero, which covers the M, N and K tails in
+//      one rule. Zero-filling BOTH operands in the K tail is what keeps 0*Inf
+//      out of a kept accumulator position.
 //   2. The store predicates. coopMatStore cannot be masked per element -- the
 //      KHR extension requires every invocation in the scope instance to be
 //      active and leaves the component-to-(row,column) mapping
@@ -53,15 +99,194 @@
 //      (VUID-RuntimeSpirv-OpCooperativeMatrixLoadKHR-08986: 4*N bytes must be a
 //      multiple of 16).
 //
+// ELEMENT TYPE (2026-09-26). ELEM_F16=1 compiles the same modules with fp16
+// operands (float16_t) instead of bf16, for a device whose cooperative
+// matrices take fp16 but not bf16: NVIDIA Turing (a Kaggle T4) has fp16 tensor
+// cores and no bf16 at all. The type appears only in the two fragment
+// declarations below: staging moves raw 16-bit words, exact zero is 0x0000 in
+// both formats, and the accumulator and C stay f32, so every rule above holds
+// unchanged. ELEM_F16 defaults to 0, and the bf16 modules compile to the bytes
+// they had before the define existed (all sixteen checked against the
+// manifest). The fp16 modules are the coopmat_f16_* entries in build.py.
+//
+// BF16 OUTPUT (2026-09-27). BF16_OUT=1 (with EDGE=1, and since 2026-09-28 in the
+// aligned modules too) writes C as bf16,
+// rounded to nearest even with NaN kept quiet exactly as cast_f32_bf16.comp
+// rounds, so a bf16 product needs neither an f32 output block nor a separate
+// cast dispatch: every fragment goes through the f32 scratch, and each lane
+// rounds and writes pairs. N and the z stride of C are even (the host refuses
+// otherwise), so a pair never straddles two rows. Batches only (zmode 0): a
+// K-split's partials stay f32. MEASURED motive: a 4096 x 512 x 512 product
+// wrote an 8 MB f32 block and re-read it to write 4 MB of bf16, on an RX
+// 9070 XT 52-57 us against hipBLASLt's 26-60.
+//
+// FP16 OUTPUT (2026-09-30). With ELEM_F16=1, BF16_OUT=1 writes C in the
+// operands' own type, fp16, rounded by the device's own conversion under
+// DECLARED float controls (to nearest even, overflow to infinity, subnormals
+// kept): for every value that is not a NaN, the word convert/v1 writes
+// (kernels/convert.comp), and a NaN stays a NaN, its sign and payload free. So
+// an fp16 product is the fp16 modules' f32 C converted once, as the torch
+// adapter did in two dispatches, without the f32 block or the convert dispatch. The
+// name BF16_OUT is kept: the bf16 modules preprocess to the text they had, so
+// their bytes do not move. An INTERIOR fragment whose rows start on 16 bytes
+// (N and C's base multiples of 8) is rounded in registers, component by
+// component, and stored whole as an fp16 fragment, two halves a word; only a
+// ragged fragment takes the scratch. MEASURED on an RX 9070 XT (2026-09-30), the
+// student's head (2048 x 1002 @ 1002 x 151936) took 20.0 ms as the product and
+// its conversion. With convert/v1's integer routine inlined here, it took 36.9 ms
+// through the scratch and 36.8 ms stored directly: that routine made the module
+// spill (736 bytes of scratch against 80). With the device's conversion it took
+// 15.3 ms, and the step's mid-size products ran 4.6-7.2x faster.
+//
+// TWO LOOPS (COMBINED=1, with EDGE=1 and PREFETCH=1; 2026-09-28). The edge
+// modules keep a bounds-checked gather inside the prefetch loop, and on an RX
+// 9070 XT that costs up to twice the aligned modules' time even on tiles that lie
+// wholly inside the extent: an edge build whose prefetch used the aligned loads
+// ran at the aligned speed. A per-tile branch INSIDE the loop did not help, and
+// the aligned module over the whole tiles followed by the edge module over the
+// ragged ones in a second dispatch was SLOWER (the ragged tiles' full K loop
+// lands on the critical path after a barrier). So each workgroup picks ONE of
+// two whole K loops, uniformly and before the first barrier. A tile wholly
+// inside M x N, with pitches, z bases and a K start that are multiples of 8, runs
+// the aligned module's loop (uvec4 loads, no gather) over the whole K tiles,
+// then one gathered step for a K tail. Every other tile runs the edge loop. Each
+// tile is still the same K tiles in the same order, with the same values staged,
+// so C is bit for bit the edge loop's. MEASURED (gemm_bench, bf16 C, ms,
+// edge -> two loops, the aligned module at the padded shape in brackets):
+// 3256 x 512 x 4096 tn 0.245 -> 0.227 [0.201]; 4096 x 3256 x 512 nt 0.225 ->
+// 0.197 [0.182]; 4096 x 512 x 3256 nn 0.197 -> 0.147 [0.152]; 4096 x 512 x 512
+// nt 0.039 -> 0.031 [0.031]. A pitch of 4 mod 8 (1628) keeps every tile on the
+// edge loop, unchanged, unless NARROW is also set (below). Without COMBINED the
+// source compiles to the bytes it did before.
+//
+// NARROW (with COMBINED; 2026-09-28). A third whole loop, for a tile wholly
+// inside M x N whose pitches, z bases and K start are multiples of 4 but not all
+// of 8. A pitch of 4 mod 8, such as the 1628-wide FFN operands, cannot start a
+// uvec4 read. That tile builds each panel uvec4 from two uvec2 reads through a
+// third view of each binding, over the whole K tiles, then takes one gathered
+// step for a K tail. Each fast loop keeps its own tail step. One gather loop
+// shared from a variable start (the whole K range for a ragged tile, the tail
+// behind either fast loop) made 4096 x 512 x 3256 nn, whose tiles all take the
+// aligned loop, 7-9 us a call slower in the pass. MEASURED in the A3r-X2 pass on
+// an RX 9070 XT, us a call, four runs each, two loops -> NARROW: 4096 x 512 x
+// 1628 nt 135 -> 87; 4096 x 1628 x 512 nn 189 -> 150; 4096 x 512 x 3256 nn 154
+// -> 153. Without NARROW the source compiles to the bytes it did before.
+//
+// MASKED (with COMBINED and NARROW; 2026-09-29). A ragged tile, one not wholly
+// inside M x N, ran the gather loop over its whole K range. It now takes a masked
+// fast loop when each of its reads lies wholly inside or wholly outside the
+// extent. A read along a stored row that is one m or one n always does. A read
+// spanning m (A stored K x M) or n (B stored K x N) does when that extent is a
+// multiple of the read's width: 8 for the uvec4 loop, 4 for the uvec2 one. A read
+// outside is not made, and zero is staged, as the gather stages it. The tiles
+// wholly inside keep their unmasked loops. Masking their reads too, with every
+// read in an exec-masked block, made 4096 x 512 x 3256 nn 15 us a call slower. The
+// ragged branch shares one gather loop, from `kGather`. MEASURED in the A3r-X2
+// pass on an RX 9070 XT, us a call, four runs each, main -> MASKED:
+// 3256 x 512 x 4096 tn 238-240 -> 219-220; 4096 x 1628 x 512 nn 147-150 ->
+// 112-114; 4096 x 3256 x 512 nt 202-204 -> 196-198. The products whose tiles all
+// lie inside are unchanged. Without MASKED the source compiles to the bytes it did
+// before.
+//
 // EDGE=1 reads A and B as whole 32-bit words, so it touches the second half of
 // the word holding a final element that sits at an even index. Every buffer is
 // allocated to a whole word by Context::buffer for exactly this reason; that
 // half is read but never used for its value, so its contents do not matter.
+//
+// PAD_ALL (2026-09-27). PAD_ALL=1 pads the two panels PAD above leaves
+// unpadded too: A when A_T=1 and B when B_T=0, whose rows are BM or BN long
+// (256 bytes at 128). The v3 measurement that left them unpadded was an RDNA
+// one. On NVIDIA a fragment load that is not along the panel row reads eight
+// 16-byte rows per 8x8 block, and a 256-byte pitch puts all eight in the same
+// four banks. A Kaggle T4 (session df5200c9, 2026-09-27, 32-lane modules)
+// measured nt, whose panels are both padded, at 16.8-22.7 TFLOPS. nn (B
+// unpadded) ran at 12.6-15.7, tt (A unpadded) at 5.4-11.1 and tn (both
+// unpadded) at 3.8-9.0. A padded row starts 16 bytes further round the banks,
+// so the eight rows fall in eight different bank groups.
+//
+// PREFETCH (2026-09-27). PREFETCH=1 reads each K tile's panels into registers
+// one tile ahead. The next tile's global reads are issued before this tile's
+// products, so their latency overlaps the cooperative-matrix work instead of
+// stalling it. The registers go to the single shared copy after the products'
+// barrier. The panels must divide evenly among the workgroup's invocations
+// (checked below). The shared geometry and the product sequence are the same
+// as without it.
+//
+// NF4 B (NF4_B=1, with EDGE=1, A_T=0 and PREFETCH, without COMBINED;
+// 2026-09-30, nf4-matmul/v1). B is a weight held in bitsandbytes'
+// NF4 with double quantisation, read in its STORED form: binding 1 holds the
+// packed 4-bit indices (two a byte, the first value in the high nibble),
+// binding 3 one map index a block of 64 values, binding 4 one FP32 absmax2 a
+// nested block of 256 blocks, binding 5 the 16 code values then the 256 map
+// values, binding 6 each member's first value (int64, ascending from 0, on whole
+// nested blocks) and binding 7 each member's FP32 offset. B's element (row,
+// col) in its stored layout is value bBase + row * ldB + col of that source,
+// which starts nf4_src_base values into the buffers. The staging decodes each
+// group of eight into exactly the 16-bit words nf4-decode/v1 writes:
+//   code[index] * fl(fl(map[q] * absmax2) + offset), every product and sum one
+//   FP32 rounding with no fused multiply-add, rounded once to ELEM (convert/v1's
+//   fp16 routine; round to nearest even with NaN kept quiet for bf16),
+// and stages zero outside the operand as the edge gather does. The z grid is
+// GROUPED: binding 8 holds three words a z (a routed expert), its first row in A
+// and C, its row count, and its weight's first value in the source; a tile past
+// its rows exits before any barrier, M's bounds are that count (M_ROWS), and
+// p.M is the grid's largest count. Nothing else changes: the A staging, the
+// shared geometry, the coopMatLoad/coopMatMulAdd sequence and the store are the
+// edge module's. So each group's C is, bit for bit, the edge module's product
+// of its rows and its decoded weight: nf4-decode/v1 followed by the kit's own
+// product, every variant of which stages the same values in the same K order.
+// The host requires ldB to be a multiple of 8, and a group whose weight base
+// is not one reads and writes nothing, so a group of eight is always one packed
+// word under one absmax. Nor does a group of more rows than p.M (the grid covers
+// p.M), whose product would otherwise be written in part. Without NF4_B the
+// source compiles to the bytes it did before.
+//
+// NF4 B WITH A 16-BIT C (NF4_B=1 with BF16_OUT=1; 2026-10-01). C is written in
+// the operands' own type by the BF16_OUT epilogue above, unchanged: bf16 rounded
+// as cast_f32_bf16.comp rounds, fp16 by the device's own conversion under the
+// declared float controls. That epilogue already bounds by M_ROWS and addresses
+// from cBase, which under NF4_B are the group's row count and its first row of
+// C, as the f32 store's are. So each group's C is the f32 C above rounded once:
+// nf4-decode/v1 followed by the kit's 16-bit-output product, bit for bit
+// (a NaN a NaN), without the f32 block and the conversion dispatch the torch
+// adapter otherwise runs. The host requires N to be even, so a pair of C never
+// straddles two rows, and the group's first element of C, rowStart * N, is
+// even too.
+//
+// DENSE GROUPED (GROUPED=1, with EDGE=1, A_T=0, B_T=0, PREFETCH=1 and
+// BF16_OUT=1, without COMBINED, NF4_B or ELEM_F16; 2026-10-02, moe-grouped/v1,
+// AKV MoE increment M2). NF4_B's grouped z grid with B read DENSE (bf16), for
+// the expert-routed layer's gate/up product. Binding 3 holds three words a z (a
+// routed expert): its first row in A and C, its row count, and its weight's
+// first element in B. That is the table moe-schedule/v1 writes (src/moe_ops.rs),
+// with A the schedule's rows gathered by moe-gather/v1. A tile past its rows
+// exits before any barrier, M's bounds are that count (M_ROWS), p.M is the
+// grid's largest count, and a group whose rows lie past p.g_rows or whose
+// weight lies past p.g_b_limit reads and writes nothing. The host keeps K*ldB,
+// rows*ldA and rows*N below 2^31 (GroupedGeometry::validate), so these products
+// cannot wrap; ldA = K and ldB = N (the host sends lda = ldb = 0). A table
+// entry is device data, so rowStart + mRows has its own wrap check. Nothing
+// else changes:
+// the A and B staging, the shared geometry, the coopMatLoad/coopMatMulAdd
+// sequence and the bf16 store are the edge module's. So each group's C is, bit
+// for bit, the single-entry product of its rows and its weight (plan Amendment
+// 5: every variant stages the same values in the same K order). Without GROUPED
+// the source compiles to the bytes it did before.
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_EXT_shader_explicit_arithmetic_types : require
+#ifndef ELEM_F16
+#define ELEM_F16 0
+#endif
+#if ELEM_F16
+// float16_t is declared by GL_EXT_shader_explicit_arithmetic_types, above
+#define ELEM float16_t
+#else
 #extension GL_EXT_bfloat16 : require
+#define ELEM bfloat16_t
+#endif
+#extension GL_EXT_control_flow_attributes : require
 
 #ifndef BM
 #define BM 128
@@ -90,9 +315,64 @@
 #ifndef EDGE
 #define EDGE 0
 #endif
+#ifndef SGW
+#define SGW 64
+#endif
+#ifndef BF16_OUT
+#define BF16_OUT 0
+#endif
+#ifndef PAD_ALL
+#define PAD_ALL 0
+#endif
+#ifndef NF4_HW
+#define NF4_HW 0
+#endif
+#if ELEM_F16 && (BF16_OUT || NF4_HW)
+// The fp16-output modules round with the device's own f32 -> f16 conversion,
+// so its rounding is DECLARED (SPV_KHR_float_controls): to nearest even,
+// subnormals kept. These are the 16-bit modes; build.py adds their 64-bit
+// twins, which a device whose float controls are only 32-bit independent
+// requires, and which glslang cannot declare beside these (it keeps one
+// declaration a mode). The host builds these modules only on a device that
+// reports all four (ffi.rs, matmul_f16_out_kernels). The fp16 NF4 modules that
+// round each decoded weight with the same conversion (NF4_HW, 2026-09-30)
+// declare the same modes.
+#extension GL_EXT_spirv_intrinsics : require
+spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [4467], 4462, 16);
+spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [4464], 4459, 16);
+#endif
+#ifndef PREFETCH
+#define PREFETCH 0
+#endif
+#ifndef NF4_B
+#define NF4_B 0
+#endif
+#if NF4_B && (!EDGE || A_T || COMBINED || !PREFETCH)
+#error NF4_B is built with EDGE=1, A_T=0 and PREFETCH=1, without COMBINED
+#endif
+#if NF4_HW && !(NF4_B && ELEM_F16)
+#error NF4_HW is a variant of the fp16 NF4 modules
+#endif
+#ifndef RAST
+#define RAST 0
+#endif
+#if RAST && (EDGE || NF4_B || SGW != 64)
+#error RAST (the WORKGROUP ORDER note) is built into the 64-lane aligned modules only, where it was measured
+#endif
+#ifndef GROUPED
+#define GROUPED 0
+#endif
+#if GROUPED && (!EDGE || A_T || B_T || COMBINED || NF4_B || ELEM_F16 || !PREFETCH || !BF16_OUT)
+#error GROUPED (the DENSE GROUPED note) is built with EDGE=1, A_T=0, B_T=0, PREFETCH=1 and BF16_OUT=1, without COMBINED, NF4_B or ELEM_F16
+#endif
 
+#if NF4_B || GROUPED
+#define M_ROWS mRows
+#else
+#define M_ROWS p.M
+#endif
 #define NSG (SG_ROWS * SG_COLS)
-#define WG (NSG * 64)
+#define WG (NSG * SGW)
 #define TM (BM / SG_ROWS)
 #define TN (BN / SG_COLS)
 #define FM (TM / 16)
@@ -103,7 +383,11 @@
 #if A_T
 #define A_ROWS BK
 #define A_VEC_PER_ROW (BM / 8)
+#if PAD_ALL
+#define A_STRIDE (A_VEC_PER_ROW + PAD)
+#else
 #define A_STRIDE A_VEC_PER_ROW
+#endif
 #else
 #define A_ROWS BM
 #define A_VEC_PER_ROW (BK / 8)
@@ -116,20 +400,108 @@
 #else
 #define B_ROWS BK
 #define B_VEC_PER_ROW (BN / 8)
+#if PAD_ALL
+#define B_STRIDE (B_VEC_PER_ROW + PAD)
+#else
 #define B_STRIDE B_VEC_PER_ROW
+#endif
 #endif
 #define A_VECS (A_ROWS * A_VEC_PER_ROW)
 #define B_VECS (B_ROWS * B_VEC_PER_ROW)
+#if PREFETCH
+#if (A_VECS % WG) != 0 || (B_VECS % WG) != 0
+#error PREFETCH needs each panel to divide evenly among the workgroup's invocations
+#endif
+#define A_PER (A_VECS / WG)
+#define B_PER (B_VECS / WG)
+#endif
 
 layout(local_size_x = WG, local_size_y = 1, local_size_z = 1) in;
 #if EDGE
-layout(std430, set = 0, binding = 0) readonly buffer A { uint a[]; };
-layout(std430, set = 0, binding = 1) readonly buffer B { uint b[]; };
+// Two views of each operand at one binding: uvec4 for the staging loads, uint
+// for the scalar tail. Aliasing a binding with compatible types is valid SPIR-V
+// and valid Vulkan; both views are read-only.
+layout(std430, set = 0, binding = 0) readonly buffer A { uvec4 a[]; };
+layout(std430, set = 0, binding = 0) readonly buffer Aw { uint aw[]; };
+#if NF4_B
+layout(std430, set = 0, binding = 1) readonly buffer Nf4Packed { uint nf4_packed[]; };
+layout(std430, set = 0, binding = 3) readonly buffer Nf4AbsmaxQ { uint nf4_absmax_q[]; };
+layout(std430, set = 0, binding = 4) readonly buffer Nf4Absmax2 { float nf4_absmax2[]; };
+layout(std430, set = 0, binding = 5) readonly buffer Nf4Tables { float nf4_tables[]; };
+layout(std430, set = 0, binding = 6) readonly buffer Nf4Starts { uint nf4_starts[]; };
+layout(std430, set = 0, binding = 7) readonly buffer Nf4Offsets { float nf4_offsets[]; };
+layout(std430, set = 0, binding = 8) readonly buffer Nf4Groups { uint nf4_groups[]; };
+#else
+layout(std430, set = 0, binding = 1) readonly buffer B { uvec4 b[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Bw { uint bw[]; };
+#endif
+#if GROUPED
+layout(std430, set = 0, binding = 3) readonly buffer MoeGroups { uint moe_groups[]; };
+#endif
+#if COMBINED && NARROW
+layout(std430, set = 0, binding = 0) readonly buffer A2 { uvec2 a2[]; };
+layout(std430, set = 0, binding = 1) readonly buffer B2 { uvec2 b2[]; };
+uvec4 narrowA(uint i) { return uvec4(a2[i], a2[i + 1u]); }
+uvec4 narrowB(uint i) { return uvec4(b2[i], b2[i + 1u]); }
+#if MASKED
+// A read a ragged tile does not own is not made; zero is staged, as the gather
+// stages it. The loop's condition makes every read wholly inside or outside.
+uvec4 maskA4(bool ok, uint i) {
+    uvec4 r = uvec4(0u);
+    if (ok) r = a[i];
+    return r;
+}
+uvec4 maskB4(bool ok, uint i) {
+    uvec4 r = uvec4(0u);
+    if (ok) r = b[i];
+    return r;
+}
+uvec4 maskA2(bool lo, bool hi, uint i) {
+    uvec4 r = uvec4(0u);
+    if (lo) r.xy = a2[i];
+    if (hi) r.zw = a2[i + 1u];
+    return r;
+}
+uvec4 maskB2(bool lo, bool hi, uint i) {
+    uvec4 r = uvec4(0u);
+    if (lo) r.xy = b2[i];
+    if (hi) r.zw = b2[i + 1u];
+    return r;
+}
+#endif
+#endif
 #else
 layout(std430, set = 0, binding = 0) readonly buffer A { uvec4 a[]; };
 layout(std430, set = 0, binding = 1) readonly buffer B { uvec4 b[]; };
 #endif
+#if BF16_OUT
+layout(std430, set = 0, binding = 2) writeonly buffer C { uint c16[]; };
+
+#if ELEM_F16
+// The device's own f32 -> f16 conversion under the declared float controls: to
+// nearest even, overflow to infinity, subnormals kept -- convert/v1's rounding
+// for every value that is not a NaN; a NaN stays a NaN, its sign and payload
+// free. convert.comp's integer routine, inlined here (with early returns or
+// branch-free alike), and even a per-element NaN rule beside the conversion,
+// made every fp16-output module spill: 736 bytes of scratch against the
+// f32-output edge module's 80 (the driver's pipeline statistics, 2026-09-30),
+// and the head's product ran 1.84x slower than the product and its conversion.
+#define OUT16H(x) float16_t(x)
+#define OUT16(x) (packFloat2x16(f16vec2(float16_t(x), float16_t(0.0))) & 0xFFFFu)
+#else
+uint f32_to_bf16(float x) {
+    uint bits = floatBitsToUint(x);
+    if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu) != 0u) {
+        return (bits >> 16) | 0x0040u;   // quiet NaN, as cast_f32_bf16.comp
+    }
+    uint lsb = (bits >> 16) & 1u;
+    return (bits + 0x7FFFu + lsb) >> 16;
+}
+#define OUT16(x) f32_to_bf16(x)
+#endif
+#else
 layout(std430, set = 0, binding = 2) buffer C { float c[]; };
+#endif
 layout(push_constant) uniform P {
     uint M; uint N; uint K;
     uint zmode;   // 0: z is a batch; 1: z is a K-split
@@ -139,6 +511,16 @@ layout(push_constant) uniform P {
     uint kz;      // k per split (zmode 1)
     uint lda;     // stored row pitch of A in elements, 0 = logical width
     uint ldb;     // stored row pitch of B in elements, 0 = logical width
+#if NF4_B
+    uint nf4_src_base;   // the NF4 source's first value in its buffers (a whole nested block)
+    uint nf4_members;    // entries of the starts and offsets bindings
+    uint nf4_rows;       // rows of A and C: every group's rows lie below it
+    uint nf4_src_limit;  // values the source holds past nf4_src_base: every weight lies below it
+#endif
+#if GROUPED
+    uint g_rows;         // rows of A and C: every group's rows lie below it
+    uint g_b_limit;      // elements B holds: every group's weight lies below it
+#endif
 } p;
 // the element offsets of this workgroup's operands, set in main before any read
 uint aBase = 0u;
@@ -146,52 +528,331 @@ uint bBase = 0u;
 
 shared uvec4 As[A_ROWS * A_STRIDE];
 shared uvec4 Bs[B_ROWS * B_STRIDE];
-#if EDGE
+#if EDGE || BF16_OUT
 // one 16x16 f32 fragment per subgroup: 4 KiB on top of the 18 KiB of panels,
 // against a 32 KiB maxComputeSharedMemorySize on this device
 shared float Cs[NSG * 256];
+#endif
+#if EDGE
 
-// Eight consecutive bf16 as one uvec4, gathered element-wise so `ld` may be any
+// Eight consecutive bf16 starting e0 (0..7) elements into the 256-bit window
+// lo:hi, as one uvec4. Branch-free on e0: a shift by e0 >> 1 whole words, then
+// by a half word when e0 is odd. Element i of the window is the low half of
+// word i >> 1 when i is even and the high half when it is odd, so result word r
+// holds window elements e0 + 2r and e0 + 2r + 1.
+uvec4 funnel8(uvec4 lo, uvec4 hi, uint e0) {
+    uvec4 x = lo;
+    uvec4 y = hi;
+    if ((e0 & 4u) != 0u) {   // two words
+        x = uvec4(x.z, x.w, y.x, y.y);
+        y = uvec4(y.z, y.w, 0u, 0u);
+    }
+    if ((e0 & 2u) != 0u) {   // one word
+        x = uvec4(x.y, x.z, x.w, y.x);
+        y = uvec4(y.y, y.z, y.w, 0u);
+    }
+    if ((e0 & 1u) != 0u) {   // half a word
+        x = (x >> 16u) | (uvec4(x.y, x.z, x.w, y.x) << 16u);
+    }
+    return x;
+}
+
+// Eight consecutive bf16 as one uvec4, so `ld` and the z offset may be any
 // value. `row` indexes the STORED layout and `ld` is its pitch in ELEMENTS; the
 // eight columns start at `col0`. Anything at or past `rowLimit`/`colLimit` is
-// exact zero. Reading whole 32-bit words can touch the high half of the word
-// holding the operand's last element; that half is discarded by the `valid`
-// mask, and Context::buffer allocates every buffer to a whole word so the read
-// itself is in bounds.
+// exact zero. A whole group reads the uvec4 holding its first element and, when
+// it does not start one, the next; the uvec4 view's length is the bound range
+// in whole uvec4, so a group that ends inside a final partial one, and a tail
+// of fewer than eight, take the scalar path through the uint view. That path
+// reads whole 32-bit words and can touch the high half of the word holding the
+// operand's last element; the half is discarded by the `valid` mask, and
+// Context::buffer allocates every buffer to a whole word, so the read itself is
+// in bounds.
 uvec4 gatherA(uint row, uint rowLimit, uint col0, uint colLimit, uint ld) {
     if (row >= rowLimit || col0 >= colLimit) return uvec4(0u);
     const uint valid = min(8u, colLimit - col0);
     const uint base = aBase + row * ld + col0;
-    if (valid == 8u && (base & 1u) == 0u) {
-        const uint q = base >> 1u;
-        return uvec4(a[q], a[q + 1u], a[q + 2u], a[q + 3u]);
+    if (valid == 8u) {
+        const uint j = base >> 3u;
+        const uint e0 = base & 7u;
+        if (e0 == 0u) return a[j];
+        if ((e0 & 1u) == 0u) {
+            const uint q = base >> 1u;
+            return uvec4(aw[q], aw[q + 1u], aw[q + 2u], aw[q + 3u]);
+        }
+        if (j + 1u < uint(a.length())) return funnel8(a[j], a[j + 1u], e0);
     }
     uvec4 r = uvec4(0u);
     for (uint e = 0u; e < valid; ++e) {
         const uint idx = base + e;
-        const uint w = a[idx >> 1u];
+        const uint w = aw[idx >> 1u];
         const uint h = ((idx & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);
         r[e >> 1u] |= h << (16u * (e & 1u));
     }
     return r;
 }
 
+#if NF4_B
+#if NF4_HW
+// the device's own f32 -> f16 conversion under the float controls declared
+// above (to nearest even, subnormals kept): for every value that is not a NaN it
+// is convert/v1's routine, which the other fp16 NF4 modules run; a NaN is a NaN
+// (NF4_HW, 2026-09-30). Each value is PINNED before it is converted
+// (2026-10-01): the RX 9070 XT's driver (26.8.1, LLPC) fused the f32 multiply
+// `code * absmax` into the f32 -> f16 conversion, rounding the exact product
+// once, even with the multiply decorated NoContraction, where nf4-decode/v1
+// rounds it to f32 and then to fp16 (87 of the ABI test's 1,048,576 attention
+// weights differed). An integer XOR with a value that is zero at run time (K,
+// below 2^31, shifted right 31 places) but not provably so keeps the bits and
+// leaves no product to fuse.
+float nf4_pinned(float x) { return uintBitsToFloat(floatBitsToUint(x) ^ (p.K >> 31u)); }
+uint nf4_to16(float x) { return packFloat2x16(f16vec2(float16_t(nf4_pinned(x)), float16_t(0.0))) & 0xFFFFu; }
+uint nf4_pack2(float lo, float hi) {
+    return packFloat2x16(f16vec2(float16_t(nf4_pinned(lo)), float16_t(nf4_pinned(hi))));
+}
+#else
+#if ELEM_F16
+// convert/v1's f32 -> f16 routine, verbatim (kernels/convert.comp): round to
+// nearest even, NaN -> sign | 0x7E00, as nf4-decode/v1's fp16 module rounds
+uint nf4_to16(float x) {
+    uint w = floatBitsToUint(x);
+    uint sign = (w >> 16u) & 0x8000u;
+    uint e = (w >> 23u) & 0xFFu;
+    uint m = w & 0x7FFFFFu;
+    if (e == 0xFFu) return sign | (m != 0u ? 0x7E00u : 0x7C00u);
+    int he = int(e) - 112;
+    if (he >= 31) return sign | 0x7C00u;
+    if (he <= 0) {
+        if (he < -10) return sign;
+        uint mf = m | 0x800000u;
+        uint shift = uint(14 - he);
+        uint q = mf >> shift;
+        uint rem = mf & ((1u << shift) - 1u);
+        uint half_ulp = 1u << (shift - 1u);
+        if (rem > half_ulp || (rem == half_ulp && (q & 1u) != 0u)) q += 1u;
+        return sign | q;
+    }
+    uint h = (uint(he) << 10u) | (m >> 13u);
+    uint rem = m & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u) != 0u)) h += 1u;
+    return sign | h;
+}
+#else
+// round to nearest even, NaN kept quiet: the pointwise family's `narrow`, as
+// nf4-decode/v1's bf16 module rounds
+uint nf4_to16(float x) {
+    const uint bits = floatBitsToUint(x);
+    if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu) != 0u) {
+        return (bits >> 16u) | 0x0040u;
+    }
+    const uint lsb = (bits >> 16u) & 1u;
+    return (bits + 0x7FFFu + lsb) >> 16u;
+}
+#endif
+uint nf4_pack2(float lo, float hi) { return nf4_to16(lo) | (nf4_to16(hi) << 16u); }
+#endif
+
+// the member holding value v of the source: the last start at or below it
+uint nf4_member(uint v) {
+    uint lo = 0u;
+    uint hi = p.nf4_members;
+    while (hi - lo > 1u) {
+        uint mid = (lo + hi) / 2u;
+        if (nf4_starts[2u * mid] <= v) lo = mid; else hi = mid;
+    }
+    return lo;
+}
+
+// Each staging slot's member, cached (2026-09-30). A slot's value index only
+// grows from one K tile to the next: with B_T its stored row is fixed and its
+// column advances, otherwise its column is fixed and its row advances. So the
+// member holding it is the cached one or a later one. A slot's first call
+// searches; later calls step forward while the next member starts at or below
+// the value. That is the member the search finds (the last start at or below
+// the value), so every word is the one before.
+uint nf4_m[B_PER];
+uint nf4_member_cached(uint slot, uint v) {
+    uint m = nf4_m[slot];
+    if (m == 0xFFFFFFFFu) {
+        m = nf4_member(v);
+    } else {
+        while (m + 1u < p.nf4_members && nf4_starts[2u * (m + 1u)] <= v) ++m;
+    }
+    nf4_m[slot] = m;
+    return m;
+}
+
+// Eight consecutive elements of B's stored layout, decoded from NF4 into the
+// 16-bit words nf4-decode/v1 writes, zero outside the operand as gatherB stages
+// it. The eight share one packed word and one absmax (the host plan's multiples
+// of 8), so the absmax is decoded once. `slot` is the staging slot (B_TILE's
+// loop index), whose member is cached. A whole group of eight (2026-09-30) is
+// unrolled into two values a word, with no indexed write; a tail keeps the loop.
+uvec4 gatherB(uint slot, uint row, uint rowLimit, uint col0, uint colLimit, uint ld) {
+    if (row >= rowLimit || col0 >= colLimit) return uvec4(0u);
+    const uint valid = min(8u, colLimit - col0);
+    const uint v0 = bBase + row * ld + col0;
+    const uint s = p.nf4_src_base + v0;
+    const uint word = nf4_packed[s >> 3u];
+    const uint blk = s >> 6u;
+    const uint q = (nf4_absmax_q[blk >> 2u] >> (8u * (blk & 3u))) & 0xFFu;
+    precise float scale = nf4_tables[16u + q] * nf4_absmax2[blk >> 8u];
+    precise float absmax = scale + nf4_offsets[nf4_member_cached(slot, v0)];
+    if (valid == 8u) {
+        precise float value[8];
+        [[unroll]] for (uint e = 0u; e < 8u; ++e) {
+            const uint byte_value = (word >> (8u * (e >> 1u))) & 0xFFu;
+            const uint index = (e & 1u) == 0u ? (byte_value >> 4u) : (byte_value & 0xFu);
+            value[e] = nf4_tables[index] * absmax;
+        }
+        return uvec4(nf4_pack2(value[0], value[1]), nf4_pack2(value[2], value[3]),
+                     nf4_pack2(value[4], value[5]), nf4_pack2(value[6], value[7]));
+    }
+    uvec4 r = uvec4(0u);
+    for (uint e = 0u; e < valid; ++e) {
+        const uint byte_value = (word >> (8u * (e >> 1u))) & 0xFFu;
+        const uint index = (e & 1u) == 0u ? (byte_value >> 4u) : (byte_value & 0xFu);
+        precise float value = nf4_tables[index] * absmax;
+        r[e >> 1u] |= nf4_to16(value) << (16u * (e & 1u));
+    }
+    return r;
+}
+#else
 uvec4 gatherB(uint row, uint rowLimit, uint col0, uint colLimit, uint ld) {
     if (row >= rowLimit || col0 >= colLimit) return uvec4(0u);
     const uint valid = min(8u, colLimit - col0);
     const uint base = bBase + row * ld + col0;
-    if (valid == 8u && (base & 1u) == 0u) {
-        const uint q = base >> 1u;
-        return uvec4(b[q], b[q + 1u], b[q + 2u], b[q + 3u]);
+    if (valid == 8u) {
+        const uint j = base >> 3u;
+        const uint e0 = base & 7u;
+        if (e0 == 0u) return b[j];
+        if ((e0 & 1u) == 0u) {
+            const uint q = base >> 1u;
+            return uvec4(bw[q], bw[q + 1u], bw[q + 2u], bw[q + 3u]);
+        }
+        if (j + 1u < uint(b.length())) return funnel8(b[j], b[j + 1u], e0);
     }
     uvec4 r = uvec4(0u);
     for (uint e = 0u; e < valid; ++e) {
         const uint idx = base + e;
-        const uint w = b[idx >> 1u];
+        const uint w = bw[idx >> 1u];
         const uint h = ((idx & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);
         r[e >> 1u] |= h << (16u * (e & 1u));
     }
     return r;
+}
+#endif
+#endif
+
+#if EDGE && COMBINED
+#if !PREFETCH
+#error COMBINED needs PREFETCH
+#endif
+#if A_T
+#define A_TILE_AL(row, col, k) a[aVec + ((k) + (row)) * aLd + (tileRow / 8u) + (col)]
+#define A_TILE_G(row, col, k) gatherA((k) + (row), kEnd, tileRow + (col) * 8u, p.M, ldA)
+#define LOAD_A(i, r0) coopMatLoad(ma[i], As, kk * A_STRIDE + (r0) / 8u, A_STRIDE, gl_CooperativeMatrixLayoutColumnMajor)
+#else
+#define A_TILE_AL(row, col, k) a[aVec + (tileRow + (row)) * aLd + ((k) / 8u) + (col)]
+#define A_TILE_G(row, col, k) gatherA(tileRow + (row), p.M, (k) + (col) * 8u, kEnd, ldA)
+#define LOAD_A(i, r0) coopMatLoad(ma[i], As, (r0) * A_STRIDE + kk / 8u, A_STRIDE, gl_CooperativeMatrixLayoutRowMajor)
+#endif
+#if B_T
+#define B_TILE_AL(row, col, k) b[bVec + (tileCol + (row)) * bLd + ((k) / 8u) + (col)]
+#define B_TILE_G(row, col, k) gatherB(tileCol + (row), p.N, (k) + (col) * 8u, kEnd, ldB)
+#define LOAD_B(j, c0) coopMatLoad(mb[j], Bs, (c0) * B_STRIDE + kk / 8u, B_STRIDE, gl_CooperativeMatrixLayoutColumnMajor)
+#else
+#define B_TILE_AL(row, col, k) b[bVec + ((k) + (row)) * bLd + (tileCol / 8u) + (col)]
+#define B_TILE_G(row, col, k) gatherB((k) + (row), kEnd, tileCol + (col) * 8u, p.N, ldB)
+#define LOAD_B(j, c0) coopMatLoad(mb[j], Bs, kk * B_STRIDE + (c0) / 8u, B_STRIDE, gl_CooperativeMatrixLayoutRowMajor)
+#endif
+#if NARROW
+#if A_T
+#define A_TILE_NA(row, col, k) narrowA((aBase + ((k) + (row)) * ldA + tileRow + (col) * 8u) >> 2u)
+#else
+#define A_TILE_NA(row, col, k) narrowA((aBase + (tileRow + (row)) * ldA + (k) + (col) * 8u) >> 2u)
+#endif
+#if B_T
+#define B_TILE_NA(row, col, k) narrowB((bBase + (tileCol + (row)) * ldB + (k) + (col) * 8u) >> 2u)
+#else
+#define B_TILE_NA(row, col, k) narrowB((bBase + ((k) + (row)) * ldB + tileCol + (col) * 8u) >> 2u)
+#endif
+#endif
+#if MASKED
+#if !NARROW
+#error MASKED needs NARROW
+#endif
+#if A_T
+// A stored K x M: a read spans eight (a uvec2 half, four) consecutive m
+#define A_TILE_ALM(row, col, k) maskA4(tileRow + (col) * 8u < p.M, aVec + ((k) + (row)) * aLd + (tileRow / 8u) + (col))
+#define A_TILE_NAM(row, col, k) maskA2(tileRow + (col) * 8u < p.M, tileRow + (col) * 8u + 4u < p.M, (aBase + ((k) + (row)) * ldA + tileRow + (col) * 8u) >> 2u)
+#else
+// A stored M x K: a read lies in one row m
+#define A_TILE_ALM(row, col, k) maskA4(tileRow + (row) < p.M, aVec + (tileRow + (row)) * aLd + ((k) / 8u) + (col))
+#define A_TILE_NAM(row, col, k) maskA2(tileRow + (row) < p.M, tileRow + (row) < p.M, (aBase + (tileRow + (row)) * ldA + (k) + (col) * 8u) >> 2u)
+#endif
+#if B_T
+// B stored N x K: a read lies in one row n
+#define B_TILE_ALM(row, col, k) maskB4(tileCol + (row) < p.N, bVec + (tileCol + (row)) * bLd + ((k) / 8u) + (col))
+#define B_TILE_NAM(row, col, k) maskB2(tileCol + (row) < p.N, tileCol + (row) < p.N, (bBase + (tileCol + (row)) * ldB + (k) + (col) * 8u) >> 2u)
+#else
+// B stored K x N: a read spans eight (four) consecutive n
+#define B_TILE_ALM(row, col, k) maskB4(tileCol + (col) * 8u < p.N, bVec + ((k) + (row)) * bLd + (tileCol / 8u) + (col))
+#define B_TILE_NAM(row, col, k) maskB2(tileCol + (col) * 8u < p.N, tileCol + (col) * 8u + 4u < p.N, (bBase + ((k) + (row)) * ldB + tileCol + (col) * 8u) >> 2u)
+#endif
+#endif
+#define KSTEP \
+        for (uint kk = 0; kk < BK; kk += 16) { \
+            coopmat<ELEM, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma[FM]; \
+            coopmat<ELEM, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb[FN]; \
+            for (uint i = 0; i < FM; ++i) { \
+                const uint r0 = sgRow * TM + i * 16; \
+                LOAD_A(i, r0); \
+            } \
+            for (uint j = 0; j < FN; ++j) { \
+                const uint c0 = sgCol * TN + j * 16; \
+                LOAD_B(j, c0); \
+            } \
+            for (uint i = 0; i < FM; ++i) \
+                for (uint j = 0; j < FN; ++j) \
+                    acc[i][j] = coopMatMulAdd(ma[i], mb[j], acc[i][j]); \
+        }
+#define KLOOP(ATILE, BTILE, KB, KE) { \
+    uvec4 ra[A_PER]; \
+    uvec4 rb[B_PER]; \
+    if ((KB) < (KE)) { \
+        [[unroll]] for (uint i = 0u; i < A_PER; ++i) { \
+            const uint v = tid + i * WG; \
+            ra[i] = ATILE(v / A_VEC_PER_ROW, v % A_VEC_PER_ROW, (KB)); \
+        } \
+        [[unroll]] for (uint i = 0u; i < B_PER; ++i) { \
+            const uint v = tid + i * WG; \
+            rb[i] = BTILE(v / B_VEC_PER_ROW, v % B_VEC_PER_ROW, (KB)); \
+        } \
+    } \
+    for (uint k0 = (KB); k0 < (KE); k0 += BK) { \
+        [[unroll]] for (uint i = 0u; i < A_PER; ++i) { \
+            const uint v = tid + i * WG; \
+            As[(v / A_VEC_PER_ROW) * A_STRIDE + v % A_VEC_PER_ROW] = ra[i]; \
+        } \
+        [[unroll]] for (uint i = 0u; i < B_PER; ++i) { \
+            const uint v = tid + i * WG; \
+            Bs[(v / B_VEC_PER_ROW) * B_STRIDE + v % B_VEC_PER_ROW] = rb[i]; \
+        } \
+        barrier(); \
+        if (k0 + BK < (KE)) { \
+            [[unroll]] for (uint i = 0u; i < A_PER; ++i) { \
+                const uint v = tid + i * WG; \
+                ra[i] = ATILE(v / A_VEC_PER_ROW, v % A_VEC_PER_ROW, k0 + BK); \
+            } \
+            [[unroll]] for (uint i = 0u; i < B_PER; ++i) { \
+                const uint v = tid + i * WG; \
+                rb[i] = BTILE(v / B_VEC_PER_ROW, v % B_VEC_PER_ROW, k0 + BK); \
+            } \
+        } \
+        KSTEP \
+        barrier(); \
+    } \
 }
 #endif
 
@@ -200,12 +861,41 @@ void main() {
     const uint sg = gl_SubgroupID;
     const uint sgRow = sg / SG_COLS;
     const uint sgCol = sg % SG_COLS;
+#if RAST
+    // (RAST, the WORKGROUP ORDER note) RAST tile rows down one tile column, then
+    // the next column; the last band holds the rows that remain. A bijection of
+    // the grid's tiles: the workgroups of a band are its rows x every column.
+    const uint linear = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    const uint bandSize = uint(RAST) * gl_NumWorkGroups.x;
+    const uint firstRow = (linear / bandSize) * uint(RAST);
+    const uint rowsInBand = min(gl_NumWorkGroups.y - firstRow, uint(RAST));
+    const uint within = linear % bandSize;
+    const uint tileRow = (firstRow + within % rowsInBand) * BM;
+    const uint tileCol = (within / rowsInBand) * BN;
+#else
     const uint tileRow = gl_WorkGroupID.y * BM;
     const uint tileCol = gl_WorkGroupID.x * BN;
+#endif
     const uint z = gl_WorkGroupID.z;
     uint kBegin = 0u;
     uint kEnd = p.K;
+#if NF4_B
+    // (NF4_B) z is a routed expert: its first row of A and C, its row count, and
+    // its weight's first value in the source
+    const uint rowStart = nf4_groups[3u * z];
+    const uint mRows = nf4_groups[3u * z + 1u];
+    const uint wBase = nf4_groups[3u * z + 2u];
+    const uint cBase = rowStart * p.N;
+#elif GROUPED
+    // (GROUPED) z is a routed expert, as for NF4_B: its first row of A and C, its
+    // row count, and its weight's first element in B
+    const uint rowStart = moe_groups[3u * z];
+    const uint mRows = moe_groups[3u * z + 1u];
+    const uint wBase = moe_groups[3u * z + 2u];
+    const uint cBase = rowStart * p.N;
+#else
     const uint cBase = z * p.zc;
+#endif
     if (p.zmode == 1u) {
         kBegin = z * p.kz;
         kEnd = min(p.K, kBegin + p.kz);
@@ -223,11 +913,72 @@ void main() {
 #else
     const uint ldB = p.ldb != 0u ? p.ldb : p.N;
 #endif
-#if !EDGE
+#if NF4_B
+    // workgroup-uniform, and before any barrier: a tile past its expert's rows has
+    // nothing to do, and a group whose rows or weight lie outside what the host
+    // sized, whose rows the grid does not cover, or whose weight base is off a
+    // packed word reads and writes nothing
+    if (tileRow >= mRows || mRows > p.M || rowStart + mRows < rowStart || rowStart + mRows > p.nf4_rows
+        || (wBase & 7u) != 0u || wBase > p.nf4_src_limit || p.N * p.K > p.nf4_src_limit - wBase) return;
+    aBase = rowStart * ldA;
+    bBase = wBase;
+    // every staging slot's member uncached until its first read (gatherB)
+    [[unroll]] for (uint i = 0u; i < B_PER; ++i) nf4_m[i] = 0xFFFFFFFFu;
+#endif
+#if GROUPED
+    // workgroup-uniform, and before any barrier: a tile past its expert's rows has
+    // nothing to do, and a group whose rows lie outside what the host sized, whose
+    // rows the grid does not cover, or whose weight (K rows of ldB) lies past B
+    // reads and writes nothing
+    if (tileRow >= mRows || mRows > p.M || rowStart + mRows < rowStart || rowStart + mRows > p.g_rows
+        || wBase > p.g_b_limit || p.K * ldB > p.g_b_limit - wBase) return;
+    aBase = rowStart * ldA;
+    bBase = wBase;
+#endif
+#if !EDGE || COMBINED
     const uint aLd = ldA / 8u;
     const uint bLd = ldB / 8u;
     const uint aVec = aBase / 8u;
     const uint bVec = bBase / 8u;
+#endif
+#if EDGE && COMBINED
+    // workgroup-uniform: this tile lies wholly inside M x N and its operands are uvec4-aligned
+    const bool interior = tileRow + BM <= p.M && tileCol + BN <= p.N
+        && (ldA & 7u) == 0u && (ldB & 7u) == 0u && (aBase & 7u) == 0u && (bBase & 7u) == 0u
+        && (kBegin & 7u) == 0u;
+    const uint kFull = kBegin + ((kEnd - kBegin) / BK) * BK;
+#if NARROW
+    const bool narrow = !interior && tileRow + BM <= p.M && tileCol + BN <= p.N
+        && (ldA & 3u) == 0u && (ldB & 3u) == 0u && (aBase & 3u) == 0u && (bBase & 3u) == 0u
+        && (kBegin & 3u) == 0u;
+#if MASKED
+    // (MASKED) a ragged tile takes a masked fast loop when each of its reads lies
+    // wholly inside or wholly outside the extent: always along a stored row that
+    // is one m or one n, and along m (A stored K x M) or n (B stored K x N) when
+    // that extent is a multiple of the read's width
+    const bool ragged = tileRow + BM > p.M || tileCol + BN > p.N;
+#if A_T
+    const bool aWhole8 = (p.M & 7u) == 0u;
+    const bool aWhole4 = (p.M & 3u) == 0u;
+#else
+    const bool aWhole8 = true;
+    const bool aWhole4 = true;
+#endif
+#if B_T
+    const bool bWhole8 = true;
+    const bool bWhole4 = true;
+#else
+    const bool bWhole8 = (p.N & 7u) == 0u;
+    const bool bWhole4 = (p.N & 3u) == 0u;
+#endif
+    const bool maskedWide = ragged && aWhole8 && bWhole8
+        && (ldA & 7u) == 0u && (ldB & 7u) == 0u && (aBase & 7u) == 0u && (bBase & 7u) == 0u
+        && (kBegin & 7u) == 0u;
+    const bool maskedNarrow = ragged && !maskedWide && aWhole4 && bWhole4
+        && (ldA & 3u) == 0u && (ldB & 3u) == 0u && (aBase & 3u) == 0u && (bBase & 3u) == 0u
+        && (kBegin & 3u) == 0u;
+#endif
+#endif
 #endif
 
     coopmat<float32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[FM][FN];
@@ -235,7 +986,116 @@ void main() {
         for (uint j = 0; j < FN; ++j)
             acc[i][j] = coopmat<float32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
 
+#if EDGE && COMBINED
+#if NARROW
+    if (interior) {
+        KLOOP(A_TILE_AL, B_TILE_AL, kBegin, kFull)
+        if (kFull < kEnd) {
+            KLOOP(A_TILE_G, B_TILE_G, kFull, kEnd)
+        }
+    } else if (narrow) {
+        KLOOP(A_TILE_NA, B_TILE_NA, kBegin, kFull)
+        if (kFull < kEnd) {
+            KLOOP(A_TILE_G, B_TILE_G, kFull, kEnd)
+        }
+    } else {
+#if MASKED
+        uint kGather = kBegin;
+        if (maskedWide) {
+            KLOOP(A_TILE_ALM, B_TILE_ALM, kBegin, kFull)
+            kGather = kFull;
+        } else if (maskedNarrow) {
+            KLOOP(A_TILE_NAM, B_TILE_NAM, kBegin, kFull)
+            kGather = kFull;
+        }
+        KLOOP(A_TILE_G, B_TILE_G, kGather, kEnd)
+#else
+        KLOOP(A_TILE_G, B_TILE_G, kBegin, kEnd)
+#endif
+    }
+#else
+    if (interior) {
+        KLOOP(A_TILE_AL, B_TILE_AL, kBegin, kFull)
+        if (kFull < kEnd) {
+            KLOOP(A_TILE_G, B_TILE_G, kFull, kEnd)
+        }
+    } else {
+        KLOOP(A_TILE_G, B_TILE_G, kBegin, kEnd)
+    }
+#endif
+#else
+#if PREFETCH
+    // The uvec4 at panel row `row`, column `col` of the K tile at `k`. It is
+    // the same read as the staging loop below, done one tile ahead.
+#if EDGE
+#if A_T
+#define A_TILE(row, col, k) gatherA((k) + (row), kEnd, tileRow + (col) * 8u, p.M, ldA)
+#else
+#define A_TILE(row, col, k) gatherA(tileRow + (row), M_ROWS, (k) + (col) * 8u, kEnd, ldA)
+#endif
+#if NF4_B
+// (NF4_B) B_TILE is expanded only inside the loops over the B staging slots, and
+// their index `i` is the slot whose member gatherB caches
+#if B_T
+#define B_TILE(row, col, k) gatherB(i, tileCol + (row), p.N, (k) + (col) * 8u, kEnd, ldB)
+#else
+#define B_TILE(row, col, k) gatherB(i, (k) + (row), kEnd, tileCol + (col) * 8u, p.N, ldB)
+#endif
+#elif B_T
+#define B_TILE(row, col, k) gatherB(tileCol + (row), p.N, (k) + (col) * 8u, kEnd, ldB)
+#else
+#define B_TILE(row, col, k) gatherB((k) + (row), kEnd, tileCol + (col) * 8u, p.N, ldB)
+#endif
+#else
+#if A_T
+#define A_TILE(row, col, k) a[aVec + ((k) + (row)) * aLd + (tileRow / 8u) + (col)]
+#else
+#define A_TILE(row, col, k) a[aVec + (tileRow + (row)) * aLd + ((k) / 8u) + (col)]
+#endif
+#if B_T
+#define B_TILE(row, col, k) b[bVec + (tileCol + (row)) * bLd + ((k) / 8u) + (col)]
+#else
+#define B_TILE(row, col, k) b[bVec + ((k) + (row)) * bLd + (tileCol / 8u) + (col)]
+#endif
+#endif
+    uvec4 ra[A_PER];
+    uvec4 rb[B_PER];
+    // workgroup-uniform; a K-split whose range is empty reads nothing
+    if (kBegin < kEnd) {
+        [[unroll]] for (uint i = 0u; i < A_PER; ++i) {
+            const uint v = tid + i * WG;
+            ra[i] = A_TILE(v / A_VEC_PER_ROW, v % A_VEC_PER_ROW, kBegin);
+        }
+        [[unroll]] for (uint i = 0u; i < B_PER; ++i) {
+            const uint v = tid + i * WG;
+            rb[i] = B_TILE(v / B_VEC_PER_ROW, v % B_VEC_PER_ROW, kBegin);
+        }
+    }
+#endif
+
     for (uint k0 = kBegin; k0 < kEnd; k0 += BK) {
+#if PREFETCH
+        [[unroll]] for (uint i = 0u; i < A_PER; ++i) {
+            const uint v = tid + i * WG;
+            As[(v / A_VEC_PER_ROW) * A_STRIDE + v % A_VEC_PER_ROW] = ra[i];
+        }
+        [[unroll]] for (uint i = 0u; i < B_PER; ++i) {
+            const uint v = tid + i * WG;
+            Bs[(v / B_VEC_PER_ROW) * B_STRIDE + v % B_VEC_PER_ROW] = rb[i];
+        }
+        barrier();
+        // the next tile's reads, in flight during this tile's products
+        if (k0 + BK < kEnd) {
+            [[unroll]] for (uint i = 0u; i < A_PER; ++i) {
+                const uint v = tid + i * WG;
+                ra[i] = A_TILE(v / A_VEC_PER_ROW, v % A_VEC_PER_ROW, k0 + BK);
+            }
+            [[unroll]] for (uint i = 0u; i < B_PER; ++i) {
+                const uint v = tid + i * WG;
+                rb[i] = B_TILE(v / B_VEC_PER_ROW, v % B_VEC_PER_ROW, k0 + BK);
+            }
+        }
+#else
         for (uint v = tid; v < A_VECS; v += WG) {
             const uint row = v / A_VEC_PER_ROW;
             const uint col = v % A_VEC_PER_ROW;
@@ -243,7 +1103,7 @@ void main() {
 #if A_T
             As[row * A_STRIDE + col] = gatherA(k0 + row, kEnd, tileRow + col * 8u, p.M, ldA);
 #else
-            As[row * A_STRIDE + col] = gatherA(tileRow + row, p.M, k0 + col * 8u, kEnd, ldA);
+            As[row * A_STRIDE + col] = gatherA(tileRow + row, M_ROWS, k0 + col * 8u, kEnd, ldA);
 #endif
 #else
 #if A_T
@@ -271,9 +1131,10 @@ void main() {
 #endif
         }
         barrier();
+#endif
         for (uint kk = 0; kk < BK; kk += 16) {
-            coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma[FM];
-            coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb[FN];
+            coopmat<ELEM, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma[FM];
+            coopmat<ELEM, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb[FN];
             for (uint i = 0; i < FM; ++i) {
                 const uint r0 = sgRow * TM + i * 16;
 #if A_T
@@ -296,30 +1157,65 @@ void main() {
         }
         barrier();
     }
-#if EDGE
-    for (uint i = 0; i < FM; ++i) {
-        for (uint j = 0; j < FN; ++j) {
+#endif
+#if EDGE || BF16_OUT
+    // UNROLLED, and it has to be (2026-09-23): with this loop body the
+    // compiler left the loops rolled, so acc[i][j] was indexed at run time and
+    // the accumulators lived in addressable memory for the WHOLE kernel, main
+    // loop included. On an NVIDIA L4 that made every edge module 3.7-4.2x
+    // slower than the aligned one AT AN ALIGNED SHAPE (8.6 against 36.1
+    // TFLOPS at 4096 x 3584 x 512); unrolled, 34.1. The aligned epilogue's
+    // one-line body was always unrolled.
+    [[unroll]] for (uint i = 0; i < FM; ++i) {
+        [[unroll]] for (uint j = 0; j < FN; ++j) {
             // subgroup-uniform: tileRow/tileCol/sgRow/sgCol/i/j and p.M/p.N are
             // all uniform here, so the whole scope instance takes one branch,
             // which is what the cooperative-matrix spec requires
             const uint r0 = tileRow + sgRow * TM + i * 16;
             const uint c0 = tileCol + sgCol * TN + j * 16;
-            if (r0 + 16u <= p.M && c0 + 16u <= p.N && (p.N & 3u) == 0u) {
+#if BF16_OUT
+#if ELEM_F16
+            if (r0 + 16u <= M_ROWS && c0 + 16u <= p.N && (p.N & 7u) == 0u && (cBase & 7u) == 0u) {
+                // an interior fragment: rounded in registers and stored whole (the note above)
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> h;
+                for (int e = 0; e < h.length(); ++e) h[e] = OUT16H(acc[i][j][e]);
+                coopMatStore(h, c16, (cBase + r0 * p.N + c0) >> 1u, p.N >> 1u, gl_CooperativeMatrixLayoutRowMajor);
+            } else
+#endif
+            if (r0 < M_ROWS && c0 < p.N) {
+                coopMatStore(acc[i][j], Cs, sg * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+                subgroupMemoryBarrierShared();
+                subgroupBarrier();
+                // pairs of columns: c0 + cc is even and N is even, so the pair
+                // is inside the row whenever its first element is
+                for (uint t = gl_SubgroupInvocationID * 2u; t < 256u; t += gl_SubgroupSize * 2u) {
+                    const uint rr = t >> 4u;
+                    const uint cc = t & 15u;
+                    if (r0 + rr < M_ROWS && c0 + cc < p.N)
+                        c16[(cBase + (r0 + rr) * p.N + c0 + cc) >> 1u] =
+                            OUT16(Cs[sg * 256u + t]) | (OUT16(Cs[sg * 256u + t + 1u]) << 16u);
+                }
+                subgroupMemoryBarrierShared();
+                subgroupBarrier();
+            }
+#else
+            if (r0 + 16u <= M_ROWS && c0 + 16u <= p.N && (p.N & 3u) == 0u) {
                 coopMatStore(acc[i][j], c, cBase + r0 * p.N + c0, p.N, gl_CooperativeMatrixLayoutRowMajor);
-            } else if (r0 < p.M && c0 < p.N) {
+            } else if (r0 < M_ROWS && c0 < p.N) {
                 coopMatStore(acc[i][j], Cs, sg * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
                 subgroupMemoryBarrierShared();
                 subgroupBarrier();
                 for (uint t = gl_SubgroupInvocationID; t < 256u; t += gl_SubgroupSize) {
                     const uint rr = t >> 4u;
                     const uint cc = t & 15u;
-                    if (r0 + rr < p.M && c0 + cc < p.N)
+                    if (r0 + rr < M_ROWS && c0 + cc < p.N)
                         c[cBase + (r0 + rr) * p.N + c0 + cc] = Cs[sg * 256u + t];
                 }
                 // the scratch is reused by the next fragment
                 subgroupMemoryBarrierShared();
                 subgroupBarrier();
             }
+#endif
         }
     }
 #else

@@ -641,3 +641,266 @@ fn split_k_partials_sum_to_the_product_and_a_single_z_is_the_old_entry() {
     }
     assert_eq!(ffi::ack_close(dev), ffi::ACK_OK, "{}", last_error());
 }
+
+/// Operands for the edge gather's alignment test, stored EXACTLY: pitches and
+/// batch offsets that are not multiples of eight, so the groups of eight the
+/// edge modules stage start at every alignment within a uvec4.
+struct Skewed {
+    z: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    a_t: bool,
+    b_t: bool,
+    lda: usize,
+    ldb: usize,
+    za: usize,
+    zb: usize,
+    a: Vec<u16>,
+    b: Vec<u16>,
+}
+
+impl Skewed {
+    fn new(a_t: bool, b_t: bool, salt: u32) -> Self {
+        // every extent off the tile; the stored widths (k or m for A, n or k for
+        // B) are multiples of eight, so each stored row's last group is WHOLE
+        // and the last batch's last row ends exactly at the buffer's end
+        let (z, m, n, k) = (3usize, 72usize, 48usize, 40usize);
+        let (a_rows, a_width) = if a_t { (k, m) } else { (m, k) };
+        let (b_rows, b_width) = if b_t { (n, k) } else { (k, n) };
+        let lda = a_width + 3;
+        let ldb = b_width + 5;
+        let za = a_rows * lda + 1;
+        let zb = b_rows * ldb + 7;
+        let a_len = (z - 1) * za + (a_rows - 1) * lda + a_width;
+        let b_len = (z - 1) * zb + (b_rows - 1) * ldb + b_width;
+        let draw = |i: usize| {
+            ((((i as u32).wrapping_mul(2_654_435_761) ^ salt) % 2_001) as f32) / 1_000.0 - 1.0
+        };
+        let a = (0..a_len).map(|i| to_bf16(draw(i))).collect();
+        let b = (0..b_len).map(|i| to_bf16(draw(i + 1_000_003))).collect();
+        Self {
+            z,
+            m,
+            n,
+            k,
+            a_t,
+            b_t,
+            lda,
+            ldb,
+            za,
+            zb,
+            a,
+            b,
+        }
+    }
+    fn a_at(&self, bi: usize, i: usize, l: usize) -> f64 {
+        let s = bi * self.za
+            + if self.a_t {
+                l * self.lda + i
+            } else {
+                i * self.lda + l
+            };
+        f64::from(from_bf16(self.a[s]))
+    }
+    fn b_at(&self, bi: usize, l: usize, j: usize) -> f64 {
+        let s = bi * self.zb
+            + if self.b_t {
+                j * self.ldb + l
+            } else {
+                l * self.ldb + j
+            };
+        f64::from(from_bf16(self.b[s]))
+    }
+    fn reference(&self) -> (Vec<f64>, Vec<f64>) {
+        let mut want = vec![0f64; self.z * self.m * self.n];
+        let mut mass = vec![0f64; self.z * self.m * self.n];
+        for bi in 0..self.z {
+            for i in 0..self.m {
+                for j in 0..self.n {
+                    let (mut acc, mut abs) = (0f64, 0f64);
+                    for l in 0..self.k {
+                        let t = self.a_at(bi, i, l) * self.b_at(bi, l, j);
+                        acc += t;
+                        abs += t.abs();
+                    }
+                    want[(bi * self.m + i) * self.n + j] = acc;
+                    mass[(bi * self.m + i) * self.n + j] = abs;
+                }
+            }
+        }
+        (want, mass)
+    }
+    /// The first element of every WHOLE group of eight the edge modules
+    /// stage from one operand: stored row by stored row, columns from 0 in
+    /// steps of eight while all eight are inside the stored width.
+    fn whole_groups(z: usize, rows: usize, width: usize, ld: usize, zoff: usize) -> Vec<usize> {
+        let mut bases = Vec::new();
+        for bi in 0..z {
+            for row in 0..rows {
+                let mut col = 0;
+                while col + 8 <= width {
+                    bases.push(bi * zoff + row * ld + col);
+                    col += 8;
+                }
+            }
+        }
+        bases
+    }
+    /// (A's group starts, A's length, B's group starts, B's length)
+    fn groups(&self) -> (Vec<usize>, usize, Vec<usize>, usize) {
+        let (a_rows, a_width) = if self.a_t {
+            (self.k, self.m)
+        } else {
+            (self.m, self.k)
+        };
+        let (b_rows, b_width) = if self.b_t {
+            (self.n, self.k)
+        } else {
+            (self.k, self.n)
+        };
+        (
+            Self::whole_groups(self.z, a_rows, a_width, self.lda, self.za),
+            self.a.len(),
+            Self::whole_groups(self.z, b_rows, b_width, self.ldb, self.zb),
+            self.b.len(),
+        )
+    }
+}
+
+/// The path the edge gather takes for a whole group at element `base` of an
+/// operand of `len` elements bound at its LOGICAL size (the range
+/// `Context::bind` gives the descriptor): 0 one uvec4 load, 1 four 32-bit loads
+/// (an even start), 2 two uvec4 and the funnel (an odd start), 3 the scalar
+/// path through the uint view (an odd start whose group ends inside the final
+/// partial uvec4). Mirrors `gatherA`/`gatherB` in
+/// kernels/coopmat_bf16_tiled_v4.comp.
+fn gather_path(base: usize, len: usize) -> usize {
+    let whole_vecs = len * 2 / 16;
+    let (j, e0) = (base >> 3, base & 7);
+    if e0 == 0 {
+        0
+    } else if e0 & 1 == 0 {
+        1
+    } else if j + 1 < whole_vecs {
+        2
+    } else {
+        3
+    }
+}
+
+/// The fixture, host only: in every layout, the groups staged from each
+/// operand start at all eight alignments and reach the one-load, four-word and
+/// funnel paths, and in every layout one operand's last group takes the scalar
+/// fallback. A fixture that never
+/// generates an alignment never tests it, so this is asserted rather than
+/// assumed; the device test below then holds every output of the same
+/// fixture to the bound.
+#[test]
+fn the_edge_alignment_fixture_reaches_every_alignment_and_the_fallback() {
+    for (a_t, b_t) in [(false, false), (false, true), (true, false), (true, true)] {
+        let s = Skewed::new(a_t, b_t, 29);
+        let (ga, la, gb, lb) = s.groups();
+        for (name, groups, len) in [("A", &ga, la), ("B", &gb, lb)] {
+            let residues: std::collections::BTreeSet<usize> =
+                groups.iter().map(|b| b & 7).collect();
+            assert_eq!(
+                residues.len(),
+                8,
+                "a_t {a_t} b_t {b_t}: {name}'s groups start at residues {residues:?}, not all eight"
+            );
+            let paths: std::collections::BTreeSet<usize> =
+                groups.iter().map(|&b| gather_path(b, len)).collect();
+            assert!(
+                [0usize, 1, 2].iter().all(|p| paths.contains(p)),
+                "a_t {a_t} b_t {b_t}: {name} reaches paths {paths:?}"
+            );
+            assert!(
+                groups.iter().all(|&b| b + 8 <= len),
+                "a_t {a_t} b_t {b_t}: a whole group of {name} runs past its operand"
+            );
+        }
+        assert!(
+            ga.iter().any(|&b| gather_path(b, la) == 3)
+                || gb.iter().any(|&b| gather_path(b, lb) == 3),
+            "a_t {a_t} b_t {b_t}: no group takes the scalar fallback"
+        );
+    }
+}
+
+/// The edge modules on the fixture above, every layout: three products of
+/// 72 x 48 x 40 per call, A and B read through pitches and batch offsets that
+/// are not multiples of eight from buffers sized exactly, every output inside
+/// the bound and none left carrying the poison.
+#[test]
+fn every_alignment_of_an_edge_operand_is_gathered_exactly() {
+    let Some(dev) = open_or_unmeasured("matmul_bf16_z edge alignments") else {
+        return;
+    };
+    for (a_t, b_t) in [(false, false), (false, true), (true, false), (true, true)] {
+        let s = Skewed::new(a_t, b_t, 29);
+        let (want, mass) = s.reference();
+        let out_len = s.z * s.m * s.n;
+        let ba = alloc(dev, s.a.len() * 2);
+        let bb = alloc(dev, s.b.len() * 2);
+        let bc = alloc(dev, out_len * 4);
+        upload(dev, ba, &Batch::bytes(&s.a));
+        upload(dev, bb, &Batch::bytes(&s.b));
+        let poison: Vec<u8> = vec![SENTINEL; out_len]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        upload(dev, bc, &poison);
+        let mut ms = 0f64;
+        let rc = unsafe {
+            ffi::ack_matmul_bf16_z(
+                dev,
+                ba,
+                bb,
+                bc,
+                s.m as u32,
+                s.n as u32,
+                s.k as u32,
+                a_t as i32,
+                b_t as i32,
+                s.z as u32,
+                0,
+                s.za as u32,
+                s.zb as u32,
+                (s.m * s.n) as u32,
+                0,
+                s.lda as u32,
+                s.ldb as u32,
+                &mut ms,
+            )
+        };
+        assert_eq!(rc, ffi::ACK_OK, "a_t {a_t} b_t {b_t}: {}", last_error());
+        let got = download_f32(dev, bc, out_len);
+        let mut worst = 0f64;
+        for (idx, (&g, &w)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                g.to_bits() != SENTINEL.to_bits(),
+                "a_t {a_t} b_t {b_t}: output {idx} still carries the poison"
+            );
+            let err = (f64::from(g) - w).abs();
+            let b = bound(s.k, mass[idx]);
+            assert!(
+                err <= b,
+                "a_t {a_t} b_t {b_t}: output {idx} got {g}, want {w}, err {err:e} > bound {b:e}"
+            );
+            worst = worst.max(err / b);
+        }
+        eprintln!(
+            "edge alignments a_t {a_t} b_t {b_t}: z={} {}x{}x{} lda {} ldb {} za {} zb {}, worst error / bound = {worst:.4}",
+            s.z, s.m, s.n, s.k, s.lda, s.ldb, s.za, s.zb
+        );
+        for buf in [ba, bb, bc] {
+            assert_eq!(
+                ffi::ack_buffer_free(dev, buf),
+                ffi::ACK_OK,
+                "{}",
+                last_error()
+            );
+        }
+    }
+}

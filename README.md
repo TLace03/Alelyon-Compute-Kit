@@ -10,6 +10,17 @@ Previously published `0.1.0a0` and `0.1.0a1` artifacts remain MIT-licensed.
 
 ## Current package
 
+The source on `main` is version `0.1.0a5`, which is **not yet published to
+PyPI**; the latest published release is `0.1.0a4`. `0.1.0a5` brings the
+reviewed kit payload (`src/alelyon_compute_kit/_kit`) up to date with the
+private source tree it is exported from: 361 files, among them new operators
+for fused attention (forward and backward, online softmax, no materialised
+score matrix), rotary position, SwiGLU, a fused weighted-bag lookup, NF4
+quantisation, mixed-precision casts, radix sort, index and integer element-wise
+operations, and the device-choice logic, each with its shaders and kernel
+manifest entries. The sub-bit streaming inference engine is not part of the
+public package.
+
 Version `0.1.0a4` is a patch release. It fixes the codebook-fitting defect
 described under "Known issue" below and is otherwise identical to `0.1.0a3`,
 which added a Windows AMD64 native library, reviewed Rust and shader sources,

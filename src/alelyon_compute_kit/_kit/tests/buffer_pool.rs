@@ -5,7 +5,10 @@
 //! host, measured at 800 live allocations, and the registered A2 microbatch
 //! pass makes 3,565 of those lifetimes -- roughly six tenths of the pass. The
 //! pool holds a freed buffer's `(VkBuffer, VkDeviceMemory)` pair instead of
-//! destroying it, keyed by the size `raw_buffer` was called with.
+//! destroying it, keyed by the size `raw_buffer` was called with: above
+//! `POOL_CLASS_FLOOR`, the request's size class (`pool_class`, at most 12.5%
+//! larger), so requests whose sizes change every step -- the MoE's per-expert
+//! bmm and mul -- share pairs instead of missing (2026-09-30).
 //!
 //! IT IS A FREE LIST AND NOT A SUBALLOCATOR, and that is a correctness
 //! decision. Eight refusals in the crate read `Buffer::id` inequality as
@@ -426,6 +429,202 @@ fn an_allocation_that_fails_drains_the_pool_and_retries() {
         0,
         "the fault was consumed by the first attempt"
     );
+    ctx.destroy_buffer(b);
+}
+
+#[test]
+#[cfg(feature = "fault-injection")]
+fn a_failed_allocation_gives_back_only_what_it_needs() {
+    // Measured 2026-09-29 on the realistic stage-E step: the first allocation
+    // failure drained the WHOLE pool (two such drains in one attributed run,
+    // ~8.5 GB each) and the steps after it allocated from nothing -- the old
+    // pool's steps spiked to 14.2 s where 7-9 s was usual. The reclaim now
+    // gives back the largest held pairs, as many bytes as the request, so the
+    // small pairs the next requests take are still there.
+    let Some(ctx) = open_or_unmeasured("partial reclaim") else {
+        return;
+    };
+    let small: Vec<Buffer> = (0..3).map(|_| ctx.buffer(4096).expect("small")).collect();
+    let large = ctx.buffer(1_000_000).expect("large");
+    for b in small {
+        ctx.destroy_buffer(b);
+    }
+    ctx.destroy_buffer(large);
+    assert_eq!(ctx.pooled_objects(), 8, "four pairs held");
+    let before = ctx.pool_stats();
+    assert_eq!(before.held_bytes, 3 * 4096 + 1_048_576);
+
+    // a request that misses (no 8 KiB pair is held) and whose allocation fails
+    ctx.inject_fault(Fault::CreateFails(
+        CreateStep::Memory,
+        vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+    ));
+    let b = ctx
+        .buffer(8192)
+        .expect("the retry after the reclaim must succeed");
+    let after = ctx.pool_stats();
+    assert_eq!(after.reclaims, before.reclaims + 1, "one reclaim");
+    assert_eq!(
+        after.drained,
+        before.drained + 1,
+        "ONE pair was given back, the largest: the old drain destroyed all four"
+    );
+    assert_eq!(
+        (ctx.pooled_objects(), after.held_bytes),
+        (6, 3 * 4096),
+        "and the three small pairs are still held"
+    );
+    assert_eq!(ctx.armed_faults(), 0, "the fault was consumed");
+    ctx.destroy_buffer(b);
+}
+
+#[test]
+fn requests_in_one_size_class_share_a_pair() {
+    // The MoE's per-expert sizes change every step, and an exact-size key
+    // missed them: 1.2-1.6k misses a step for bmm and the fp16 mul alone
+    // (2026-09-29). 1,000,000 and 1,040,000 bytes are one class (1 MiB);
+    // 1,048,580 is in the next (1,179,648).
+    let Some(ctx) = open_or_unmeasured("size classes") else {
+        return;
+    };
+    let a = ctx.buffer(1_000_000).expect("a");
+    assert_eq!(
+        (a.bytes, a.allocated_bytes()),
+        (1_000_000, 1_048_576),
+        "allocated at its class, and still the size the caller asked for"
+    );
+    ctx.destroy_buffer(a);
+    let hits = ctx.pool_stats().hits;
+    let b = ctx.buffer(1_040_000).expect("b");
+    assert_eq!(
+        ctx.pool_stats().hits,
+        hits + 1,
+        "a request in the same class takes the pair"
+    );
+    assert_eq!((b.bytes, b.allocated_bytes()), (1_040_000, 1_048_576));
+    let c = ctx.buffer(1_048_580).expect("c");
+    assert_eq!(
+        ctx.pool_stats().hits,
+        hits + 1,
+        "a request one class up does not"
+    );
+    assert_eq!(c.allocated_bytes(), 1_179_648);
+    ctx.destroy_buffer(b);
+    ctx.destroy_buffer(c);
+}
+
+#[test]
+fn a_request_whose_class_is_empty_takes_the_smallest_larger_pair_within_twice() {
+    // (2026-10-01) On the stage-E step a pool miss costs about 0.77 ms while
+    // the pool holds thousands of idle pairs. A request whose own class is
+    // empty may now take a larger idle pair, at most POOL_REUSE_RATIO (2)
+    // times its own class. The caller's size stays the buffer's size, and the
+    // pair goes back to ITS class when it is freed.
+    let Some(ctx) = open_or_unmeasured("larger-class reuse") else {
+        return;
+    };
+    ctx.set_buffer_pool_reuse_larger(true);
+    let big = ctx.buffer(1_500_000).expect("big");
+    assert_eq!(big.allocated_bytes(), 1_572_864);
+    ctx.destroy_buffer(big);
+    let s0 = ctx.pool_stats();
+    let small = ctx.buffer(1_000_000).expect("small"); // its class, 1,048,576, holds nothing
+    let s1 = ctx.pool_stats();
+    assert_eq!(
+        (s1.hits, s1.hits_larger, s1.misses),
+        (s0.hits + 1, s0.hits_larger + 1, s0.misses),
+        "served by the larger pair, without an allocation"
+    );
+    assert_eq!(
+        (small.bytes, small.allocated_bytes()),
+        (1_000_000, 1_572_864),
+        "the caller's size, on the pair's allocated size"
+    );
+    let data: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
+    ctx.upload(&small, &data).expect("upload");
+    assert_eq!(
+        ctx.download(&small).expect("download"),
+        data,
+        "the data path is the caller's size"
+    );
+    ctx.destroy_buffer(small);
+    let s2 = ctx.pool_stats();
+    let again = ctx.buffer(1_500_000).expect("again");
+    let s3 = ctx.pool_stats();
+    assert_eq!(
+        (s3.hits, s3.hits_larger, again.allocated_bytes()),
+        (s2.hits + 1, s2.hits_larger, 1_572_864),
+        "freed, it was filed under its own class, which a request of that class takes exactly"
+    );
+    ctx.destroy_buffer(again);
+}
+
+#[test]
+fn a_larger_pair_is_not_taken_beyond_twice_or_with_the_reuse_off() {
+    let Some(ctx) = open_or_unmeasured("larger-class reuse, its limits") else {
+        return;
+    };
+    ctx.set_buffer_pool_reuse_larger(true);
+    let big = ctx.buffer(3_000_000).expect("big"); // class 3,145,728
+    ctx.destroy_buffer(big);
+    let s0 = ctx.pool_stats();
+    let a = ctx.buffer(1_000_000).expect("a"); // class 1,048,576: twice it is 2,097,152
+    let s1 = ctx.pool_stats();
+    assert_eq!(
+        (s1.misses, s1.hits_larger),
+        (s0.misses + 1, s0.hits_larger),
+        "a pair more than twice the request's class is not taken"
+    );
+    ctx.destroy_buffer(a);
+    ctx.set_buffer_pool_reuse_larger(false);
+    let s2 = ctx.pool_stats();
+    let b = ctx.buffer(1_500_000).expect("b"); // class 1,572,864: the 3 MiB pair is exactly twice it
+    let s3 = ctx.pool_stats();
+    assert_eq!(
+        (s3.misses, s3.hits_larger),
+        (s2.misses + 1, s2.hits_larger),
+        "with the reuse off, a request takes its own class or allocates"
+    );
+    ctx.destroy_buffer(b);
+    ctx.set_buffer_pool_reuse_larger(true);
+    let s4 = ctx.pool_stats();
+    let c = ctx.buffer(2_000_000).expect("c"); // class 2,097,152: the 3 MiB pair is within twice it
+    let s5 = ctx.pool_stats();
+    assert_eq!(
+        (s5.hits_larger, c.allocated_bytes()),
+        (s4.hits_larger + 1, 3_145_728),
+        "and with it on, the same pair serves a request within twice"
+    );
+    ctx.destroy_buffer(c);
+}
+
+#[test]
+fn a_pair_made_with_the_pool_off_is_filed_under_its_own_size() {
+    // A buffer allocated while the pool was OFF has its exact size, and if the
+    // pool is on again by the time it is freed, it must be filed under THAT
+    // size. Filed under its class, it would serve a request its memory cannot
+    // hold -- which is why `Buffer` carries the size it was allocated at.
+    let Some(ctx) = open_or_unmeasured("pool off, then on") else {
+        return;
+    };
+    ctx.set_buffer_pool_enabled(false);
+    let a = ctx.buffer(1_000_000).expect("a");
+    assert_eq!(a.allocated_bytes(), 1_000_000, "no class with the pool off");
+    ctx.set_buffer_pool_enabled(true);
+    ctx.destroy_buffer(a);
+    assert_eq!(
+        ctx.pool_stats().held_bytes,
+        1_000_000,
+        "held at its own size"
+    );
+    let hits = ctx.pool_stats().hits;
+    let b = ctx.buffer(1_000_000).expect("b");
+    assert_eq!(
+        ctx.pool_stats().hits,
+        hits,
+        "the same request with the pool on asks for its class, which that pair is not"
+    );
+    assert_eq!(b.allocated_bytes(), 1_048_576);
     ctx.destroy_buffer(b);
 }
 

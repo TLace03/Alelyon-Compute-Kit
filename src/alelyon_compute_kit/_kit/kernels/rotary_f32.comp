@@ -1,0 +1,70 @@
+#version 450
+// rotary-f32/v1 (2026-09-29): the rotate-half rotary position embedding over
+// FP32 rows, and its backward, one invocation per rotated pair.
+//
+// The primary holds `rows` rows of `cols` (even) elements, dense. Row r sits at
+// position t = (r / pos_div) % positions, and the two tables hold `positions`
+// rows of `cols`: cos and sin. With h = cols / 2 and i < h, the pair is
+// (i, i + h).
+//
+//   op 0, forward:  out = x * cos + rot(x) * sin, rot(x) = cat(-x[h:], x[:h])
+//     out[i]     = x[i] * cos[i]         + (-x[i + h]) * sin[i]
+//     out[i + h] = x[i + h] * cos[i + h] +   x[i]      * sin[i + h]
+//   op 1, backward, primary = the upstream gradient g of `out`:
+//     gx[i]      = g[i] * cos[i]         + g[i + h] * sin[i + h]
+//     gx[i + h]  = g[i + h] * cos[i + h] - g[i] * sin[i]
+//
+// Each product is rounded, then their sum: the same correctly rounded f32
+// multiplies and add, in the same order, as the decomposition
+// `x * cos + torch.cat([-x[..., h:], x[..., :h]], -1) * sin` and autograd's
+// backward of it. Negation is exact. Everything is `precise`, so nothing is
+// contracted into a fused multiply-add. The one difference from the
+// decomposition's backward is the sign of an exact zero: autograd adds the
+// zero halves of the two sliced gradients, and -0 + 0 is +0.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer Primary { float primary[]; };
+layout(set = 0, binding = 1, std430) readonly buffer CosTable { float cos_table[]; };
+layout(set = 0, binding = 2, std430) readonly buffer SinTable { float sin_table[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer Output { float output_values[]; };
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+    uint op;
+    uint pos_div;
+    uint positions;
+    uint pairs;  // rows * cols / 2, below 2^31 by the host plan
+} p;
+
+void main() {
+    uint id = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * 256u);
+    if (id >= p.pairs) return;
+    uint half_cols = p.cols >> 1u;
+    uint r = id / half_cols;
+    uint i = id - r * half_cols;
+    uint t = (r / p.pos_div) % p.positions;
+    uint lo = r * p.cols + i;
+    uint hi = lo + half_cols;
+    uint tlo = t * p.cols + i;
+    uint thi = tlo + half_cols;
+    precise float a = primary[lo];
+    precise float b = primary[hi];
+    precise float out_lo;
+    precise float out_hi;
+    if (p.op == 0u) {
+        precise float m0 = a * cos_table[tlo];
+        precise float m1 = (-b) * sin_table[tlo];
+        out_lo = m0 + m1;
+        precise float m2 = b * cos_table[thi];
+        precise float m3 = a * sin_table[thi];
+        out_hi = m2 + m3;
+    } else {
+        precise float m0 = a * cos_table[tlo];
+        precise float m1 = b * sin_table[thi];
+        out_lo = m0 + m1;
+        precise float m2 = b * cos_table[thi];
+        precise float m3 = a * sin_table[tlo];
+        out_hi = m2 - m3;
+    }
+    output_values[lo] = out_lo;
+    output_values[hi] = out_hi;
+}

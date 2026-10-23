@@ -1,0 +1,376 @@
+#version 450
+// Fused attention, backward for dQ (attention-v2, 2026-09-27):
+//   dQ = scale * dS K,   dS = P o (dP - Delta),   dP = dO V^T,
+//   P = exp(scale * Q K^T - LSE) under the causal mask,   Delta = rowsum(dO o O)
+// the query-row half of FlashAttention-2's backward (attention_bwd_dkdv_v2.comp
+// is the key-row half), for head dimension D = 64 or 128 (a define), as the
+// attention-v2 forward: the operands staged in padded shared rows, 16-byte
+// loads when the strides allow, and the footprint within 32 KiB of shared
+// memory (31,744 bytes at D = 128). DETERMINISTIC: one workgroup owns a block
+// of 64 query rows of one (batch, query head) and sums over its key blocks in
+// order; no atomics.
+//
+// ONE WORKGROUP = one (batch, query head, block of BR = 64 query rows), as
+// NSG = 4 subgroups of 16 rows. Q and dO for the subgroup's rows are loaded
+// once as cooperative-matrix A operands; for each block of BC = 32 keys the
+// K and V rows are staged, S = Q K^T and dP = dO V^T are formed, P and dS are
+// computed element by element from the saved LSE and Delta, dS is rounded to
+// bf16, and dQ += dS K accumulates in cooperative-matrix accumulators. dQ is
+// scaled and rounded to bf16 at the end, rows past T not written.
+//
+// ELEMENT TYPE (2026-09-29): bf16 by default; -DELT_F16=1 builds the same
+// kernel over binary16 (fp16) q, k, v and outputs, for the fp16 autocast the
+// stage-E step is registered with. Only the cooperative-matrix element type
+// (ELT), the rounding of a float to it (f32_to_elt) and, in the backward, the
+// decoding of a stored pair (elt_lo / elt_hi) differ; the fp16 ones are exact
+// integer routines, so no CONVERSION depends on a device's float controls
+// (with -DF16_HW=1 the device's own conversions under declared round-to-
+// nearest-even and denormal preservation, the same rule, for the decode; the
+// encode is the integer routine in every build, see below). The fp16
+// modules' f32 arithmetic is pinned by NoContraction on every float result,
+// added after compiling (kernels/no_contraction.py, 2026-09-30): without it
+// the driver contracted the two builds' identical arithmetic differently. The
+// bf16 modules' preprocessed source is what it was before this switch.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#ifdef ELT_F16
+#define ELT float16_t
+#else
+#extension GL_EXT_bfloat16 : require
+#define ELT bfloat16_t
+#endif
+#extension GL_EXT_control_flow_attributes : require
+#if defined(ELT_F16) && defined(F16_HW)
+// HARDWARE BINARY16 CONVERSION (2026-09-29). -DF16_HW=1 declares round to
+// nearest even and denormal preservation for 16-bit floats. A device grants
+// both only when it reports shaderRoundingModeRTEFloat16 and
+// shaderDenormPreserveFloat16, and the host builds these modules only then
+// (ffi::attention_f16_hardware). A float16_t conversion is then IEEE's: round
+// to nearest even, subnormals kept, an overflow to infinity. That is the
+// integer routine's rule in one instruction. Infinities and NaNs keep the
+// integer routines' bits, so the two modules agree on every input
+// (tests/attention_v2.rs holds them to it, bit for bit).
+#extension GL_EXT_spirv_intrinsics : require
+spirv_execution_mode(capabilities = [4467], 4462, 16);   // RoundingModeRTE, 16-bit floats
+spirv_execution_mode(capabilities = [4464], 4459, 16);   // DenormPreserve, 16-bit floats
+#endif
+
+#ifndef SGW
+#define SGW 64
+#endif
+#ifndef D
+#define D 128
+#endif
+#define BC 32
+#define BR 64
+#define NSG 4
+#define WG (NSG * SGW)
+#define LPR (SGW / 16)       // lanes per query row in the elementwise phase
+#define CPL (BC / LPR)       // key columns per lane
+#define DW (D / 2)
+#define VPR (D / 8)
+#define KSV (VPR + 1)        // shared row stride of Q, dO, K and V, in 16-byte words
+#define SSV (BC / 4 + 1)     // shared row stride of S and dP, in vec4
+#define PSV (BC / 8 + 1)     // shared row stride of dS, in 16-byte words
+#define FV (4 / LPR)
+
+layout(local_size_x = WG, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Qb { uint q[]; };
+layout(std430, set = 0, binding = 0) readonly buffer Qb4 { uvec4 q4[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Kb { uint k[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Kb4 { uvec4 k4[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Vb { uint v[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Vb4 { uvec4 v4[]; };
+layout(std430, set = 0, binding = 3) readonly buffer Ob { uint o[]; };
+layout(std430, set = 0, binding = 4) readonly buffer DOb { uint dout[]; };
+layout(std430, set = 0, binding = 4) readonly buffer DOb4 { uvec4 dout4[]; };
+layout(std430, set = 0, binding = 5) readonly buffer Lb { float lse[]; };
+layout(std430, set = 0, binding = 6) writeonly buffer DQb { uint dq[]; };
+
+layout(push_constant) uniform P {
+    uint T, H, HKV, causal;
+    uint qB, qH, qR;
+    uint kB, kH, kR;
+    uint vB, vH, vR;
+    uint oB, oH, oR;
+    uint gB, gH, gR;     // dO
+    uint qgB, qgH, qgR;  // dQ
+    float scale;
+} p;
+
+#define NEG_INF uintBitsToFloat(0xFF800000u)
+#define LOG2E 1.4426950408889634
+
+shared uvec4 sKV[2 * BC * KSV];   // the Q block, then the dO block, then each key block's K and V rows
+shared vec4 sS[BR * SSV];         // S, then dP; at the end each dQ tile
+shared uvec4 sDS[BR * PSV];       // dS, bf16
+
+#ifdef ELT_F16
+// binary32 -> binary16, round to nearest even, subnormals kept, an overflow to
+// infinity, a NaN quieted with its payload's top bits: integer instructions
+// only, so its bits do not depend on the device's float controls
+// THE BACKWARD ENCODES WITH THE INTEGER ROUTINE IN EVERY BUILD (2026-10-21). The hardware modules used
+// float16_t(x) here. RX 9070 XT driver 32.0.32015.7029 (installed 2026-10-21) fuses an f32 multiply with that
+// conversion into one rounding from the exact product, NoContraction or not: f16(p * (dp - delta)) differed from
+// the f32-then-f16 result in 124 of 2,000,000 probed values, each one the single rounding, and a bitcast round
+// trip did not stop it. dS = P o (dP - Delta) is exactly that expression, so dQ and dK left the integer modules'
+// bits. An integer routine has nothing to fuse. The hardware DECODE below is exact and unchanged.
+uint f32_to_f16(float x) {
+    const uint bits = floatBitsToUint(x);
+    const uint sign = (bits >> 16) & 0x8000u;
+    const uint a = bits & 0x7FFFFFFFu;
+    if (a >= 0x7F800000u) {
+        return sign | 0x7C00u | (a > 0x7F800000u ? (0x0200u | ((a >> 13) & 0x03FFu)) : 0u);
+    }
+    if (a >= 0x477FF000u) return sign | 0x7C00u;       // 65520 and above round to infinity
+    if (a >= 0x38800000u) {                              // a normal binary16
+        const uint r = a - 0x38000000u;
+        uint h = r >> 13;
+        const uint rest = r & 0x1FFFu;
+        if (rest > 0x1000u || (rest == 0x1000u && (h & 1u) != 0u)) h += 1u;
+        return sign | h;
+    }
+    if (a < 0x33000000u) return sign;                    // below half the smallest subnormal
+    const uint e = a >> 23;                              // 102 .. 112
+    const uint m = (a & 0x7FFFFFu) | 0x800000u;
+    const uint shift = 126u - e;                         // 14 .. 24
+    uint h = m >> shift;
+    const uint rest = m & ((1u << shift) - 1u);
+    const uint half_ulp = 1u << (shift - 1u);
+    if (rest > half_ulp || (rest == half_ulp && (h & 1u) != 0u)) h += 1u;
+    return sign | h;                                     // 0x0400 when it rounds up to the smallest normal
+}
+
+// binary16 -> binary32, exactly (a subnormal becomes a normal binary32)
+#ifdef F16_HW
+float f16_to_f32(uint h) {
+    if ((h & 0x7C00u) == 0x7C00u) {   // an infinity or a NaN: the integer routine's bits
+        return uintBitsToFloat(((h & 0x8000u) << 16) | 0x7F800000u | ((h & 0x03FFu) << 13));
+    }
+    return float(uint16BitsToFloat16(uint16_t(h)));
+}
+#else
+float f16_to_f32(uint h) {
+    const uint sign = (h & 0x8000u) << 16;
+    const uint e = (h >> 10) & 0x1Fu;
+    const uint m = h & 0x03FFu;
+    if (e == 0x1Fu) return uintBitsToFloat(sign | 0x7F800000u | (m << 13));
+    if (e != 0u) return uintBitsToFloat(sign | ((e + 112u) << 23) | (m << 13));
+    if (m == 0u) return uintBitsToFloat(sign);
+    const int top = findMSB(m);
+    return uintBitsToFloat(sign | (uint(top + 103) << 23) | ((m << uint(23 - top)) & 0x7FFFFFu));
+}
+#endif
+#define f32_to_elt f32_to_f16
+#define elt_lo(w) f16_to_f32((w) & 0xFFFFu)
+#define elt_hi(w) f16_to_f32((w) >> 16)
+#else
+uint f32_to_bf16(float x) {
+    uint bits = floatBitsToUint(x);
+    if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu) != 0u) {
+        return (bits >> 16) | 0x0040u;
+    }
+    uint lsb = (bits >> 16) & 1u;
+    return (bits + 0x7FFFu + lsb) >> 16;
+}
+
+float bf16_lo(uint w) { return uintBitsToFloat(w << 16); }
+float bf16_hi(uint w) { return uintBitsToFloat(w & 0xFFFF0000u); }
+#define f32_to_elt f32_to_bf16
+#define elt_lo bf16_lo
+#define elt_hi bf16_hi
+#endif
+
+void main() {
+    const uint nqb = (p.T + BR - 1u) / BR;
+    const uint qblock = p.causal != 0u ? nqb - 1u - gl_WorkGroupID.x : gl_WorkGroupID.x;
+    const uint h = gl_WorkGroupID.y;
+    const uint b = gl_WorkGroupID.z;
+    const uint hk = h / (p.H / p.HKV);
+    const uint sg = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint row = lane / LPR;
+    const uint part = lane % LPR;
+    const uint qrow0 = qblock * BR;
+    const uint my_q = qrow0 + sg * 16u + row;
+    const uint srow = (sg * 16u + row) * SSV;
+    const float sl2 = p.scale * LOG2E;
+
+    const uint qbase = b * p.qB + h * p.qH;
+    const uint gbase = b * p.gB + h * p.gH;
+    const uint kbase = b * p.kB + hk * p.kH;
+    const uint vbase = b * p.vB + hk * p.vH;
+    const bool vecq = ((p.qB | p.qH | p.qR) & 7u) == 0u;
+    const bool vecg = ((p.gB | p.gH | p.gR) & 7u) == 0u;
+    const bool veckv = ((p.kB | p.kH | p.kR | p.vB | p.vH | p.vR) & 7u) == 0u;
+
+    // this row's LSE (base 2) and Delta = rowsum(dO o O), LPR lanes a row
+    float lse2 = 0.0;
+    float delta = 0.0;
+    if (my_q < p.T) {
+        lse2 = lse[(b * p.H + h) * p.T + my_q] * LOG2E;
+        const uint ob = (b * p.oB + h * p.oH + my_q * p.oR) / 2u;
+        const uint gb = (gbase + my_q * p.gR) / 2u;
+        for (uint c = part; c < DW; c += LPR) {
+            uint ow = o[ob + c], gw = dout[gb + c];
+            delta += elt_lo(ow) * elt_lo(gw) + elt_hi(ow) * elt_hi(gw);
+        }
+    }
+    [[unroll]] for (uint off = 1u; off < LPR; off <<= 1u) {
+        delta += subgroupShuffleXor(delta, off);
+    }
+
+    // Q, then dO, as A operands, staged through sKV (rows past T as zero)
+    coopmat<ELT, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> qa[D / 16];
+    coopmat<ELT, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ga[D / 16];
+    if (vecq) {
+        for (uint i = tid; i < BR * VPR; i += WG) {
+            uint r = i / VPR, c = i % VPR, qr = qrow0 + r;
+            sKV[r * KSV + c] = qr < p.T ? q4[(qbase + qr * p.qR) / 8u + c] : uvec4(0u);
+        }
+    } else {
+        for (uint i = tid; i < BR * DW; i += WG) {
+            uint r = i / DW, c = i % DW, qr = qrow0 + r;
+            sKV[r * KSV + c / 4u][c % 4u] = qr < p.T ? q[(qbase + qr * p.qR) / 2u + c] : 0u;
+        }
+    }
+    barrier();
+    [[unroll]] for (uint kk = 0u; kk < D / 16u; ++kk) {
+        coopMatLoad(qa[kk], sKV, (sg * 16u) * KSV + kk * 2u, KSV, gl_CooperativeMatrixLayoutRowMajor);
+    }
+    barrier();
+    if (vecg) {
+        for (uint i = tid; i < BR * VPR; i += WG) {
+            uint r = i / VPR, c = i % VPR, qr = qrow0 + r;
+            sKV[r * KSV + c] = qr < p.T ? dout4[(gbase + qr * p.gR) / 8u + c] : uvec4(0u);
+        }
+    } else {
+        for (uint i = tid; i < BR * DW; i += WG) {
+            uint r = i / DW, c = i % DW, qr = qrow0 + r;
+            sKV[r * KSV + c / 4u][c % 4u] = qr < p.T ? dout[(gbase + qr * p.gR) / 2u + c] : 0u;
+        }
+    }
+    barrier();
+    [[unroll]] for (uint kk = 0u; kk < D / 16u; ++kk) {
+        coopMatLoad(ga[kk], sKV, (sg * 16u) * KSV + kk * 2u, KSV, gl_CooperativeMatrixLayoutRowMajor);
+    }
+
+    coopmat<float32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> dqa[D / 16];
+    [[unroll]] for (uint dd = 0u; dd < D / 16u; ++dd) {
+        dqa[dd] = coopmat<float32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    }
+
+    const uint nkb = (p.T + BC - 1u) / BC;
+    const uint last = p.causal != 0u ? min(nkb, (qrow0 + BR + BC - 1u) / BC) : nkb;
+    for (uint kb = 0u; kb < last; ++kb) {
+        const uint krow0 = kb * BC;
+        barrier();   // the dO fragments are loaded / every subgroup is done with the last K, V and dS
+        if (veckv) {
+            for (uint i = tid; i < BC * VPR; i += WG) {
+                uint r = i / VPR, c = i % VPR, kr = krow0 + r;
+                bool in_range = kr < p.T;
+                sKV[r * KSV + c] = in_range ? k4[(kbase + kr * p.kR) / 8u + c] : uvec4(0u);
+                sKV[(BC + r) * KSV + c] = in_range ? v4[(vbase + kr * p.vR) / 8u + c] : uvec4(0u);
+            }
+        } else {
+            for (uint i = tid; i < BC * DW; i += WG) {
+                uint r = i / DW, c = i % DW, kr = krow0 + r;
+                bool in_range = kr < p.T;
+                sKV[r * KSV + c / 4u][c % 4u] = in_range ? k[(kbase + kr * p.kR) / 2u + c] : 0u;
+                sKV[(BC + r) * KSV + c / 4u][c % 4u] = in_range ? v[(vbase + kr * p.vR) / 2u + c] : 0u;
+            }
+        }
+        barrier();
+
+        // S = Q K^T -> P, element by element, into registers
+        [[unroll]] for (uint jb = 0u; jb < BC / 16u; ++jb) {
+            coopmat<float32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> s =
+                coopmat<float32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            [[unroll]] for (uint kk = 0u; kk < D / 16u; ++kk) {
+                coopmat<ELT, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> kt;
+                coopMatLoad(kt, sKV, (jb * 16u) * KSV + kk * 2u, KSV, gl_CooperativeMatrixLayoutColumnMajor);
+                s = coopMatMulAdd(qa[kk], kt, s);
+            }
+            coopMatStore(s, sS, (sg * 16u) * SSV + jb * 4u, SSV, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        float pr[CPL];
+        [[unroll]] for (uint c4 = 0u; c4 < CPL / 4u; ++c4) {
+            vec4 s4 = sS[srow + part * (CPL / 4u) + c4];
+            [[unroll]] for (uint e = 0u; e < 4u; ++e) {
+                uint key = krow0 + part * CPL + c4 * 4u + e;
+                bool masked = key >= p.T || (p.causal != 0u && key > my_q);
+                pr[c4 * 4u + e] = masked ? 0.0 : exp2(s4[e] * sl2 - lse2);
+            }
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();   // every lane has read S before dP lands on it
+
+        // dP = dO V^T -> dS = P o (dP - Delta), bf16, into sDS
+        [[unroll]] for (uint jb = 0u; jb < BC / 16u; ++jb) {
+            coopmat<float32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> dp =
+                coopmat<float32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            [[unroll]] for (uint kk = 0u; kk < D / 16u; ++kk) {
+                coopmat<ELT, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> vt;
+                coopMatLoad(vt, sKV, (BC + jb * 16u) * KSV + kk * 2u, KSV, gl_CooperativeMatrixLayoutColumnMajor);
+                dp = coopMatMulAdd(ga[kk], vt, dp);
+            }
+            coopMatStore(dp, sS, (sg * 16u) * SSV + jb * 4u, SSV, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        [[unroll]] for (uint c8 = 0u; c8 < CPL / 8u; ++c8) {
+            vec4 d0 = sS[srow + part * (CPL / 4u) + 2u * c8];
+            vec4 d1 = sS[srow + part * (CPL / 4u) + 2u * c8 + 1u];
+            float dpv[8] = float[8](d0.x, d0.y, d0.z, d0.w, d1.x, d1.y, d1.z, d1.w);
+            uvec4 w;
+            [[unroll]] for (uint e = 0u; e < 4u; ++e) {
+                float ds0 = pr[c8 * 8u + 2u * e] * (dpv[2u * e] - delta);
+                float ds1 = pr[c8 * 8u + 2u * e + 1u] * (dpv[2u * e + 1u] - delta);
+                w[e] = f32_to_elt(ds0) | (f32_to_elt(ds1) << 16);
+            }
+            sDS[(sg * 16u + row) * PSV + part * (CPL / 8u) + c8] = w;
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+
+        // dQ += dS K
+        coopmat<ELT, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> dsa[BC / 16];
+        [[unroll]] for (uint jj = 0u; jj < BC / 16u; ++jj) {
+            coopMatLoad(dsa[jj], sDS, (sg * 16u) * PSV + jj * 2u, PSV, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        [[unroll]] for (uint dd = 0u; dd < D / 16u; ++dd) {
+            [[unroll]] for (uint jj = 0u; jj < BC / 16u; ++jj) {
+                coopmat<ELT, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> kb16;
+                coopMatLoad(kb16, sKV, (jj * 16u) * KSV + dd * 2u, KSV, gl_CooperativeMatrixLayoutRowMajor);
+                dqa[dd] = coopMatMulAdd(dsa[jj], kb16, dqa[dd]);
+            }
+        }
+    }
+
+    // dQ * scale -> bf16, one 16 x 16 tile at a time through this subgroup's sS rows
+    const uint qgbase = b * p.qgB + h * p.qgH + my_q * p.qgR;
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+    [[unroll]] for (uint dd = 0u; dd < D / 16u; ++dd) {
+        coopMatStore(dqa[dd], sS, (sg * 16u) * SSV, SSV, gl_CooperativeMatrixLayoutRowMajor);
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        if (my_q < p.T) {
+            [[unroll]] for (uint f = 0u; f < FV; ++f) {
+                vec4 t4 = sS[srow + part * FV + f] * p.scale;
+                uint at = (qgbase + dd * 16u + (part * FV + f) * 4u) / 2u;
+                dq[at] = f32_to_elt(t4.x) | (f32_to_elt(t4.y) << 16);
+                dq[at + 1u] = f32_to_elt(t4.z) | (f32_to_elt(t4.w) << 16);
+            }
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+    }
+}

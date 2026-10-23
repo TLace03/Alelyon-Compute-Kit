@@ -1,0 +1,266 @@
+#version 450
+// nf4-gemv/v1 (2026-09-30): the NF4 product at a few rows, as decoding runs it
+// (one to 16 rows a group), with its weight read in bitsandbytes' NF4 stored
+// form (nf4-decode/v1's) and its operands bf16 (ELEM_F16=0) or fp16
+// (ELEM_F16=1). C[m, n] = sum over k of A[m, k] * W[n, k], W stored N x K.
+//
+// A call is GROUPED as nf4-matmul/v1's is: binding 8 holds three words a group
+// z (its first row of A and C, its row count, its weight's first value in the
+// source). One workgroup of 64 invocations computes one output column n of one
+// group, for all of its rows, so a projection of N columns runs N workgroups
+// however few its rows.
+//
+// THE LAW, in f32, the same on every device:
+//   w = widen(to16(fl(code[index] * fl(fl(map[q] * absmax2) + offset))))
+//       nf4-decode/v1's 16-bit weight, widened exactly (bf16 << 16; fp16 by
+//       convert/v1's integer routine)
+//   x = A's element, widened exactly
+//   invocation l accumulates acc = fl(acc + x * w) over the packed words
+//   j = l, l + 64, l + 128, ... in ascending order, and within a word over its
+//   eight values in ascending order; x * w is EXACT in f32 (two 16-bit
+//   significands) whenever it lies in f32's normal range, so a fused
+//   multiply-add would round the same (acc is `precise`: none is formed);
+//   then a fixed tree over the 64 partial sums in shared memory:
+//   v[l] = fl(v[l] + v[l + s]) for l < s, s = 32, 16, 8, 4, 2, 1; C = v[0].
+// That order does not depend on the subgroup width, so a host that follows it
+// in IEEE single precision gets the same words (tests/nf4_gemv_abi.rs does):
+// always for fp16 operands (every product and nonzero partial sum is a multiple
+// of 2^-48, inside f32's normal range), and for bf16 operands whenever every
+// product and partial sum is zero or normal (a device may flush f32's
+// subnormals).
+// It is NOT the cooperative-matrix product's order: against nf4-matmul/v1 the
+// two agree to f32 summation error.
+//
+// A group with no rows, more than the module holds (ROWS_CAP: 1, 4 or 16; the
+// host takes the smallest module that holds the call's largest group), rows
+// past `rows`, a weight past the source, or a weight base that is not a
+// multiple of 8 reads and writes nothing (the host checks the table; the kernel
+// still guards it). A needs a row pitch of whole uvec4 (a multiple of 8) from
+// its buffer's front; K is a multiple of 8, so a packed word is one absmax's.
+//
+// The same words, fewer loads (2026-09-30). Each invocation looks up the
+// members holding the column's first value and its last, once. When they are
+// the same member (a column inside one member, as every registered weight's
+// are), its offset serves every word; otherwise each word looks its own up as
+// before. The 1- and 4-row modules (ROWS_CAP <= 4) also stage the 16 code
+// values and the 256 map values in shared memory once a workgroup, instead of
+// reading them from the buffer for every value. The 16-row module does not:
+// on an RX 9070 XT staging made it 16-36% slower, while the smaller modules
+// ran 1.1-2.0x faster. Every value is the one the buffers hold and every sum
+// keeps its order, so the words are v1's; only the loads a word costs changed.
+//
+// The device's own fp16 conversions (F16_HW=1, 2026-09-30). The fp16 modules
+// above round each decoded weight to fp16 and widen every weight and every
+// activation back to f32 through convert/v1's integer routines; on an RX 9070
+// XT they ran 2.8-3.5x slower than the bf16 modules at the same shapes, whose
+// rounding and widening are shifts and whose loop is otherwise the same. The
+// F16_HW modules convert with the device's instructions (OpFConvert) under
+// DECLARED float controls, RoundingModeRTE and DenormPreserve for 16-bit floats
+// (build.py adds the 64-bit twins a device whose controls are only 32-bit
+// independent needs). Rounding to nearest even with subnormals kept is exactly
+// the integer routine's rounding, and a widening is exact, so every weight, every
+// activation and therefore every word of C is the same wherever no NaN is
+// involved. A NaN may carry another payload (the routine writes sign | 0x7E00 and
+// keeps an input's payload when widening), and a NaN weight or activation makes
+// its column's sum a NaN either way: the law holds for every word that is not a
+// NaN, and a NaN is a NaN (swiglu/v1's and the fp16-output products' law). The
+// host takes these modules on a device that reports shaderFloat16 and the four
+// float controls, and convert/v1's modules elsewhere.
+#extension GL_EXT_control_flow_attributes : require
+#ifndef ELEM_F16
+#define ELEM_F16 0
+#endif
+#ifndef F16_HW
+#define F16_HW 0
+#endif
+#if F16_HW && !ELEM_F16
+#error F16_HW is a variant of the fp16 modules
+#endif
+#if F16_HW
+#extension GL_EXT_spirv_intrinsics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// RoundingModeRTE (4462) and DenormPreserve (4459) for 16-bit floats
+spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [4467], 4462, 16);
+spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [4464], 4459, 16);
+#endif
+#ifndef ROWS_CAP
+#define ROWS_CAP 16
+#endif
+#define LANES 64u
+#define MAX_ROWS uint(ROWS_CAP)
+#if ROWS_CAP <= 4
+#define STAGE_TABLES 1
+#else
+#define STAGE_TABLES 0
+#endif
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) readonly buffer A { uvec4 a[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Packed { uint packed_words[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer C { float c[]; };
+layout(std430, set = 0, binding = 3) readonly buffer AbsmaxQ { uint absmax_q[]; };
+layout(std430, set = 0, binding = 4) readonly buffer Absmax2 { float absmax2[]; };
+layout(std430, set = 0, binding = 5) readonly buffer Tables { float tables[]; };
+layout(std430, set = 0, binding = 6) readonly buffer Starts { uint starts[]; };
+layout(std430, set = 0, binding = 7) readonly buffer Offsets { float offsets[]; };
+layout(std430, set = 0, binding = 8) readonly buffer Groups { uint groups[]; };
+layout(push_constant) uniform P {
+    uint n;          // W's rows: C's columns
+    uint k;          // W's columns and A's (a multiple of 8)
+    uint lda;        // A's row pitch in elements (a multiple of 8)
+    uint rows;       // rows of A and C: every group's rows lie below it
+    uint src_base;   // the source's first value in its buffers (a whole nested block)
+    uint src_limit;  // values the source holds past src_base
+    uint members;    // entries of starts and offsets
+} p;
+
+shared float partial[ROWS_CAP][LANES];
+#if STAGE_TABLES
+shared float code_s[16];
+shared float map_s[256];
+#define CODE(i) code_s[i]
+#define MAP(q) map_s[q]
+#else
+#define CODE(i) tables[i]
+#define MAP(q) tables[16u + (q)]
+#endif
+
+#if F16_HW
+// the device's conversions under the declared float controls (the header's F16_HW).
+// The f32 value is PINNED before it is converted (2026-10-01): the RX 9070 XT's
+// driver (26.8.1, LLPC) fused `code * absmax` into the f32 -> f16 conversion,
+// rounding the exact product once, even with the multiply decorated
+// NoContraction; nf4-decode/v1 rounds it to f32 and then to fp16, and the two
+// differed in 87 of the ABI test's 1,048,576 attention weights. An integer XOR
+// with a value that is zero at run time (K, which the host keeps below 2^31,
+// shifted right 31 places) but not provably so leaves the bits unchanged, and
+// leaves the compiler no product to fuse: the conversion reads a rounded f32.
+float pinned(float x) { return uintBitsToFloat(floatBitsToUint(x) ^ (p.k >> 31u)); }
+uint to16(float x) { return packFloat2x16(f16vec2(float16_t(pinned(x)), float16_t(0.0))) & 0xFFFFu; }
+float widen(uint h) { return float(unpackFloat2x16(h).x); }
+#elif ELEM_F16
+// convert/v1's routines, verbatim (kernels/convert.comp): f16 -> f32 exact,
+// f32 -> f16 round to nearest even with NaN -> sign | 0x7E00
+uint f16_to_f32(uint h) {
+    uint sign = (h & 0x8000u) << 16u;
+    uint e = (h >> 10u) & 0x1Fu;
+    uint m = h & 0x3FFu;
+    if (e == 0x1Fu) return sign | 0x7F800000u | (m << 13u);
+    if (e == 0u) {
+        if (m == 0u) return sign;
+        uint t = uint(findMSB(m));
+        return sign | ((t + 103u) << 23u) | (((m << (23u - t)) & 0x7FFFFFu));
+    }
+    return sign | ((e + 112u) << 23u) | (m << 13u);
+}
+uint to16(float x) {
+    uint w = floatBitsToUint(x);
+    uint sign = (w >> 16u) & 0x8000u;
+    uint e = (w >> 23u) & 0xFFu;
+    uint m = w & 0x7FFFFFu;
+    if (e == 0xFFu) return sign | (m != 0u ? 0x7E00u : 0x7C00u);
+    int he = int(e) - 112;
+    if (he >= 31) return sign | 0x7C00u;
+    if (he <= 0) {
+        if (he < -10) return sign;
+        uint mf = m | 0x800000u;
+        uint shift = uint(14 - he);
+        uint q = mf >> shift;
+        uint rem = mf & ((1u << shift) - 1u);
+        uint half_ulp = 1u << (shift - 1u);
+        if (rem > half_ulp || (rem == half_ulp && (q & 1u) != 0u)) q += 1u;
+        return sign | q;
+    }
+    uint h = (uint(he) << 10u) | (m >> 13u);
+    uint rem = m & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u) != 0u)) h += 1u;
+    return sign | h;
+}
+float widen(uint h) { return uintBitsToFloat(f16_to_f32(h)); }
+#else
+// round to nearest even, NaN kept quiet: nf4-decode/v1's bf16 rounding
+uint to16(float x) {
+    const uint bits = floatBitsToUint(x);
+    if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu) != 0u) {
+        return (bits >> 16u) | 0x0040u;
+    }
+    const uint lsb = (bits >> 16u) & 1u;
+    return (bits + 0x7FFFu + lsb) >> 16u;
+}
+float widen(uint h) { return uintBitsToFloat(h << 16u); }
+#endif
+
+// the member holding value v of the source: the last start at or below it
+uint member_of(uint v) {
+    uint lo = 0u;
+    uint hi = p.members;
+    while (hi - lo > 1u) {
+        uint mid = (lo + hi) / 2u;
+        if (starts[2u * mid] <= v) lo = mid; else hi = mid;
+    }
+    return lo;
+}
+
+void main() {
+    const uint n = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    const uint z = gl_WorkGroupID.z;
+    const uint lane = gl_LocalInvocationID.x;
+    const uint rowStart = groups[3u * z];
+    const uint mRows = groups[3u * z + 1u];
+    const uint wBase = groups[3u * z + 2u];
+    // workgroup-uniform, before any barrier
+    if (n >= p.n || mRows == 0u || mRows > MAX_ROWS || rowStart + mRows < rowStart || rowStart + mRows > p.rows
+        || (wBase & 7u) != 0u || wBase > p.src_limit || p.n * p.k > p.src_limit - wBase) return;
+    // the members of the column's first and last values, once an invocation
+    const uint first_member = member_of(wBase + n * p.k);
+    const bool one_member = first_member == member_of(wBase + n * p.k + p.k - 1u);
+    const float column_offset = offsets[first_member];
+#if STAGE_TABLES
+    // the tables, once a workgroup
+    for (uint i = lane; i < 272u; i += LANES) {
+        if (i < 16u) code_s[i] = tables[i]; else map_s[i - 16u] = tables[i];
+    }
+    barrier();
+#endif
+    precise float acc[ROWS_CAP];
+    [[unroll]] for (uint m = 0u; m < MAX_ROWS; ++m) acc[m] = 0.0;
+    const uint words = p.k / 8u;
+    for (uint j = lane; j < words; j += LANES) {
+        const uint v0 = wBase + n * p.k + 8u * j;
+        const uint s = p.src_base + v0;
+        const uint word = packed_words[s >> 3u];
+        const uint blk = s >> 6u;
+        const uint q = (absmax_q[blk >> 2u] >> (8u * (blk & 3u))) & 0xFFu;
+        precise float scale = MAP(q) * absmax2[blk >> 8u];
+        precise float absmax = scale + (one_member ? column_offset : offsets[member_of(v0)]);
+        float w[8];
+        [[unroll]] for (uint e = 0u; e < 8u; ++e) {
+            const uint byte_value = (word >> (8u * (e >> 1u))) & 0xFFu;
+            const uint index = (e & 1u) == 0u ? (byte_value >> 4u) : (byte_value & 0xFu);
+            precise float value = CODE(index) * absmax;
+            w[e] = widen(to16(value));
+        }
+        [[unroll]] for (uint m = 0u; m < MAX_ROWS; ++m) {
+            if (m < mRows) {
+                const uvec4 av = a[((rowStart + m) * p.lda + 8u * j) >> 3u];
+                [[unroll]] for (uint e = 0u; e < 8u; ++e) {
+                    const uint h = (av[e >> 1u] >> (16u * (e & 1u))) & 0xFFFFu;
+                    acc[m] = acc[m] + widen(h) * w[e];
+                }
+            }
+        }
+    }
+    [[unroll]] for (uint m = 0u; m < MAX_ROWS; ++m) partial[m][lane] = acc[m];
+    barrier();
+    [[unroll]] for (uint half_lanes = LANES / 2u; half_lanes > 0u; half_lanes >>= 1u) {
+        if (lane < half_lanes) {
+            [[unroll]] for (uint m = 0u; m < MAX_ROWS; ++m) {
+                if (m < mRows) {
+                    precise float sum = partial[m][lane] + partial[m][lane + half_lanes];
+                    partial[m][lane] = sum;
+                }
+            }
+        }
+        barrier();
+    }
+    if (lane < mRows) c[(rowStart + lane) * p.n + n] = partial[lane][0];
+}

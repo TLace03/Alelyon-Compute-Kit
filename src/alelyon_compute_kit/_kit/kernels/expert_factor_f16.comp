@@ -1,0 +1,223 @@
+#version 450
+// expert-factor-f16/v1 (2026-09-29): the sub-bit student's expert factors, each built from its signs in one pass,
+// and their backward. The student's reference is research/subbit_expert/moe/formats.py
+// `ExpertsIndependent._fused_factors` (`scaled_sign`, then `_pad_rank8`), whose CUDA counterpart is
+// student_kernels.latent_factors / packed_factors. On the kit that reference is a dozen aten operations a factor,
+// forward and backward.
+//
+//   binding 0 src     the latent W (E x M x R f32; ops 0, 2) or the packed sign cache S (E x M x NB bytes; ops 1, 3, 4)
+//                     or, with INT8_SIGNS (flags bit 2, 2026-09-30), the int8 sign cache S (E x M x R bytes; ops 1, 3, 4)
+//   binding 1 ids     the routed experts (P int64), each below E
+//   binding 2 row     the row scale (P x M f32), with HAS_ROW
+//   binding 3 col     the column scale (P x R f32), with HAS_COL
+//   binding 4 factor  the fp16 factor (P x M x LD), this part at columns [OFF, OFF + R8): written by ops 0 and 1,
+//                     read as the upstream gradient by ops 2, 3 and 4
+//   binding 5 out_a   op 2: the latent's gradient (E x M x R f32; the rows of experts not routed are not written);
+//                     op 3: g_row (P x M f32); op 4: g_col (P x R f32)
+//   binding 6 out_b   op 2: gs (P x M x R f32) with both scales, g_row (P x M f32) with a row scale only
+//
+// FORWARD (ops 0, 1), for c < R8:
+//   out[q, m, OFF + c] = c < R ? sign * s16 : 0,   s16 = f16(row[q, m] * col[q, c])
+// An absent scale is 1. The sign is +1 where W[e, m, c] >= 0 (op 0; a NaN latent takes -1, as
+// torch.where(W >= 0, s, -s) does) or where bit c % 8 of byte c / 8 of S[e, m] is set (op 1), else -1. With
+// INT8_SIGNS the sign is the signed byte S[e, m, c] itself, +1 or -1 (the student's _sign_cache form, whose
+// `cache * scale` is then exactly +-s16); any other byte is not a sign, and its factor entry and every sum it
+// enters are NaN. The scale
+// product is one f32 rounding (the reference's `h * l`), then one fp16 rounding to nearest even (c10's
+// `scale.to(dtype)`), so a factor is the reference's bit for bit: +-s16 is exact.
+// BACKWARD, with g = f32(factor[q, m, OFF + c]) for c < R and gs = sign * g (exact):
+//   op 2: gW[e, m, c] = (g * s32) * d, with s32 the f32 scale product and d = (t * t - 1) * -K, t = tanh(W K):
+//         `_ScaledSignFunction.backward`'s order (tanh's own rounding aside). With a row scale only,
+//         g_row[q, m] = sum_c gs; with both, gs itself (the caller reduces it against each scale, as autograd does).
+//   op 3: g_row[q, m] = sum_c gs * (col[q, c], or 1)
+//   op 4: g_col[q, c] = sum_m gs * row[q, m]
+// The sums run in increasing c (ops 2, 3) or m (op 4). An id at or past E makes its rows NaN (forward, op 3, op 4)
+// and writes no latent gradient (op 2): it is never an address.
+//
+// One invocation a (q, m) row for ops 0-3, one a (q, c) column for op 4; the grid folds past 65,535 workgroups.
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Src { uint src[]; };      // f32 bits (W) or bytes (S)
+layout(set = 0, binding = 1, std430) readonly buffer Ids { uint ids[]; };      // int64 as (lo, hi)
+layout(set = 0, binding = 2, std430) readonly buffer RowScale { float row_scale[]; };
+layout(set = 0, binding = 3, std430) readonly buffer ColScale { float col_scale[]; };
+layout(set = 0, binding = 4, std430) buffer Factor { uint factor[]; };          // fp16 pairs
+layout(set = 0, binding = 5, std430) writeonly buffer OutA { float out_a[]; };
+layout(set = 0, binding = 6, std430) writeonly buffer OutB { float out_b[]; };
+
+// MIRRORS src/expert_factor_ops.rs's ExpertFactorPlan::push_constants, word for word.
+layout(push_constant) uniform Push {
+    uint op;
+    uint flags;       // bit 0: a row scale; bit 1: a column scale; bit 2: int8 signs (ops 1, 3, 4)
+    uint P;
+    uint M;
+    uint R;
+    uint R8;
+    uint LD;          // the factor's row length in fp16 elements (even)
+    uint OFF;         // this part's first column (even)
+    uint NB;          // packed bytes an (expert, m) row: ceil(R / 8)
+    uint k_bits;      // the SmoothSign slope K, f32 bits
+    uint E;           // latent or cache rows
+    uint groups_x;
+} p;
+
+// f16 -> f32 bits, exact (convert.comp's own form)
+uint f16_to_f32(uint h16) {
+    uint sign = (h16 & 0x8000u) << 16u;
+    uint e = (h16 >> 10u) & 0x1Fu;
+    uint m = h16 & 0x3FFu;
+    if (e == 0x1Fu) return sign | 0x7F800000u | (m << 13u);
+    if (e == 0u) {
+        if (m == 0u) return sign;
+        uint t = uint(findMSB(m));
+        return sign | ((t + 103u) << 23u) | ((m << (23u - t)) & 0x7FFFFFu);
+    }
+    return sign | ((e + 112u) << 23u) | (m << 13u);
+}
+
+// f32 bits -> f16, round to nearest even; NaN -> sign | 0x7E00, as c10 writes it (convert.comp's own form)
+uint f32_to_f16(uint w) {
+    uint sign = (w >> 16u) & 0x8000u;
+    uint e = (w >> 23u) & 0xFFu;
+    uint m = w & 0x7FFFFFu;
+    if (e == 0xFFu) return sign | (m != 0u ? 0x7E00u : 0x7C00u);
+    int he = int(e) - 112;
+    if (he >= 31) return sign | 0x7C00u;
+    if (he <= 0) {
+        if (he < -10) return sign;
+        uint mf = m | 0x800000u;
+        uint shift = uint(14 - he);
+        uint q = mf >> shift;
+        uint rem = mf & ((1u << shift) - 1u);
+        uint half_ulp = 1u << (shift - 1u);
+        if (rem > half_ulp || (rem == half_ulp && (q & 1u) != 0u)) q += 1u;
+        return sign | q;
+    }
+    uint h16 = (uint(he) << 10u) | (m >> 13u);
+    uint rem = m & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h16 & 1u) != 0u)) h16 += 1u;
+    return sign | h16;
+}
+
+bool has_row() { return (p.flags & 1u) != 0u; }
+bool has_col() { return (p.flags & 2u) != 0u; }
+bool latent() { return p.op == 0u || p.op == 2u; }
+bool int8_signs() { return (p.flags & 4u) != 0u; }
+
+// the sign entry (e, m, c) carries: the latent's (W >= 0; NaN -> -1), the packed bit's, or the int8 byte's own
+// +1 or -1 (NaN for any other byte)
+float sign_of(uint e, uint m, uint c) {
+    if (latent()) {
+        float w = uintBitsToFloat(src[(e * p.M + m) * p.R + c]);
+        return w >= 0.0 ? 1.0 : -1.0;
+    }
+    if (int8_signs()) {
+        uint at = (e * p.M + m) * p.R + c;
+        int v = int(src[at >> 2u] << (24u - 8u * (at & 3u))) >> 24;
+        return v == 1 ? 1.0 : (v == -1 ? -1.0 : uintBitsToFloat(0x7FC00000u));
+    }
+    uint at = (e * p.M + m) * p.NB + (c >> 3u);
+    uint byte_value = (src[at >> 2u] >> ((at & 3u) * 8u)) & 0xFFu;
+    return ((byte_value >> (c & 7u)) & 1u) != 0u ? 1.0 : -1.0;
+}
+
+// the f32 scale product row[q, m] * col[q, c], one rounding; an absent scale is 1
+float scale_of(uint q, uint m, uint c) {
+    if (has_row() && has_col()) {
+        precise float s = row_scale[q * p.M + m] * col_scale[q * p.R + c];
+        return s;
+    }
+    if (has_row()) return row_scale[q * p.M + m];
+    if (has_col()) return col_scale[q * p.R + c];
+    return 1.0;
+}
+
+float grad_at(uint q, uint m, uint c) {
+    uint at = (q * p.M + m) * p.LD + p.OFF + c;
+    uint w16 = factor[at >> 1u];
+    return uintBitsToFloat(f16_to_f32((at & 1u) == 0u ? (w16 & 0xFFFFu) : (w16 >> 16u)));
+}
+
+// +-s16 at fp16, or 0 past the rank
+uint factor_entry(uint e, uint q, uint m, uint c) {
+    if (c >= p.R) return 0u;
+    uint s16 = f32_to_f16(floatBitsToUint(scale_of(q, m, c)));
+    float sg = sign_of(e, m, c);
+    if (isnan(sg)) return 0x7E00u;   // an int8 byte that is not a sign
+    return sg < 0.0 ? (s16 ^ 0x8000u) : s16;
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x + gl_WorkGroupID.y * (p.groups_x * 64u);
+    float invalid = uintBitsToFloat(0x7FC00000u);
+    if (p.op == 4u) {
+        if (gid >= p.P * p.R) return;
+        uint q = gid / p.R;
+        uint c = gid - q * p.R;
+        uint e = ids[2u * q];
+        if (ids[2u * q + 1u] != 0u || e >= p.E) {
+            out_a[q * p.R + c] = invalid;
+            return;
+        }
+        precise float acc = 0.0;
+        for (uint m = 0u; m < p.M; ++m) {
+            precise float gs = sign_of(e, m, c) * grad_at(q, m, c);
+            precise float t = gs * row_scale[q * p.M + m];
+            acc = acc + t;
+        }
+        out_a[q * p.R + c] = acc;
+        return;
+    }
+    if (gid >= p.P * p.M) return;
+    uint q = gid / p.M;
+    uint m = gid - q * p.M;
+    uint e = ids[2u * q];
+    bool bad = ids[2u * q + 1u] != 0u || e >= p.E;
+    if (p.op <= 1u) {
+        uint base = (q * p.M + m) * p.LD + p.OFF;   // even: LD and OFF are
+        for (uint c = 0u; c < p.R8; c += 2u) {
+            uint lo = bad ? 0x7E00u : factor_entry(e, q, m, c);
+            uint hi = bad ? 0x7E00u : factor_entry(e, q, m, c + 1u);
+            factor[(base + c) >> 1u] = lo | (hi << 16u);
+        }
+        return;
+    }
+    if (bad) {
+        if (p.op == 3u || !has_col()) {
+            if (p.op == 3u) out_a[q * p.M + m] = invalid;
+            else if (has_row()) out_b[q * p.M + m] = invalid;
+        } else if (has_row()) {
+            for (uint c = 0u; c < p.R; ++c) out_b[(q * p.M + m) * p.R + c] = invalid;
+        }
+        return;
+    }
+    float kk = uintBitsToFloat(p.k_bits);
+    precise float row_sum = 0.0;
+    for (uint c = 0u; c < p.R; ++c) {
+        float g = grad_at(q, m, c);
+        precise float gs = sign_of(e, m, c) * g;
+        if (p.op == 2u) {
+            float w = uintBitsToFloat(src[(e * p.M + m) * p.R + c]);
+            precise float wk = w * kk;
+            float t = tanh(wk);
+            precise float tt = t * t;
+            precise float tm = tt - 1.0;
+            precise float d = tm * -kk;
+            precise float gw = g * scale_of(q, m, c);
+            precise float gwd = gw * d;
+            out_a[(e * p.M + m) * p.R + c] = gwd;
+            if (has_row() && has_col()) out_b[(q * p.M + m) * p.R + c] = gs;
+            else row_sum = row_sum + gs;
+        } else {
+            precise float t = has_col() ? gs * col_scale[q * p.R + c] : gs;
+            row_sum = row_sum + t;
+        }
+    }
+    if (p.op == 2u) {
+        if (has_row() && !has_col()) out_b[q * p.M + m] = row_sum;
+    } else {
+        out_a[q * p.M + m] = row_sum;
+    }
+}

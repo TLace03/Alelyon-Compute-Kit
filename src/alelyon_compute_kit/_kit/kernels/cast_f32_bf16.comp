@@ -4,6 +4,19 @@
 // MODE 0: f32 -> bf16 (round to nearest even, ties to even; NaN payload kept
 // quiet). MODE 1: bf16 -> f32 (exact). Each invocation handles 4 elements;
 // n is the element count and the tail is masked.
+//
+// VECTORS (2026-09-27). An invocation's four consecutive elements move as ONE
+// load and ONE store: 16 bytes of f32 and 8 bytes of bf16. Lane j of workgroup
+// w owns elements 1,024 w + 4 j to + 3, as before, so consecutive lanes touch
+// consecutive 16- or 8-byte words. Before this, each lane made four scalar
+// accesses 16 (f32) or 8 (bf16) bytes apart, and every bf16 access was a
+// 2-byte one. MEASURED on a Kaggle T4 (thomaslacy/ack-pass-t4 v1, the same loop
+// against torch's CUDA casts): f32 -> bf16 [4,1024,512] 67.2 against 53.6 us,
+// bf16 -> f32 [1024,32000] 1,275.6 against 908.8 us. A group that n cuts short
+// goes element by element, so no access passes the n elements the host sized
+// the buffers for (src and dst are whole buffers from element 0, ack_cast's
+// contract). The rounding is f32_to_bf16 below, unchanged: the pointwise
+// family's narrow and the GEMM's bf16-output epilogue copy it.
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 
 #ifndef MODE
@@ -14,9 +27,13 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 #if MODE == 0
 layout(std430, set = 0, binding = 0) readonly buffer Src { float src[]; };
 layout(std430, set = 0, binding = 1) writeonly buffer Dst { uint16_t dst[]; };
+layout(std430, set = 0, binding = 0) readonly buffer SrcV { vec4 src4[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer DstV { uvec2 dst4[]; };
 #else
 layout(std430, set = 0, binding = 0) readonly buffer Src { uint16_t src[]; };
 layout(std430, set = 0, binding = 1) writeonly buffer Dst { float dst[]; };
+layout(std430, set = 0, binding = 0) readonly buffer SrcV { uvec2 src4[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer DstV { vec4 dst4[]; };
 #endif
 layout(push_constant) uniform P { uint n; } p;
 
@@ -32,9 +49,21 @@ uint16_t f32_to_bf16(float x) {
 
 void main() {
     uint base = gl_GlobalInvocationID.x * 4u;
-    for (uint i = 0u; i < 4u; ++i) {
-        uint idx = base + i;
-        if (idx >= p.n) break;
+    if (base >= p.n) return;
+    if (p.n - base >= 4u) {
+        uint v = base >> 2;
+#if MODE == 0
+        vec4 x = src4[v];
+        dst4[v] = uvec2(uint(f32_to_bf16(x.x)) | (uint(f32_to_bf16(x.y)) << 16),
+                        uint(f32_to_bf16(x.z)) | (uint(f32_to_bf16(x.w)) << 16));
+#else
+        uvec2 w = src4[v];
+        dst4[v] = vec4(uintBitsToFloat(w.x << 16), uintBitsToFloat(w.x & 0xFFFF0000u),
+                       uintBitsToFloat(w.y << 16), uintBitsToFloat(w.y & 0xFFFF0000u));
+#endif
+        return;
+    }
+    for (uint idx = base; idx < p.n; ++idx) {
 #if MODE == 0
         dst[idx] = f32_to_bf16(src[idx]);
 #else

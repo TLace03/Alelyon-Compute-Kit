@@ -1,0 +1,174 @@
+#version 450
+// head-kl-ce-f16/v1 (2026-09-29), the BACKWARD: the gradient of
+// g_kl * KL + g_ce * CE (the sub-bit student's head loss, as `head_lse_f16`
+// describes) with respect to the fp16 head output `yp` (rows x cols), written
+// at fp16, and each row group's partial of the gradient with respect to the
+// fp32 per-column scale `h`, in one pass over `yp`.
+//
+// With z = yp * h, q = exp(z - lse) the student's softmax, p the teacher's
+// top-k probabilities, t its tail mass and Q the student's tail mass, the
+// reference (student.py `_kl_ce_block_bwd_f`) forms, per row,
+//   c_top = g_kl A + g_ce,  c_nt = c_top - g_kl t / Q,  A = sum(p) + t,
+// and then, per column,
+//   grad = q c_nt                      a column not in the row's top-k,
+//   grad = q c_top - g_kl p            a top-k column (the LAST of its
+//                                      repeats, as torch's scatter keeps),
+//   grad = grad + (-g_ce)              the target column, after the above,
+//   d/dyp = f16(grad * h),  d/dh[c] = sum over rows of yp * grad.
+// The host computes c_top, c_nt and g_kl p on (rows, k) values with the
+// reference's own expressions and passes them in; this kernel applies them
+// column by column. Every product and sum is `precise`, rounded in the
+// reference's order: q is exp(z - lse) of the same correctly rounded z, the
+// casts are exact widening and round-to-nearest-even narrowing (c10's), so an
+// element differs from the reference only through exp's own rounding. The
+// d/dh partials sum in row order within a group; the host sums the groups.
+//
+// One workgroup takes `rows_per_group` rows (at most 64) of one 512-column
+// block (256 lanes, two columns a lane, one fp16 word each). The rows' top-k
+// columns inside the block are a bit mask in shared memory, built from `top`
+// first. A top-k index out of [0, cols) marks nothing: the forward already
+// made that row's log-sum-exps NaN, so its gradient is NaN throughout.
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Yp { uint yp[]; };             // fp16 pairs
+layout(set = 0, binding = 1, std430) readonly buffer Scale { float h[]; };
+layout(set = 0, binding = 2, std430) readonly buffer Top { uint top[]; };           // rows x k int64 as (lo, hi)
+layout(set = 0, binding = 3, std430) readonly buffer Targets { uint targets[]; };   // rows int64 as (lo, hi)
+// [0, rows) lse, [rows, 2 rows) c_top, [2 rows, 3 rows) c_nt, [3 rows] g_ce
+layout(set = 0, binding = 4, std430) readonly buffer RowValues { float row_values[]; };
+layout(set = 0, binding = 5, std430) readonly buffer TopTerm { float gkp[]; };      // rows x k: g_kl * p
+layout(set = 0, binding = 6, std430) writeonly buffer Grad { uint grad[]; };        // fp16 pairs
+layout(set = 0, binding = 7, std430) writeonly buffer Partial { float partial_values[]; };  // groups x cols
+
+// MIRRORS src/head_loss_ops.rs's HeadGradPlan::push_constants, word for word.
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;             // even
+    uint k;                // 1..256
+    uint rows_per_group;   // 1..64
+} p;
+
+const uint BLOCK_COLS = 512u;
+const uint BLOCK_WORDS = 16u;   // BLOCK_COLS / 32
+const uint MAX_GROUP_ROWS = 64u;
+
+shared uint block_bits[MAX_GROUP_ROWS * BLOCK_WORDS];
+
+// f16 -> f32 bits, exact, in integers (convert.comp's own form)
+uint f16_to_f32(uint h16) {
+    uint sign = (h16 & 0x8000u) << 16u;
+    uint e = (h16 >> 10u) & 0x1Fu;
+    uint m = h16 & 0x3FFu;
+    if (e == 0x1Fu) return sign | 0x7F800000u | (m << 13u);
+    if (e == 0u) {
+        if (m == 0u) return sign;
+        uint t = uint(findMSB(m));
+        return sign | ((t + 103u) << 23u) | ((m << (23u - t)) & 0x7FFFFFu);
+    }
+    return sign | ((e + 112u) << 23u) | (m << 13u);
+}
+
+// f32 bits -> f16, round to nearest even; NaN -> sign | 0x7E00, as c10 writes it (convert.comp's own form)
+uint f32_to_f16(uint w) {
+    uint sign = (w >> 16u) & 0x8000u;
+    uint e = (w >> 23u) & 0xFFu;
+    uint m = w & 0x7FFFFFu;
+    if (e == 0xFFu) return sign | (m != 0u ? 0x7E00u : 0x7C00u);
+    int he = int(e) - 112;
+    if (he >= 31) return sign | 0x7C00u;
+    if (he <= 0) {
+        if (he < -10) return sign;
+        uint mf = m | 0x800000u;
+        uint shift = uint(14 - he);
+        uint q = mf >> shift;
+        uint rem = mf & ((1u << shift) - 1u);
+        uint half_ulp = 1u << (shift - 1u);
+        if (rem > half_ulp || (rem == half_ulp && (q & 1u) != 0u)) q += 1u;
+        return sign | q;
+    }
+    uint h16 = (uint(he) << 10u) | (m >> 13u);
+    uint rem = m & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h16 & 1u) != 0u)) h16 += 1u;
+    return sign | h16;
+}
+
+// the final gradient of one element: the column's case, in the reference's order
+float element_grad(float y, float hc, uint col, uint row, uint rr, uint c0, uint target, float lse, float c_top,
+                   float c_nt, float g_ce) {
+    precise float z = y * hc;
+    precise float zs = z - lse;
+    float q = exp(zs);
+    uint off = col - c0;
+    bool is_top = ((block_bits[rr * BLOCK_WORDS + (off >> 5u)] >> (off & 31u)) & 1u) != 0u;
+    precise float g;
+    if (is_top) {
+        // the last of the row's top-k entries naming this column, as torch's scatter keeps the last
+        uint last = 0u;
+        for (uint i = 0u; i < p.k; ++i) {
+            uint at = 2u * (row * p.k + i);
+            if (top[at + 1u] == 0u && top[at] == col) last = i;
+        }
+        precise float qt = q * c_top;
+        g = qt - gkp[row * p.k + last];
+    } else {
+        g = q * c_nt;
+    }
+    if (col == target) {
+        precise float gt = g + (-g_ce);
+        g = gt;
+    }
+    return g;
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint c0 = gl_WorkGroupID.x * BLOCK_COLS;
+    uint r0 = gl_WorkGroupID.y * p.rows_per_group;
+    uint group_rows = min(p.rows_per_group, p.rows - r0);   // r0 < rows by the grid
+    for (uint w = lane; w < group_rows * BLOCK_WORDS; w += 256u) block_bits[w] = 0u;
+    barrier();
+    for (uint e = lane; e < group_rows * p.k; e += 256u) {
+        uint rr = e / p.k;
+        uint at = 2u * ((r0 + rr) * p.k + (e - rr * p.k));
+        uint lo = top[at];
+        if (top[at + 1u] == 0u && lo < p.cols && lo >= c0 && lo - c0 < BLOCK_COLS) {
+            uint off = lo - c0;
+            atomicOr(block_bits[rr * BLOCK_WORDS + (off >> 5u)], 1u << (off & 31u));
+        }
+    }
+    barrier();
+
+    uint half_cols = p.cols >> 1u;
+    uint j = gl_WorkGroupID.x * (BLOCK_COLS >> 1u) + lane;   // this lane's fp16 word in each row
+    if (j >= half_cols) return;   // no barrier follows
+    uint col = j << 1u;
+    float h0 = h[col];
+    float h1 = h[col + 1u];
+    float g_ce = row_values[3u * p.rows];
+    precise float acc0 = 0.0;
+    precise float acc1 = 0.0;
+    for (uint rr = 0u; rr < group_rows; ++rr) {
+        uint row = r0 + rr;
+        float lse = row_values[row];
+        float c_top = row_values[p.rows + row];
+        float c_nt = row_values[2u * p.rows + row];
+        uint target = targets[2u * row + 1u] == 0u ? targets[2u * row] : 0xFFFFFFFFu;
+        uint w = yp[row * half_cols + j];
+        float y0 = uintBitsToFloat(f16_to_f32(w & 0xFFFFu));
+        float y1 = uintBitsToFloat(f16_to_f32(w >> 16u));
+        float g0 = element_grad(y0, h0, col, row, rr, c0, target, lse, c_top, c_nt, g_ce);
+        float g1 = element_grad(y1, h1, col + 1u, row, rr, c0, target, lse, c_top, c_nt, g_ce);
+        precise float d0 = g0 * h0;
+        precise float d1 = g1 * h1;
+        grad[row * half_cols + j] = f32_to_f16(floatBitsToUint(d0)) | (f32_to_f16(floatBitsToUint(d1)) << 16u);
+        precise float t0 = y0 * g0;
+        precise float t1 = y1 * g1;
+        acc0 = acc0 + t0;
+        acc1 = acc1 + t1;
+    }
+    uint base = gl_WorkGroupID.y * p.cols + col;
+    partial_values[base] = acc0;
+    partial_values[base + 1u] = acc1;
+}

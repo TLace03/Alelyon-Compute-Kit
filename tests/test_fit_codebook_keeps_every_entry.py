@@ -310,20 +310,18 @@ def test_the_audits_shape_exercises_the_defect(monkeypatch):
 
 
 def test_position_one_is_outside_the_calibration_sample_at_group_8():
-    """Precondition of the next test, kept separate so its xfail cannot swallow it.
+    """Precondition of the next test, kept separate so a failure there cannot hide this one.
     Mirrors the strided sample in `fit_codebook`."""
     vectors = 65536 // 8
     sampled = np.linspace(0, vectors - 1, min(vectors, 4096), dtype=np.int64)
     assert 1 not in set(sampled.tolist()) and vectors - 1 in set(sampled.tolist())
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "OPEN: an entry used only by vectors outside fit_codebook's 4,096-vector "
-    "calibration sample loses its row on the next step, even on a zero "
-    "gradient; measured 8 values moved, 15 distinct rows. A warm start alone "
-    "does not fix it; judging emptiness on the whole tensor does (see the "
-    "comment above)."))
 def test_a_zero_gradient_moves_no_weight_when_an_entry_is_outside_the_calibration_sample():
+    """Was a strict xfail through 0.1.0a4: an entry used only by vectors outside
+    fit_codebook's 4,096-vector calibration sample lost its row on the next step,
+    even on a zero gradient (8 values moved, 15 distinct rows). The 0.1.0a5 kit
+    payload carries the fix, and the test now holds."""
     changed, rows, max_dw = zero_gradient_step(*review_shape(8, rare_at=1), 8)
     assert changed == 0 and rows == ENTRIES, (
         f"{changed} of 65,536 weight values moved on a zero gradient "
